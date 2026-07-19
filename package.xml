@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<package format="1" xmlns="https://wiki.freecad.org/Package_Metadata">
+  <name>WoodCAM2D</name>
+  <description>Workbench simples para gerar G-code 2.5D de marcenaria no FreeCAD.</description>
+  <version>0.1.0</version>
+  <date>2026-06-08</date>
+  <icon>Resources/icons/woodcam2d.svg</icon>
+  <license>MIT</license>
+  <content>
+    <workbench>
+      <classname>WoodCAM2DWorkbench</classname>
+      <subdirectory>.</subdirectory>
+    </workbench>
+  </content>
+</package>

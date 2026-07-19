@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="100mm" height="60mm" viewBox="0 0 100 60">
+  <g id="layer-a" transform="translate(10 5)">
+    <rect id="plate" x="0" y="0" width="40" height="20"/>
+    <circle id="hole" cx="10" cy="10" r="3"/>
+    <path id="curves"
+          d="M 50 0 C 55 0 55 10 60 10 Q 65 10 70 5 A 5 5 0 0 1 75 10"/>
+  </g>
+</svg>

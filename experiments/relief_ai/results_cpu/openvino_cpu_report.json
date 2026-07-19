@@ -1,0 +1,29 @@
+{
+  "openvino": "2026.2.1-21919-ede283a88e3-releases/2026/2",
+  "requested_device": "CPU",
+  "available_devices": [
+    "CPU"
+  ],
+  "models": {
+    "da2_small": {
+      "status": "ok",
+      "input_shape": [
+        1,
+        3,
+        280,
+        518
+      ],
+      "conversion_seconds": 2.3990689139999404,
+      "median_seconds": 0.09485531000007086,
+      "minimum_seconds": 0.09353633699993225,
+      "iterations": 3,
+      "mean_absolute_error": 0.0023728397209197283,
+      "correlation": 0.9999986871881379
+    },
+    "da3_small": {
+      "status": "conversion_error",
+      "error_type": "OpConversionFailure",
+      "error": "Check 'false' failed at src/frontends/common_translators/src/unconverted_ops_report.cpp:141:\nFrontEnd API failed with OpConversionFailure:\nModel wasn't fully converted.\nSummary:\n-- No conversion rule found for operations: aten::cartesian_prod\n"
+    }
+  }
+}

@@ -1,0 +1,40 @@
+# Python/FreeCAD generated files
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local FreeCAD documents, exports and temporary previews
+*.FCStd
+*.FCStd1
+*.FCBak
+*.nc
+*.gcode
+*.log
+local_ai/
+output/
+outputs/
+
+# Local backups and test artifacts
+backups/
+experiments/**/outputs/
+test-results/
+
+# Optional AI runtimes, downloaded weights and local configuration
+.relief-ai-install.*
+.woodcam-ai/
+*.safetensors
+*.onnx
+*.pth
+*.gguf
+*.part
+
+# Local editor/OS metadata
+.agents/
+.codex/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
