@@ -2021,6 +2021,10 @@ deve continuar disponível como referência até o marco R1 ser aprovado.
   alguma peça for ambígua ou inválida.
 - PanelNest preserva X/Y/rotação do Editor e só executa novo nesting por comando
   explícito do usuário;
+- a árvore do FCStd usa uma única raiz `WoodCAM`, com `Peças`, `Operações` e
+  `Área de trabalho`; grupos históricos são migrados sem alterar geometria;
+- no CAM 3D, o XY da fonte/percurso é absoluto e o datum de Trabalho define
+  somente início e retorno, sem transladar a peça;
 - vetorização preto/branco de bitmaps usa limiar, ruído, cantos, suavização,
   tamanho em milímetros e confirmação por prévia;
 - propriedades exatas distinguem escala, largura, altura, raio/diâmetro e raios
@@ -2037,8 +2041,9 @@ deve continuar disponível como referência até o marco R1 ser aprovado.
 - trim e extend priorizam casos lineares seguros;
 - offset fechado usa o caso linear/miter validado;
 - elipse não circular não é alvo de splice;
-- Bézier cúbica pertence ao modelo/importação, mas ainda não tem ferramenta de
-  desenho dedicada;
+- Bézier cúbica possui ferramenta de desenho própria com quatro pontos
+  (início, controle 1, controle 2 e fim); no modo Nós, seus dois handles de
+  controle possuem prévia, Snap e comando atômico próprio;
 - texto, vetorização de bitmap, booleanos gerais e modelagem 3D continuam fora
   do núcleo inicial;
 - quantidades adicionais são replicadas na ponte PanelNest, não desenhadas como

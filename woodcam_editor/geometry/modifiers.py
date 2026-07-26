@@ -495,6 +495,88 @@ def preview_offset_closed_path(
     return ModifierPreview("offset", (path,), (result,), details, tuple(vertices))
 
 
+def preview_create_offset_contour(
+    entity: VectorEntity,
+    distance: float,
+    *,
+    miter_limit: float = 10.0,
+    tolerance: float = 1.0e-9,
+) -> ModifierPreview:
+    """Create a separate offset contour while preserving the source vector.
+
+    This is deliberately distinct from the interactive *Offset* modifier,
+    whose contract replaces the source.  Aspire's ``Create vector boundary``
+    workflow is additive: the original artwork remains and a new closed
+    contour is created beside it.
+    """
+
+    distance = float(distance)
+    if abs(distance) <= tolerance:
+        raise ModifierError("offset distance must be non-zero")
+    details = {
+        "source_entity_id": entity.id,
+        "distance_mm": distance,
+        "side": "outward" if distance > 0.0 else "inward",
+        "preserves_source": True,
+    }
+    if isinstance(entity, CircleEntity):
+        radius = entity.radius + distance
+        if radius <= tolerance:
+            raise ModifierError("inward offset collapsed the circle")
+        metadata = dict(entity.metadata)
+        metadata.update(
+            {
+                "last_woodcam_modifier": "create_offset_contour",
+                "source_entity_id": entity.id,
+                "offset_distance_mm": distance,
+            }
+        )
+        created = CircleEntity(
+            layer_id=entity.layer_id,
+            center=entity.center,
+            radius=radius,
+            id=new_id("offset"),
+            metadata=metadata,
+        )
+        details["join"] = "round"
+    elif isinstance(entity, PathEntity):
+        offset_preview = preview_offset_closed_path(
+            entity,
+            distance,
+            miter_limit=miter_limit,
+            tolerance=tolerance,
+        )
+        offset = offset_preview.result_entities[0]
+        metadata = dict(offset.metadata)
+        metadata.update(
+            {
+                "last_woodcam_modifier": "create_offset_contour",
+                "source_entity_id": entity.id,
+                "offset_distance_mm": distance,
+            }
+        )
+        created = PathEntity(
+            layer_id=offset.layer_id,
+            # A separate vector needs its own stable span IDs.  Reusing the
+            # offset preview spans would violate the document's global ID
+            # invariant even though the geometry itself is identical.
+            spans=tuple(LineSpan(span.start, span.end) for span in offset.spans),
+            closed=True,
+            id=new_id("offset"),
+            metadata=metadata,
+        )
+        details.update({key: value for key, value in offset_preview.metadata.items() if key not in details})
+    else:
+        raise ModifierError("create contour supports only circles and closed linear paths")
+    return ModifierPreview(
+        "create_offset_contour",
+        (entity,),
+        (entity, created),
+        details,
+        (),
+    )
+
+
 def _corner_geometry(path: PathEntity, node_id: str, angle_tolerance: float | None = None):
     if not isinstance(path, PathEntity) or not path.closed:
         raise ModifierError("fillet requires a closed path")

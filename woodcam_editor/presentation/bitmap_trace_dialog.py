@@ -81,6 +81,25 @@ class BitmapTraceDialog(QtWidgets.QDialog):
         form.addRow("Largura final", self.target_width)
         root.addLayout(form)
 
+        crop_box = QtWidgets.QGroupBox("Recortar imagem antes de vetorizar", self)
+        crop_form = QtWidgets.QGridLayout(crop_box)
+        self.crop_enabled = QtWidgets.QCheckBox("Usar somente esta área", crop_box)
+        self.crop_enabled.setToolTip(
+            "O recorte é feito nos pixels da imagem original; o arquivo nunca é alterado."
+        )
+        crop_form.addWidget(self.crop_enabled, 0, 0, 1, 4)
+        self.crop_x = self._crop_field(crop_box)
+        self.crop_y = self._crop_field(crop_box)
+        self.crop_width = self._crop_field(crop_box, minimum=1)
+        self.crop_height = self._crop_field(crop_box, minimum=1)
+        for column, label in enumerate(("X", "Y", "Largura", "Altura")):
+            crop_form.addWidget(QtWidgets.QLabel(label, crop_box), 1, column)
+        for column, field in enumerate(
+            (self.crop_x, self.crop_y, self.crop_width, self.crop_height)
+        ):
+            crop_form.addWidget(field, 2, column)
+        root.addWidget(crop_box)
+
         self.status = QtWidgets.QLabel(
             "A confirmação seguinte aparecerá no topo do Editor como prévia magenta.", self
         )
@@ -101,7 +120,11 @@ class BitmapTraceDialog(QtWidgets.QDialog):
 
         self.threshold.valueChanged.connect(self._update_preview)
         self.invert.toggled.connect(self._update_preview)
+        self.crop_enabled.toggled.connect(self._update_crop_enabled)
+        for field in (self.crop_x, self.crop_y, self.crop_width, self.crop_height):
+            field.valueChanged.connect(self._update_preview)
         self._load_original()
+        self._update_crop_enabled(False)
         self._update_preview()
 
     def _preview_label(self, text):
@@ -112,6 +135,13 @@ class BitmapTraceDialog(QtWidgets.QDialog):
         label.setStyleSheet("QLabel { background: #f8fafc; color: #475569; }")
         return label
 
+    @staticmethod
+    def _crop_field(parent, minimum=0):
+        field = QtWidgets.QSpinBox(parent)
+        field.setRange(int(minimum), 1)
+        field.setSuffix(" px")
+        return field
+
     def _scaled(self, pixmap):
         return pixmap.scaled(
             self.original_label.size() - QtCore.QSize(12, 12),
@@ -120,11 +150,51 @@ class BitmapTraceDialog(QtWidgets.QDialog):
         )
 
     def _load_original(self):
-        pixmap = QtGui.QPixmap(self.image_path)
+        self._original_pixmap = QtGui.QPixmap(self.image_path)
+        pixmap = self._original_pixmap
         if pixmap.isNull():
             self.original_label.setText("Não foi possível visualizar %s" % Path(self.image_path).name)
         else:
-            self.original_label.setPixmap(self._scaled(pixmap))
+            self.crop_x.setRange(0, max(0, pixmap.width() - 1))
+            self.crop_y.setRange(0, max(0, pixmap.height() - 1))
+            self.crop_width.setRange(1, max(1, pixmap.width()))
+            self.crop_height.setRange(1, max(1, pixmap.height()))
+            self.crop_width.setValue(max(1, pixmap.width()))
+            self.crop_height.setValue(max(1, pixmap.height()))
+            self._update_original_preview()
+
+    def _update_crop_enabled(self, enabled):
+        for field in (self.crop_x, self.crop_y, self.crop_width, self.crop_height):
+            field.setEnabled(bool(enabled))
+        self._update_preview()
+
+    def _crop_values(self):
+        if not self.crop_enabled.isChecked():
+            return 0, 0, 0, 0
+        return (
+            int(self.crop_x.value()),
+            int(self.crop_y.value()),
+            int(self.crop_width.value()),
+            int(self.crop_height.value()),
+        )
+
+    def _refresh_crop_limits(self):
+        pixmap = getattr(self, "_original_pixmap", None)
+        if pixmap is None or pixmap.isNull():
+            return
+        max_width = max(1, pixmap.width() - self.crop_x.value())
+        max_height = max(1, pixmap.height() - self.crop_y.value())
+        self.crop_width.setMaximum(max_width)
+        self.crop_height.setMaximum(max_height)
+
+    def _update_original_preview(self):
+        pixmap = getattr(self, "_original_pixmap", None)
+        if pixmap is None or pixmap.isNull():
+            return
+        crop_x, crop_y, crop_width, crop_height = self._crop_values()
+        if crop_width and crop_height:
+            pixmap = pixmap.copy(crop_x, crop_y, crop_width, crop_height)
+        self.original_label.setPixmap(self._scaled(pixmap))
 
     def options(self):
         return BitmapTraceOptions(
@@ -134,17 +204,23 @@ class BitmapTraceDialog(QtWidgets.QDialog):
             corner_fit=float(self.corner_fit.value()),
             curve_tolerance=float(self.curve_tolerance.value()),
             target_width_mm=float(self.target_width.value()),
+            crop_x_px=self._crop_values()[0],
+            crop_y_px=self._crop_values()[1],
+            crop_width_px=self._crop_values()[2],
+            crop_height_px=self._crop_values()[3],
         )
 
     def _update_preview(self, *_args):
         self.threshold_value.setText(str(int(self.threshold.value())))
         try:
+            self._refresh_crop_limits()
+            self._update_original_preview()
             data = threshold_preview_png(self.image_path, self.options())
             pixmap = QtGui.QPixmap()
             pixmap.loadFromData(data, "PNG")
             self.mask_label.setPixmap(self._scaled(pixmap))
             self.status.setText(
-                "Preto = vetor. Ajuste ruído/cantos e gere a prévia magenta no Editor."
+                "Preto = vetor. O recorte só afeta a prévia e a vetorização; a imagem original não muda."
             )
         except Exception as error:
             self.mask_label.setText("Prévia indisponível")

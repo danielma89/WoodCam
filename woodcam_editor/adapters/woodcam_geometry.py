@@ -241,6 +241,61 @@ def _hole_record(entity: Any, deflection: float, transform: Any = None) -> dict:
     }
 
 
+def _polyline_hole_record(
+    entity: Any,
+    deflection: float,
+    transform: Any = None,
+) -> Optional[dict]:
+    """Recover a small imported circle that arrived as a closed polyline.
+
+    FreeCAD/DXF imports commonly tessellate circles.  Treating that contour as
+    an arbitrary polygon preserves the visible cutout in WoodCAM, but sibling
+    CAM systems such as PanelNest can no longer identify it as a drilling
+    feature.  Recognition stays deliberately conservative: at least eight
+    vertices, diameter no greater than the existing 12 mm drill rule and a
+    near-constant radius after the complete piece transform.
+    """
+
+    if not bool(getattr(entity, "closed", False)):
+        return None
+    points = [
+        _transform_point(point, transform)
+        for point in path_points(entity, deflection)
+    ]
+    # Twelve sides is enough for typical DXF/FreeCAD circle tessellation while
+    # avoiding promotion of an intentional small octagon into a drill hole.
+    if len(points) < 12:
+        return None
+    min_x = min(point[0] for point in points)
+    max_x = max(point[0] for point in points)
+    min_y = min(point[1] for point in points)
+    max_y = max(point[1] for point in points)
+    width = max_x - min_x
+    height = max_y - min_y
+    diameter = (width + height) * 0.5
+    if diameter <= 1.0e-9 or diameter > 12.0 + 1.0e-9:
+        return None
+    if abs(width - height) > max(0.05, diameter * 0.04):
+        return None
+    center = ((min_x + max_x) * 0.5, (min_y + max_y) * 0.5)
+    radii = [_distance(point, center) for point in points]
+    mean_radius = sum(radii) / len(radii)
+    if mean_radius <= 1.0e-9:
+        return None
+    if max(abs(radius - mean_radius) for radius in radii) > max(
+        0.03,
+        mean_radius * 0.05,
+    ):
+        return None
+    return {
+        "x": center[0],
+        "y": center[1],
+        "diameter_mm": mean_radius * 2.0,
+        "depth_mm": 0.0,
+        "points": points,
+    }
+
+
 def _append_entity(
     result: dict,
     entity: Any,
@@ -258,8 +313,21 @@ def _append_entity(
             )
         return
     if kind == "circle" and circle_as_hole:
-        result["holes"].append(_hole_record(entity, deflection, transform))
-        return
+        # Keep the CAM contract honest: small circles are drill holes, while a
+        # larger circular contour is an internal profile/pocket. This mirrors
+        # the Editor's import classifier without rewriting the vector.
+        try:
+            is_drill = float(getattr(entity, "radius", 0.0)) * 2.0 <= 12.0 + 1e-9
+        except (TypeError, ValueError):
+            is_drill = True
+        if is_drill:
+            result["holes"].append(_hole_record(entity, deflection, transform))
+            return
+    if kind == "path" and circle_as_hole:
+        imported_hole = _polyline_hole_record(entity, deflection, transform)
+        if imported_hole is not None:
+            result["holes"].append(imported_hole)
+            return
     points = entity_points(entity, deflection)
     points = [_transform_point(point, transform) for point in points]
     if len(points) < 3:
@@ -313,7 +381,10 @@ def document_to_woodcam_geometry(
                     inner,
                     deflection=deflection,
                     transform=transform,
-                    circle_as_hole=_entity_kind(inner) == "circle",
+                    # Imported round holes may be tessellated paths instead
+                    # of CircleEntity.  The adapter applies the same strict
+                    # <=12 mm circularity rule before promoting one to a hole.
+                    circle_as_hole=True,
                     strict=strict,
                 )
         return result

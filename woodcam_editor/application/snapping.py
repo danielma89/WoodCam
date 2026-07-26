@@ -25,6 +25,8 @@ class SnapKind(str, Enum):
     HORIZONTAL = "horizontal"
     VERTICAL = "vertical"
     ANGLE = "angle"
+    PERPENDICULAR = "perpendicular"
+    TANGENT = "tangent"
     WORK_AREA = "work_area"
 
 
@@ -39,6 +41,8 @@ _LABELS = {
     SnapKind.HORIZONTAL: "Horizontal",
     SnapKind.VERTICAL: "Vertical",
     SnapKind.ANGLE: "Ângulo",
+    SnapKind.PERPENDICULAR: "Perpendicular",
+    SnapKind.TANGENT: "Tangente",
     SnapKind.WORK_AREA: "Área de Trabalho",
 }
 
@@ -51,6 +55,8 @@ _PRIORITY = {
     SnapKind.HORIZONTAL: 40,
     SnapKind.VERTICAL: 41,
     SnapKind.ANGLE: 42,
+    SnapKind.PERPENDICULAR: 43,
+    SnapKind.TANGENT: 44,
     SnapKind.ON_GEOMETRY: 50,
     SnapKind.WORK_AREA: 55,
     SnapKind.GRID: 60,
@@ -80,6 +86,15 @@ class SnapSettings:
     on_geometry: bool = True
     grid: bool = True
     grid_spacing_mm: float = 10.0
+    # Smart snaps are measured from the active drawing/measurement anchor.
+    # They are screen-radius candidates just like endpoint/grid snaps, never
+    # hidden constraints in the document.
+    horizontal: bool = True
+    vertical: bool = True
+    angle: bool = True
+    angle_increment_degrees: float = 15.0
+    perpendicular: bool = True
+    tangent: bool = True
 
 
 def _xy(point: Any) -> Tuple[float, float]:
@@ -136,6 +151,7 @@ class SnapEngine:
         pixels_per_mm: float,
         excluded_entity_ids: Iterable[str] = (),
         disabled: bool = False,
+        reference_point: Any = None,
     ) -> Optional[SnapCandidate]:
         if disabled or pixels_per_mm <= 0.0:
             return None
@@ -165,6 +181,16 @@ class SnapEngine:
                     pixels_per_mm,
                 )
             )
+        if reference_point is not None:
+            candidates.extend(
+                self._smart_candidates(
+                    point,
+                    reference_point,
+                    pixels_per_mm,
+                    entities,
+                    excluded,
+                )
+            )
         candidates = [
             candidate
             for candidate in candidates
@@ -173,6 +199,252 @@ class SnapEngine:
         if not candidates:
             return None
         return min(candidates, key=lambda value: (value.priority, value.distance_px))
+
+    def _smart_candidates(
+        self,
+        point: Any,
+        reference_point: Any,
+        pixels_per_mm: float,
+        entities: Sequence[Any],
+        excluded: Set[str],
+    ) -> List[SnapCandidate]:
+        """Generate temporary Ortho/angle candidates from one known anchor.
+
+        The candidates have no entity IDs and live only under the cursor.  A
+        drawing tool passes its first/last confirmed point, so a loose mouse
+        movement cannot change a vector or create an implicit constraint.
+        ``distance_px`` remains the sole capture gate, which makes this feel
+        identical at every zoom level.
+        """
+
+        px, py = _xy(point)
+        rx, ry = _xy(reference_point)
+        candidates: List[SnapCandidate] = []
+        if self.settings.horizontal:
+            candidates.append(
+                self._candidate(
+                    point,
+                    _make_like(point, px, ry),
+                    SnapKind.HORIZONTAL,
+                    pixels_per_mm,
+                )
+            )
+        if self.settings.vertical:
+            candidates.append(
+                self._candidate(
+                    point,
+                    _make_like(point, rx, py),
+                    SnapKind.VERTICAL,
+                    pixels_per_mm,
+                )
+            )
+        increment = float(self.settings.angle_increment_degrees or 0.0)
+        if self.settings.angle and 1.0e-9 < increment < 180.0:
+            dx, dy = px - rx, py - ry
+            length = math.hypot(dx, dy)
+            if length > 1.0e-12:
+                step = math.radians(increment)
+                raw_angle = math.atan2(dy, dx)
+                snapped_angle = round(raw_angle / step) * step
+                # Horizontal/vertical already have their own stronger,
+                # clearer labels.  Do not create duplicate candidates there.
+                quarter_turn = math.pi * 0.5
+                distance_to_axis = abs((snapped_angle + quarter_turn * 0.5) % quarter_turn - quarter_turn * 0.5)
+                if distance_to_axis > 1.0e-8:
+                    target = _make_like(
+                        point,
+                        rx + length * math.cos(snapped_angle),
+                        ry + length * math.sin(snapped_angle),
+                    )
+                    candidate = self._candidate(
+                        point, target, SnapKind.ANGLE, pixels_per_mm
+                    )
+                    # Include the actual snapped increment in the status
+                    # instead of a vague generic "angle" label.
+                    candidate = SnapCandidate(
+                        point=candidate.point,
+                        kind=candidate.kind,
+                        entity_id=candidate.entity_id,
+                        span_id=candidate.span_id,
+                        parameter=candidate.parameter,
+                        distance_px=candidate.distance_px,
+                        priority=candidate.priority,
+                        label="Ângulo %.0f°" % math.degrees(snapped_angle),
+                    )
+                    candidates.append(candidate)
+        candidates.extend(
+            self._reference_geometry_candidates(
+                point, reference_point, pixels_per_mm, entities, excluded
+            )
+        )
+        return candidates
+
+    def _reference_geometry_candidates(
+        self,
+        point: Any,
+        reference_point: Any,
+        pixels_per_mm: float,
+        entities: Sequence[Any],
+        excluded: Set[str],
+    ) -> List[SnapCandidate]:
+        """Return exact perpendicular/tangent candidates from the anchor.
+
+        This deliberately starts with the two unambiguous primitives useful
+        for cabinetry: a perpendicular foot to a finite line, and radial or
+        tangent points on an exact circle.  Ellipse and arbitrary Bézier
+        tangency need a numerical solver and are left out rather than guessed.
+        """
+
+        candidates: List[SnapCandidate] = []
+        rx, ry = _xy(reference_point)
+        for entity in entities:
+            entity_id = _entity_id(entity)
+            if entity_id in excluded:
+                continue
+            for span in _entity_spans(entity):
+                if type(span).__name__ != "LineSpan" or not self.settings.perpendicular:
+                    if type(span).__name__ != "ArcSpan":
+                        continue
+                    candidates.extend(
+                        self._arc_reference_candidates(
+                            point,
+                            reference_point,
+                            span,
+                            pixels_per_mm,
+                            entity_id,
+                        )
+                    )
+                    continue
+                sx, sy = _xy(span.start)
+                ex, ey = _xy(span.end)
+                dx, dy = ex - sx, ey - sy
+                length_sq = dx * dx + dy * dy
+                if length_sq <= 1.0e-12:
+                    continue
+                parameter = ((rx - sx) * dx + (ry - sy) * dy) / length_sq
+                # The source is a finite vector, never an infinite imaginary
+                # extension.  This avoids a surprising snap beyond its end.
+                if parameter < -1.0e-12 or parameter > 1.0 + 1.0e-12:
+                    continue
+                target = _make_like(
+                    reference_point,
+                    sx + dx * parameter,
+                    sy + dy * parameter,
+                )
+                candidates.append(
+                    self._candidate(
+                        point,
+                        target,
+                        SnapKind.PERPENDICULAR,
+                        pixels_per_mm,
+                        entity_id,
+                        _span_id(span),
+                        parameter,
+                    )
+                )
+
+            center = getattr(entity, "center", None)
+            radius = getattr(entity, "radius", None)
+            if center is None or radius is None:
+                continue
+            cx, cy = _xy(center)
+            radius = float(radius)
+            vx, vy = rx - cx, ry - cy
+            distance = math.hypot(vx, vy)
+            if radius <= 1.0e-12 or distance <= 1.0e-12:
+                continue
+            ux, uy = vx / distance, vy / distance
+            if self.settings.perpendicular:
+                candidates.append(
+                    self._candidate(
+                        point,
+                        _make_like(reference_point, cx + radius * ux, cy + radius * uy),
+                        SnapKind.PERPENDICULAR,
+                        pixels_per_mm,
+                        entity_id,
+                    )
+                )
+            if self.settings.tangent and distance > radius + 1.0e-12:
+                base = math.atan2(vy, vx)
+                offset = math.acos(radius / distance)
+                for angle in (base + offset, base - offset):
+                    candidates.append(
+                        self._candidate(
+                            point,
+                            _make_like(
+                                reference_point,
+                                cx + radius * math.cos(angle),
+                                cy + radius * math.sin(angle),
+                            ),
+                            SnapKind.TANGENT,
+                            pixels_per_mm,
+                            entity_id,
+                        )
+                    )
+        return candidates
+
+    def _arc_reference_candidates(
+        self,
+        point: Any,
+        reference_point: Any,
+        span: Any,
+        pixels_per_mm: float,
+        entity_id: Optional[str],
+    ) -> List[SnapCandidate]:
+        """Reference candidates restricted to the actual ArcSpan sweep."""
+
+        center = getattr(span, "center", None)
+        radius = getattr(span, "radius", None)
+        if center is None or radius is None:
+            return []
+        cx, cy = _xy(center)
+        rx, ry = _xy(reference_point)
+        radius = float(radius)
+        vx, vy = rx - cx, ry - cy
+        distance = math.hypot(vx, vy)
+        if radius <= 1.0e-12 or distance <= 1.0e-12:
+            return []
+        result: List[SnapCandidate] = []
+
+        def add_if_on_arc(target, kind):
+            nearest, parameter = self._nearest(span, target)
+            if nearest is None:
+                return
+            tx, ty = _xy(target)
+            nx, ny = _xy(nearest)
+            if math.hypot(tx - nx, ty - ny) > 1.0e-7:
+                return
+            result.append(
+                self._candidate(
+                    point,
+                    target,
+                    kind,
+                    pixels_per_mm,
+                    entity_id,
+                    _span_id(span),
+                    parameter,
+                )
+            )
+
+        ux, uy = vx / distance, vy / distance
+        if self.settings.perpendicular:
+            add_if_on_arc(
+                _make_like(reference_point, cx + radius * ux, cy + radius * uy),
+                SnapKind.PERPENDICULAR,
+            )
+        if self.settings.tangent and distance > radius + 1.0e-12:
+            base = math.atan2(vy, vx)
+            offset = math.acos(radius / distance)
+            for angle in (base + offset, base - offset):
+                add_if_on_arc(
+                    _make_like(
+                        reference_point,
+                        cx + radius * math.cos(angle),
+                        cy + radius * math.sin(angle),
+                    ),
+                    SnapKind.TANGENT,
+                )
+        return result
 
     @staticmethod
     def _entity_is_editable_visible(document: Any, entity: Any) -> bool:

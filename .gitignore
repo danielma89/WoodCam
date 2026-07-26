@@ -21,6 +21,7 @@ outputs/
 backups/
 experiments/**/outputs/
 test-results/
+analizar no chat gpt.zip
 
 # Optional AI runtimes, downloaded weights and local configuration
 .relief-ai-install.*

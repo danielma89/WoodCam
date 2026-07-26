@@ -15,6 +15,7 @@ class NodeTool(EditorTool):
         super(NodeTool, self).__init__(manager)
         self.entity_id = None
         self.node_id = None
+        self.handle_kind = "node"
         self.original = None
         self.press_screen = None
         self.press_scene = None
@@ -36,6 +37,7 @@ class NodeTool(EditorTool):
     def cancel(self):
         super(NodeTool, self).cancel()
         self.node_id = None
+        self.handle_kind = "node"
         self.original = None
         self.press_screen = None
         self.press_scene = None
@@ -50,9 +52,10 @@ class NodeTool(EditorTool):
             return
         self.overlays.show_nodes(
             self.entity_id,
-            self.controller.node_positions(self.entity_id),
+            self.controller.editable_handle_positions(self.entity_id),
             self.controller.selected_node_ids,
         )
+        self.overlays.show_bezier_guides(self.controller.get_entity(self.entity_id))
 
     def pointer_press(self, event):
         if event.button != LEFT_BUTTON:
@@ -65,8 +68,12 @@ class NodeTool(EditorTool):
                 self.controller.selection.select_only(entity_id)
             return
         self.node_id = handle.node_id
+        self.handle_kind = getattr(handle, "kind", "node")
         self.controller.selected_node_ids = (self.node_id,)
-        self.original = self.controller.get_entity(self.entity_id).node_position(self.node_id)
+        if self.handle_kind == "bezier_control":
+            self.original = self.controller.bezier_handle_position(self.entity_id, self.node_id)
+        else:
+            self.original = self.controller.get_entity(self.entity_id).node_position(self.node_id)
         self.press_screen = event.screen_pos
         self.press_scene = event.scene_pos
         self.dragging = False
@@ -90,14 +97,19 @@ class NodeTool(EditorTool):
         )
         self.preview_position = snapped
         self.overlays.show_snap(candidate)
-        preview = self.controller.preview_node(self.entity_id, self.node_id, snapped)
+        preview = (
+            self.controller.preview_bezier_handle(self.entity_id, self.node_id, snapped)
+            if self.handle_kind == "bezier_control"
+            else self.controller.preview_node(self.entity_id, self.node_id, snapped)
+        )
         self.adapter.preview_entity(self.entity_id, preview)
         if preview is not None:
             self.overlays.show_nodes(
                 self.entity_id,
-                self.controller.node_positions_for_entity(preview),
+                self.controller.editable_handle_positions_for_entity(preview),
                 (self.node_id,),
             )
+            self.overlays.show_bezier_guides(preview)
         nx, ny = xy(snapped)
         self.overlays.show_measure(
             "X %.3f   Y %.3f   ΔX %.3f   ΔY %.3f mm" % (nx, ny, nx - ox, ny - oy),
@@ -109,16 +121,21 @@ class NodeTool(EditorTool):
             return
         entity_id = self.entity_id
         node_id = self.node_id
+        handle_kind = self.handle_kind
         position = self.preview_position
         was_dragging = self.dragging
         self.adapter.clear_preview()
         self.overlays.clear_transient()
         self.node_id = None
+        self.handle_kind = "node"
         self.press_screen = None
         self.press_scene = None
         self.dragging = False
         if was_dragging:
-            self.controller.move_node(entity_id, node_id, position)
+            if handle_kind == "bezier_control":
+                self.controller.move_bezier_handle(entity_id, node_id, position)
+            else:
+                self.controller.move_node(entity_id, node_id, position)
         self._show_nodes()
 
     def key_press(self, event):

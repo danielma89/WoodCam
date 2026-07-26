@@ -42,6 +42,7 @@ class VectorGraphicsView(QtWidgets.QGraphicsView):
     keyPressed = Signal(object)
     keyReleased = Signal(object)
     cursorMoved = Signal(object)
+    viewChanged = Signal()
     cancelRequested = Signal()
 
     def __init__(self, scene=None, parent=None):
@@ -112,11 +113,13 @@ class VectorGraphicsView(QtWidgets.QGraphicsView):
         self.scale(scale, -scale)
         self._zoom = scale
         self.centerOn(rect.center())
+        self.viewChanged.emit()
 
     def reset_camera(self):
         self.resetTransform()
         self.scale(1.0, -1.0)
         self._zoom = 1.0
+        self.viewChanged.emit()
 
     def _pointer_event(self, event):
         screen = event_screen_point(event)
@@ -130,6 +133,17 @@ class VectorGraphicsView(QtWidgets.QGraphicsView):
         )
 
     def mousePressEvent(self, event):
+        # Do not let the FreeCAD main window steal editor shortcuts after a
+        # canvas click.  We intentionally accept the pointer event below, so
+        # QGraphicsView's default focus hand-off would not otherwise run.
+        self.setFocus()
+        # FreeCAD actions use application-level shortcuts.  While the user is
+        # actively clicking the 2D canvas, explicitly own the keyboard so
+        # Ctrl+A/Delete cannot be redirected to the document tree.
+        try:
+            self.grabKeyboard()
+        except Exception:
+            pass
         if event.button() == RIGHT_BUTTON:
             self._right_canceling = True
             self.cancelRequested.emit()
@@ -143,6 +157,13 @@ class VectorGraphicsView(QtWidgets.QGraphicsView):
             return
         self.pointerPressed.emit(self._pointer_event(event))
         event.accept()
+
+    def focusOutEvent(self, event):
+        try:
+            self.releaseKeyboard()
+        except Exception:
+            pass
+        super(VectorGraphicsView, self).focusOutEvent(event)
 
     def mouseMoveEvent(self, event):
         screen = event_screen_point(event)
@@ -201,6 +222,7 @@ class VectorGraphicsView(QtWidgets.QGraphicsView):
         after = self.mapToScene(screen)
         shift = after - before
         self.translate(shift.x(), shift.y())
+        self.viewChanged.emit()
         event.accept()
 
     def keyPressEvent(self, event):
@@ -261,4 +283,98 @@ class VectorGraphicsView(QtWidgets.QGraphicsView):
         painter.restore()
 
 
-__all__ = ["CanvasPointerEvent", "VectorGraphicsView"]
+class RulerWidget(QtWidgets.QWidget):
+    """Lightweight millimetre ruler synchronized with the editor camera."""
+
+    def __init__(self, view, horizontal=True, parent=None):
+        super(RulerWidget, self).__init__(parent)
+        self.view = view
+        self.horizontal = bool(horizontal)
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+        if self.horizontal:
+            self.setFixedHeight(22)
+        else:
+            # Match the top ruler thickness.  Rotated labels do not require a
+            # 38 px gutter; that old width merely separated the number from
+            # its tick and consumed useful drawing space.
+            self.setFixedWidth(22)
+        view.viewChanged.connect(self.update)
+        view.cursorMoved.connect(lambda _point: self.update())
+        view.horizontalScrollBar().valueChanged.connect(lambda _value: self.update())
+        view.verticalScrollBar().valueChanged.connect(lambda _value: self.update())
+
+    @staticmethod
+    def _step(pixels_per_mm):
+        target_pixels = 70.0
+        if pixels_per_mm <= 1.0e-9:
+            return 10.0
+        raw = target_pixels / pixels_per_mm
+        power = 10.0 ** math.floor(math.log10(max(raw, 1.0e-12)))
+        for multiplier in (1.0, 2.0, 5.0, 10.0):
+            step = power * multiplier
+            if step * pixels_per_mm >= target_pixels:
+                return step
+        return power * 10.0
+
+    def paintEvent(self, event):  # noqa: N802 - Qt virtual name
+        painter = QtGui.QPainter(self)
+        painter.fillRect(self.rect(), QtGui.QColor("#f1f5f9"))
+        painter.setPen(QtGui.QPen(QtGui.QColor("#94a3b8"), 1.0))
+        painter.drawLine(
+            0,
+            self.height() - 1 if self.horizontal else 0,
+            self.width() if self.horizontal else 0,
+            self.height() if self.horizontal else self.height(),
+        )
+        pixels = self.view.pixels_per_mm()
+        step = self._step(pixels)
+        if self.horizontal:
+            start = self.view.mapToScene(QtCore.QPoint(0, 0)).x()
+            end = self.view.mapToScene(QtCore.QPoint(self.width(), 0)).x()
+            first = math.floor(start / step) * step
+            value = first
+            while value <= end + step and value < start + 100000 * step:
+                x = self.view.mapFromScene(QtCore.QPointF(value, 0.0)).x()
+                if 0 <= x <= self.width():
+                    painter.drawLine(x, self.height() - 8, x, self.height() - 1)
+                    text = "%.0f" % value
+                    metrics = painter.fontMetrics()
+                    # The tick is the datum.  Center the label on it instead
+                    # of adding a fixed offset (which drifts at every zoom).
+                    painter.drawText(
+                        int(x - metrics.horizontalAdvance(text) / 2),
+                        16,
+                        text,
+                    )
+                value += step
+        else:
+            top = self.view.mapToScene(QtCore.QPoint(0, 0)).y()
+            bottom = self.view.mapToScene(QtCore.QPoint(0, self.height())).y()
+            low, high = min(top, bottom), max(top, bottom)
+            first = math.floor(low / step) * step
+            value = first
+            while value <= high + step and value < low + 100000 * step:
+                y = self.view.mapFromScene(QtCore.QPointF(0.0, value)).y()
+                if 0 <= y <= self.height():
+                    painter.drawLine(self.width() - 7, y, self.width() - 1, y)
+                    text = "%.0f" % value
+                    metrics = painter.fontMetrics()
+                    painter.save()
+                    # Rotate around the tick itself, so the baseline and the
+                    # tick stay aligned instead of appearing one label-height
+                    # above/below one another.
+                    # Keep the rotated label immediately beside the inner
+                    # tick.  Both rulers now use the same 22 px thickness.
+                    painter.translate(7, y)
+                    painter.rotate(-90)
+                    painter.drawText(
+                        int(-metrics.horizontalAdvance(text) / 2),
+                        int((metrics.ascent() - metrics.descent()) / 2),
+                        text,
+                    )
+                    painter.restore()
+                value += step
+        painter.end()
+
+
+__all__ = ["CanvasPointerEvent", "RulerWidget", "VectorGraphicsView"]

@@ -29,6 +29,13 @@ class BitmapTraceOptions:
     corner_fit: float = 1.0
     curve_tolerance: float = 0.2
     target_width_mm: float = 200.0
+    # Crop coordinates belong to the source bitmap (origin at its upper-left).
+    # Zero width/height means the entire image, keeping older saved options
+    # fully compatible.
+    crop_x_px: int = 0
+    crop_y_px: int = 0
+    crop_width_px: int = 0
+    crop_height_px: int = 0
 
     def __post_init__(self) -> None:
         if not 0 <= int(self.threshold) <= 255:
@@ -41,14 +48,34 @@ class BitmapTraceOptions:
             raise ValueError("A tolerância de curva não pode ser negativa.")
         if not math.isfinite(float(self.target_width_mm)) or float(self.target_width_mm) <= 0.0:
             raise ValueError("A largura final precisa ser positiva.")
+        if int(self.crop_x_px) < 0 or int(self.crop_y_px) < 0:
+            raise ValueError("A origem do recorte não pode ser negativa.")
+        crop_width = int(self.crop_width_px)
+        crop_height = int(self.crop_height_px)
+        if (crop_width == 0) != (crop_height == 0):
+            raise ValueError("Informe largura e altura do recorte, ou deixe ambas em zero.")
+        if crop_width < 0 or crop_height < 0:
+            raise ValueError("As dimensões do recorte não podem ser negativas.")
 
 
-def _pillow_image(path: str | Path):
+def _pillow_image(path: str | Path, options: BitmapTraceOptions | None = None):
     try:
         from PIL import Image
     except ImportError as error:  # pragma: no cover - deployment dependency
         raise RuntimeError("A vetorização de imagem requer Pillow.") from error
     source = Image.open(str(path)).convert("RGBA")
+    options = options or BitmapTraceOptions()
+    crop_width = int(options.crop_width_px)
+    crop_height = int(options.crop_height_px)
+    if crop_width and crop_height:
+        crop_x = int(options.crop_x_px)
+        crop_y = int(options.crop_y_px)
+        if crop_x + crop_width > source.width or crop_y + crop_height > source.height:
+            raise ValueError(
+                "O recorte (%d, %d, %d × %d px) fica fora da imagem %d × %d px."
+                % (crop_x, crop_y, crop_width, crop_height, source.width, source.height)
+            )
+        source = source.crop((crop_x, crop_y, crop_x + crop_width, crop_y + crop_height))
     background = Image.new("RGBA", source.size, (255, 255, 255, 255))
     background.alpha_composite(source)
     return background.convert("L")
@@ -59,7 +86,7 @@ def threshold_mask(path: str | Path, options: BitmapTraceOptions):
 
     from PIL import Image
 
-    gray = _pillow_image(path)
+    gray = _pillow_image(path, options)
     threshold = int(options.threshold)
     if options.invert:
         mask = gray.point(lambda value: 0 if value >= threshold else 255, mode="1")
@@ -132,6 +159,10 @@ def trace_bitmap(
         "trace_corner_fit": float(options.corner_fit),
         "trace_curve_tolerance": float(options.curve_tolerance),
         "trace_target_width_mm": float(options.target_width_mm),
+        "trace_crop_x_px": int(options.crop_x_px),
+        "trace_crop_y_px": int(options.crop_y_px),
+        "trace_crop_width_px": int(options.crop_width_px),
+        "trace_crop_height_px": int(options.crop_height_px),
     }
     entities = []
     for entity in imported.entities:

@@ -13,8 +13,8 @@ from typing import Any, Optional
 
 
 VECTOR_DOCUMENT_FEATURE_NAME = "WoodCAM2D_VectorDocument"
-VECTOR_DOCUMENT_GROUP_NAME = "WoodCAM2D_VectorDrawing"
-VECTOR_DOCUMENT_GROUP_LABEL = "WoodCAM 2D — Desenho"
+VECTOR_DOCUMENT_GROUP_NAME = "WoodCAM_Parts"
+VECTOR_DOCUMENT_GROUP_LABEL = "Peças"
 
 
 class DocumentStoreError(RuntimeError):

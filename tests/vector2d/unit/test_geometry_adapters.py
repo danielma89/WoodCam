@@ -86,6 +86,23 @@ def rectangle(identifier="outer", layer_id="design"):
     return PathEntity(identifier, layer_id, spans, True)
 
 
+def regular_polygon(identifier, center, radius, sides=16, layer_id="design"):
+    import math
+
+    points = tuple(
+        Point(
+            center.x + radius * math.cos(2.0 * math.pi * index / sides),
+            center.y + radius * math.sin(2.0 * math.pi * index / sides),
+        )
+        for index in range(sides)
+    )
+    spans = tuple(
+        LineSpan(points[index], points[(index + 1) % len(points)])
+        for index in range(len(points))
+    )
+    return PathEntity(identifier, layer_id, spans, True)
+
+
 class GeometryAdapterTests(unittest.TestCase):
     def test_cam_contract_preserves_path_and_exact_circle_hole(self):
         outer = rectangle()
@@ -152,6 +169,26 @@ class GeometryAdapterTests(unittest.TestCase):
         self.assertEqual(parts[0].id, "piece-1")
         self.assertEqual(parts[0].quantity, 2)
         self.assertEqual(len(parts[0].circular_holes), 1)
+        self.assertEqual(parts[0].inner_profile_loops, ())
+
+    def test_panelnest_recovers_small_round_hole_imported_as_polyline(self):
+        """A tessellated imported circle must not disappear in PanelNest."""
+        outer = rectangle()
+        imported_hole = regular_polygon("hole-polyline", Point(20, 25), 5)
+        piece = Piece("piece-1", outer.id, (imported_hole.id,))
+        document = Document(
+            {outer.id: outer, imported_hole.id: imported_hole},
+            {"design": Layer("design")},
+            {piece.id: piece},
+        )
+
+        parts = document_to_panel_parts(document, deflection=0.1)
+
+        self.assertEqual(len(parts), 1)
+        self.assertEqual(len(parts[0].circular_holes), 1)
+        self.assertAlmostEqual(parts[0].circular_holes[0]["x"], 20.0, places=6)
+        self.assertAlmostEqual(parts[0].circular_holes[0]["y"], 25.0, places=6)
+        self.assertAlmostEqual(parts[0].circular_holes[0]["diameter_mm"], 10.0, places=3)
         self.assertEqual(parts[0].inner_profile_loops, ())
 
     def test_piece_placement_is_applied_to_outer_and_hole_as_one_unit(self):

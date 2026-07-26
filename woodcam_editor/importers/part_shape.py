@@ -88,6 +88,33 @@ class ImportResult:
         return self.layers
 
 
+@dataclass(frozen=True)
+class _ShapeSource:
+    """A read-only effective Shape plus the originating tree label.
+
+    ``Part.getShape`` is essential for an ``App::Link``: its visible
+    placement belongs to the instance, while ``obj.Shape`` can refer to the
+    unplaced linked object.  The adapter lets the normal Shape importer keep
+    its single-source contract without ever altering the source document.
+    """
+
+    name: str
+    label: str
+    shape: Any
+
+    @property
+    def Name(self):  # FreeCAD-style spelling used by import_part_shape.
+        return self.name
+
+    @property
+    def Label(self):
+        return self.label
+
+    @property
+    def Shape(self):
+        return self.shape
+
+
 def _domain_api():
     from woodcam_editor.domain.primitives import Vec2, new_id
     from woodcam_editor.domain.spans import ArcSpan, CubicBezierSpan, LineSpan
@@ -137,16 +164,313 @@ def _point3(value: Any) -> tuple[float, float, float]:
     )
 
 
-def _transform_point(value: Any, placement: Any = None) -> tuple[float, float, float]:
-    if placement is None:
-        return _point3(value)
-    try:
-        import FreeCAD  # type: ignore
+@dataclass(frozen=True)
+class _PlaneProjection:
+    """Orthonormal local XY plane used to flatten one planar Part face.
 
-        source = value if hasattr(value, "x") else FreeCAD.Vector(*_point3(value))
-        return _point3(placement.multVec(source))
+    The Editor domain is deliberately 2D.  A furniture assembly, however,
+    often contains panels standing on their edge.  Projecting the selected
+    broad face into a local plane avoids accidentally importing the MDF
+    thickness faces as the part profile.
+    """
+
+    origin: tuple[float, float, float]
+    axis_x: tuple[float, float, float]
+    axis_y: tuple[float, float, float]
+
+    def project(self, value: Any) -> tuple[float, float, float]:
+        point = _point3(value)
+        delta = tuple(point[index] - self.origin[index] for index in range(3))
+        return (
+            sum(delta[index] * self.axis_x[index] for index in range(3)),
+            sum(delta[index] * self.axis_y[index] for index in range(3)),
+            0.0,
+        )
+
+
+def _dot(left: tuple[float, float, float], right: tuple[float, float, float]) -> float:
+    return sum(left[index] * right[index] for index in range(3))
+
+
+def _cross(left: tuple[float, float, float], right: tuple[float, float, float]):
+    return (
+        left[1] * right[2] - left[2] * right[1],
+        left[2] * right[0] - left[0] * right[2],
+        left[0] * right[1] - left[1] * right[0],
+    )
+
+
+def _normalized(value: tuple[float, float, float]) -> tuple[float, float, float]:
+    length = math.sqrt(_dot(value, value))
+    if length <= 1.0e-12:
+        raise ValueError("O plano da face não possui normal válida.")
+    return tuple(component / length for component in value)
+
+
+def _face_normal(face: Any) -> Optional[tuple[float, float, float]]:
+    try:
+        return _normalized(_point3(face.normalAt(0.0, 0.0)))
     except Exception:
-        return _point3(value)
+        return None
+
+
+def _is_planar_face(face: Any) -> bool:
+    """Reject curved side faces when selecting a panel's broad face."""
+
+    checker = getattr(face, "isPlanar", None)
+    if callable(checker):
+        try:
+            return bool(checker())
+        except Exception:
+            pass
+    surface = getattr(face, "Surface", None)
+    if surface is None:
+        # Lightweight importer fakes used by integrations often expose only
+        # normalAt/Area.  Retain the historical permissive fallback there.
+        return True
+    description = "%s %s" % (
+        type(surface).__name__,
+        getattr(surface, "TypeId", ""),
+    )
+    return "plane" in description.lower()
+
+
+def _horizontal_face_height(face: Any, normal: tuple[float, float, float]) -> float:
+    """Prefer the same physical side of horizontal solids for temporary unions."""
+
+    if abs(abs(normal[2]) - 1.0) > 1.0e-8:
+        return 0.0
+    try:
+        return float(face.CenterOfMass.z)
+    except Exception:
+        return 0.0
+
+
+def _canonical_normal_key(normal: tuple[float, float, float]) -> tuple[float, float, float]:
+    """Stable orientation tie-breaker for the two broad sides of a panel.
+
+    OCC is free to list either side of a box first.  When neither side has
+    more machining detail, choosing a canonical normal makes every solid in
+    the *same source part* pick the same physical side.  That matters for a
+    compound used as one dogbone-shaped part: a central plate and the circular
+    pads must be coplanar before they can be fused in the temporary import.
+
+    More wires/edges still win before this key, so a genuinely detailed face
+    (holes or pockets) remains authoritative.
+    """
+
+    for component in normal:
+        if abs(component) > 1.0e-8:
+            sign = 1.0 if component > 0.0 else -1.0
+            return tuple(round(component * sign, 12) for component in normal)
+    return (0.0, 0.0, 0.0)
+
+
+def _normal_side_key(normal: tuple[float, float, float]) -> int:
+    """Choose a repeatable side when two broad faces are otherwise equal."""
+
+    for component in normal:
+        if abs(component) > 1.0e-8:
+            return 1 if component > 0.0 else 0
+    return 0
+
+
+def _plane_projection(face: Any, normal: tuple[float, float, float]) -> _PlaneProjection:
+    vertices = list(getattr(face, "Vertexes", []) or [])
+    if vertices:
+        origin = _point3(vertices[0].Point)
+    else:
+        origin = _point3(getattr(face, "CenterOfMass"))
+    reference = min(
+        ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+        key=lambda axis: abs(_dot(axis, normal)),
+    )
+    axis_x = _normalized(_cross(reference, normal))
+    axis_y = _normalized(_cross(normal, axis_x))
+    return _PlaneProjection(origin, axis_x, axis_y)
+
+
+def _select_panel_face(solid: Any):
+    """Choose the useful broad face of a panel, never one thickness side.
+
+    First keep only faces close to the largest planar face.  This discards
+    the four narrow MDF sides even on long narrow strips.  Between the two
+    broad faces, prefer the one with more wires/edges and then its actual
+    face area.  This deliberately follows the proven Assembly→DXF macro:
+    details win first; if both sides carry the same details, the broadest face
+    is the stable tiebreaker.
+    """
+
+    candidates = []
+    for index, face in enumerate(list(getattr(solid, "Faces", []) or [])):
+        if not _is_planar_face(face):
+            continue
+        normal = _face_normal(face)
+        if normal is None:
+            continue
+        area = max(0.0, float(getattr(face, "Area", 0.0)))
+        if area <= 1.0e-9:
+            continue
+        candidates.append((index, face, normal, area))
+    if not candidates:
+        return None
+    # A chapa tem duas faces grandes e paralelas; as outras quatro são as
+    # faces da espessura.  Escolher apenas por "mais wires" podia escolher
+    # uma lateral longa quando ela recebia muitos encaixes.  A macro de
+    # fabricação resolve isto começando pela maior face e só comparando faces
+    # paralelas a ela.  Mantemos a mesma regra aqui, antes de pontuar recortes.
+    largest = max(candidates, key=lambda candidate: candidate[3])
+    largest_area = largest[3]
+    largest_normal = largest[2]
+    broad = [
+        candidate
+        for candidate in candidates
+        if candidate[3] >= largest_area * 0.45
+        and abs(_dot(largest_normal, candidate[2])) >= 1.0 - 1.0e-4
+    ]
+    return max(
+        broad,
+        key=lambda candidate: (
+            len(list(getattr(candidate[1], "Wires", []) or [])),
+            len(list(getattr(candidate[1], "Edges", []) or [])),
+            # For coplanar top/bottom alternatives, retain the upper face.
+            # It is where OCC keeps the fused manufacturing outline for
+            # compound panel features such as dogbones.  Area remains the
+            # macro-compatible deterministic tiebreaker after that.
+            _horizontal_face_height(candidate[1], candidate[2]),
+            _normal_side_key(candidate[2]),
+            _canonical_normal_key(candidate[2]),
+            candidate[3],
+        ),
+    )
+
+
+def _faces_are_coplanar(
+    first: Any,
+    second: Any,
+    tolerance: float = 1.0e-7,
+) -> bool:
+    """Return whether two planar faces occupy the same mathematical plane."""
+
+    first_normal = _face_normal(first)
+    second_normal = _face_normal(second)
+    if first_normal is None or second_normal is None:
+        return False
+    if abs(_dot(first_normal, second_normal)) < 1.0 - 1.0e-6:
+        return False
+    try:
+        first_point = _point3(first.CenterOfMass)
+        second_point = _point3(second.CenterOfMass)
+    except Exception:
+        return False
+    delta = tuple(second_point[index] - first_point[index] for index in range(3))
+    return abs(_dot(delta, first_normal)) <= tolerance
+
+
+def _faces_have_positive_overlap(first: Any, second: Any, tolerance: float = 1.0e-7) -> bool:
+    """Return whether coplanar faces have a *partial* material overlap.
+
+    The earlier XY bounding-box guard was correct only for panels that already
+    lay flat.  A standing panel has virtually zero XY footprint, so it made a
+    plate-plus-circular-pads compound impossible to recognize.  OCC ``common``
+    is evaluated in the native face plane and works for every orientation.
+    """
+
+    try:
+        if not _faces_are_coplanar(first, second, tolerance):
+            return False
+        common = first.common(second)
+        if bool(getattr(common, "isNull", lambda: True)()):
+            return False
+        common_area = float(getattr(common, "Area", 0.0))
+        first_area = max(0.0, float(getattr(first, "Area", 0.0)))
+        second_area = max(0.0, float(getattr(second, "Area", 0.0)))
+        if common_area <= tolerance:
+            return False
+        # Do not silently merge an entire smaller face into a larger one or
+        # collapse duplicate/coincident solids.  In an Assembly those are
+        # commonly independent boards/instances.  A dogbone extension has a
+        # real partial intersection: each round pad overlaps the plate but
+        # also extends beyond it.
+        return common_area < min(first_area, second_area) - tolerance
+    except Exception:
+        return False
+
+
+def _fuse_overlapping_xy_faces(source_shapes: Iterable[tuple[Any, Optional[_PlaneProjection]]]):
+    """Fuse overlapping coplanar source faces into one import outline.
+
+    A dogbone-style cutout is often authored as a square plus four circular
+    pads.  Its source object is a compound of solids, so importing every
+    broad face independently turns one intended contour into a square and
+    four circles.  The fusion happens on a temporary OCC copy; the source
+    object, its Shape and the FreeCAD document are never modified.
+
+    Faces that merely touch are intentionally not fused.  Furniture panels
+    may share an edge in an assembly but remain distinct CNC pieces.
+    """
+
+    # The historical name remains for compatibility with callers/tests.  The
+    # operation is intentionally orientation-independent: every candidate
+    # comes from one source Shape, so fusing is allowed only for faces that
+    # share the same physical plane *and* positive material area.
+    candidates = tuple(source_shapes)
+    groups = []
+    for face, projection in candidates:
+        matching = [
+            index
+            for index, group in enumerate(groups)
+            if any(_faces_have_positive_overlap(face, member[0]) for member in group)
+        ]
+        if not matching:
+            groups.append([(face, projection)])
+            continue
+        combined = [(face, projection)]
+        for index in reversed(matching):
+            combined.extend(groups.pop(index))
+        groups.append(combined)
+
+    fused = []
+    for group in groups:
+        if len(group) == 1:
+            fused.append(group[0])
+            continue
+        try:
+            # Fusing the cluster in one OCC operation is important: repeated
+            # pair fuses can preserve splitter faces and reintroduce the
+            # square-plus-circles representation during wire import.
+            combined_shape = group[0][0].multiFuse(
+                [member[0] for member in group[1:]]
+            ).removeSplitter()
+            if bool(getattr(combined_shape, "isNull", lambda: True)()):
+                raise ValueError("união OCC retornou forma nula")
+            # Each temporary fusion remains in the plane established by the
+            # first face.  Reusing that projection avoids a per-solid local
+            # origin/axis from separating members that are now one profile.
+            fused.append((combined_shape, group[0][1]))
+        except Exception:
+            # A failed boolean must not make an import lose geometry.
+            fused.extend(group)
+    return tuple(fused)
+
+
+
+def _transform_point(
+    value: Any,
+    placement: Any = None,
+    projection: Optional[_PlaneProjection] = None,
+) -> tuple[float, float, float]:
+    if placement is None:
+        result = _point3(value)
+    else:
+        try:
+            import FreeCAD  # type: ignore
+
+            source = value if hasattr(value, "x") else FreeCAD.Vector(*_point3(value))
+            result = _point3(placement.multVec(source))
+        except Exception:
+            result = _point3(value)
+    return projection.project(result) if projection is not None else result
 
 
 def _span_values(api: Mapping[str, Any], start: Any, end: Any) -> dict:
@@ -327,17 +651,25 @@ def _ellipse_entity(
     return _construct(api["EllipseEntity"], values)
 
 
-def _edge_endpoints(edge: Any, placement: Any = None):
+def _edge_endpoints(
+    edge: Any,
+    placement: Any = None,
+    projection: Optional[_PlaneProjection] = None,
+):
     vertices = list(getattr(edge, "Vertexes", []) or [])
     if len(vertices) < 2:
         return None
     return (
-        _transform_point(vertices[0].Point, placement),
-        _transform_point(vertices[-1].Point, placement),
+        _transform_point(vertices[0].Point, placement, projection),
+        _transform_point(vertices[-1].Point, placement, projection),
     )
 
 
-def _edge_midpoint(edge: Any, placement: Any = None):
+def _edge_midpoint(
+    edge: Any,
+    placement: Any = None,
+    projection: Optional[_PlaneProjection] = None,
+):
     first = float(getattr(edge, "FirstParameter", 0.0))
     last = float(getattr(edge, "LastParameter", 1.0))
     parameter = (first + last) * 0.5
@@ -345,7 +677,7 @@ def _edge_midpoint(edge: Any, placement: Any = None):
         value = edge.valueAt(parameter)
     except Exception:
         value = edge.Curve.value(parameter)
-    return _transform_point(value, placement)
+    return _transform_point(value, placement, projection)
 
 
 def _clockwise(start: Any, forward_sample: Any, center: Any) -> bool:
@@ -371,8 +703,9 @@ def _edge_to_span(
     edge: Any,
     api: Mapping[str, Any],
     placement: Any,
+    projection: Optional[_PlaneProjection] = None,
 ):
-    endpoints = _edge_endpoints(edge, placement)
+    endpoints = _edge_endpoints(edge, placement, projection)
     if endpoints is None:
         return None, "A aresta não possui duas extremidades."
     start_3d, end_3d = endpoints
@@ -385,7 +718,7 @@ def _edge_to_span(
         return _line_span(api, start, end), None
 
     if "circle" in curve_name:
-        center_3d = _transform_point(curve.Center, placement)
+        center_3d = _transform_point(curve.Center, placement, projection)
         first_parameter = float(getattr(edge, "FirstParameter", 0.0))
         last_parameter = float(getattr(edge, "LastParameter", 1.0))
         forward_parameter = first_parameter + (last_parameter - first_parameter) * 1.0e-6
@@ -393,7 +726,7 @@ def _edge_to_span(
             forward_value = edge.valueAt(forward_parameter)
         except Exception:
             forward_value = curve.value(forward_parameter)
-        forward_3d = _transform_point(forward_value, placement)
+        forward_3d = _transform_point(forward_value, placement, projection)
         return (
             _arc_span(
                 api,
@@ -409,7 +742,10 @@ def _edge_to_span(
         poles = list(curve.getPoles())
         if len(poles) != 4:
             return None, f"Bézier de {len(poles) - 1} grau ainda não suportada."
-        transformed = [_vec2(api, _transform_point(point, placement)) for point in poles]
+        transformed = [
+            _vec2(api, _transform_point(point, placement, projection))
+            for point in poles
+        ]
         if transformed[0].distance_to(start) > transformed[-1].distance_to(start):
             transformed.reverse()
         return _bezier_span(api, start, transformed[1], transformed[2], end), None
@@ -422,14 +758,18 @@ def _full_curve_entity(
     api: Mapping[str, Any],
     layer_id: str,
     placement: Any,
+    projection: Optional[_PlaneProjection] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
 ):
     curve = getattr(edge, "Curve", None)
     name = _curve_name(curve)
     if "circle" in name:
-        center = _vec2(api, _transform_point(curve.Center, placement))
-        return _circle_entity(api, layer_id, center, float(curve.Radius)), None
+        center = _vec2(api, _transform_point(curve.Center, placement, projection))
+        return _circle_entity(
+            api, layer_id, center, float(curve.Radius), metadata=metadata
+        ), None
     if "ellipse" in name:
-        center = _vec2(api, _transform_point(curve.Center, placement))
+        center = _vec2(api, _transform_point(curve.Center, placement, projection))
         x_axis = getattr(curve, "XAxis", None)
         rotation = math.atan2(float(x_axis.y), float(x_axis.x)) if x_axis is not None else 0.0
         return (
@@ -440,10 +780,236 @@ def _full_curve_entity(
                 float(curve.MajorRadius),
                 float(curve.MinorRadius),
                 rotation,
+                metadata=metadata,
             ),
             None,
         )
     return None, f"Curva fechada não suportada: {type(curve).__name__}."
+
+
+def _shape_has_solids(shape: Any) -> bool:
+    try:
+        return shape is not None and not shape.isNull() and bool(list(shape.Solids or ()))
+    except Exception:
+        return False
+
+
+def _effective_tree_shape(source: Any) -> Any:
+    """Read an object's displayed shape, resolving App::Link when possible."""
+
+    try:
+        import Part  # type: ignore
+
+        try:
+            return Part.getShape(
+                source,
+                "",
+                needSubElement=False,
+                refine=False,
+            )
+        except TypeError:
+            return Part.getShape(source)
+    except Exception:
+        return getattr(source, "Shape", None)
+
+
+def _tree_children(source: Any) -> tuple[Any, ...]:
+    """Return structural children without following a Link target twice."""
+
+    if source is None:
+        return ()
+    type_id = str(getattr(source, "TypeId", "") or "")
+    if type_id.startswith("App::Link") or type_id == "PartDesign::Body":
+        return ()
+    candidates = []
+    for property_name in ("Group", "ElementList", "Elements"):
+        try:
+            candidates.extend(
+                item for item in (getattr(source, property_name, None) or ())
+                if hasattr(item, "Name")
+            )
+        except Exception:
+            pass
+    if not candidates:
+        try:
+            candidates.extend(
+                item for item in (getattr(source, "OutList", None) or ())
+                if hasattr(item, "Name")
+            )
+        except Exception:
+            pass
+    unique = []
+    seen = set()
+    for item in candidates:
+        key = (
+            str(getattr(getattr(item, "Document", None), "Name", "")),
+            str(getattr(item, "Name", id(item))),
+        )
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+    return tuple(unique)
+
+
+def _collect_tree_shape_sources(sources: Iterable[Any]) -> tuple[_ShapeSource, ...]:
+    """Mirror the Assembly→DXF macro's component traversal.
+
+    The direct Editor import used to read ``Shape`` from the selected
+    container.  A furniture generator often exposes a consolidated shape
+    there, which loses the 98 logical boards that still exist below it in the
+    tree.  Walk containers first, treat Links and Bodies as physical leaves,
+    and fall back to the container only if it did not yield a leaf.
+    """
+
+    result = []
+    visited = set()
+
+    def visit(source: Any, depth: int = 0) -> None:
+        if source is None or depth > 50:
+            return
+        key = (
+            str(getattr(getattr(source, "Document", None), "Name", "")),
+            str(getattr(source, "Name", id(source))),
+        )
+        if key in visited:
+            return
+        visited.add(key)
+
+        children = _tree_children(source)
+        before = len(result)
+        for child in children:
+            visit(child, depth + 1)
+        if children and len(result) > before:
+            return
+
+        shape = _effective_tree_shape(source)
+        if not _shape_has_solids(shape):
+            return
+        result.append(
+            _ShapeSource(
+                name=str(getattr(source, "Name", "") or "part_shape"),
+                label=str(
+                    getattr(source, "Label", "")
+                    or getattr(source, "Name", "")
+                    or "Peça importada"
+                ),
+                shape=shape,
+            )
+        )
+
+    for source in sources or ():
+        visit(source)
+    return tuple(result)
+
+
+def _stage_tree_imports(results: Iterable[ImportResult]) -> tuple[Any, ...]:
+    """Park independent flattened boards in a compact, non-nesting grid."""
+
+    from woodcam_editor.domain.entities import GroupEntity
+    from woodcam_editor.domain.primitives import Affine2D, Vec2
+
+    blocks = []
+    total_area = 0.0
+    widest = 25.0
+    for result in results:
+        entities = tuple(result.entities)
+        leaves = tuple(entity for entity in entities if not isinstance(entity, GroupEntity))
+        if not leaves:
+            continue
+        min_x = min(entity.bounds().min_x for entity in leaves)
+        min_y = min(entity.bounds().min_y for entity in leaves)
+        max_x = max(entity.bounds().max_x for entity in leaves)
+        max_y = max(entity.bounds().max_y for entity in leaves)
+        width = max(0.0, max_x - min_x)
+        height = max(0.0, max_y - min_y)
+        blocks.append((entities, min_x, min_y, width, height))
+        total_area += (width + 25.0) * (height + 25.0)
+        widest = max(widest, width + 25.0)
+    if not blocks:
+        return ()
+
+    target_row_width = max(widest, math.sqrt(total_area) * 1.25)
+    placed = []
+    x_value = 0.0
+    y_value = 0.0
+    row_height = 0.0
+    for entities, min_x, min_y, width, height in blocks:
+        if x_value > 0.0 and x_value + width > target_row_width:
+            x_value = 0.0
+            y_value += row_height + 25.0
+            row_height = 0.0
+        transform = Affine2D.translation(Vec2(x_value - min_x, y_value - min_y))
+        placed.extend(
+            entity if isinstance(entity, GroupEntity) else entity.transformed(transform)
+            for entity in entities
+        )
+        x_value += width + 25.0
+        row_height = max(row_height, height)
+    return tuple(placed)
+
+
+def _mark_tree_result_instance(
+    result: ImportResult,
+    source: _ShapeSource,
+    index: int,
+) -> ImportResult:
+    """Attach a stable physical-board scope to one imported tree leaf."""
+
+    instance_id = "%03d:%s" % (int(index), source.name)
+    entities = []
+    for entity in result.entities:
+        metadata = dict(getattr(entity, "metadata", {}) or {})
+        metadata.update(
+            {
+                "source_tree_instance_id": instance_id,
+                "source_tree_label": source.label,
+            }
+        )
+        entities.append(replace(entity, metadata=metadata))
+    return ImportResult(entities, result.issues, result.source_metadata, result.layers)
+
+
+def import_freecad_tree(
+    sources: Iterable[Any],
+    *,
+    layer_id: str,
+    flatten_solids: bool = False,
+    compound_groups: bool = False,
+) -> ImportResult:
+    """Import actual Assembly tree components instead of a merged container.
+
+    This is the direct, no-PanelNest equivalent of the Assembly→DXF macro's
+    extraction stage.  It is a read-only snapshot and deliberately does not
+    run nesting or change any Shape/FCStd object.
+    """
+
+    tree_sources = _collect_tree_shape_sources(sources)
+    imported = tuple(
+        _mark_tree_result_instance(
+            import_part_shape(
+            source,
+            layer_id=layer_id,
+            flatten_solids=flatten_solids,
+            compound_groups=compound_groups,
+            ),
+            source,
+            index,
+        )
+        for index, source in enumerate(tree_sources, start=1)
+    )
+    issues = tuple(issue for result in imported for issue in result.issues)
+    layers = {}
+    for result in imported:
+        layers.update(result.layers)
+    return ImportResult(
+        _stage_tree_imports(imported),
+        issues,
+        {
+            "source_kind": "freecad_tree",
+            "source_count": len(tree_sources),
+        },
+        layers,
+    )
 
 
 def import_part_shape(
@@ -451,12 +1017,22 @@ def import_part_shape(
     *,
     layer_id: str,
     placement: Any = None,
+    flatten_solids: bool = False,
+    compound_groups: bool = False,
 ) -> ImportResult:
     """Copy an OCC Shape without modifying/hiding the source object.
 
     ``placement`` is explicit to avoid accidentally applying an object's
     placement twice.  FreeCAD ``Shape`` coordinates are normally already in
     the object's shape placement.
+
+    ``compound_groups`` preserves the object identity of each source face.
+    A face can legitimately contain one outer profile plus several exact
+    circular holes/inner wires.  The Editor still stores those wires as
+    independent vectors for CAM, but exposes them as one selectable compound
+    (the same semantic role as ``Part.makeCompound(face.Wires)`` in the
+    Assembly→DXF macro).  It is opt-in because low-level boolean callers
+    already create their own compound group.
     """
 
     api = _domain_api()
@@ -464,37 +1040,60 @@ def import_part_shape(
     if shape is None or bool(getattr(shape, "isNull", lambda: True)()):
         raise ValueError("O objeto selecionado não possui Shape importável.")
 
-    # For 3D solids, copy one horizontal planar face per solid instead of
-    # importing repeated top/bottom/side wires.  A PanelNest CAM compound can
-    # contain many solids, and each one is an independent part that must reach
-    # the editor. Explicit Face/wire input remains untouched.
-    source_shapes = [shape]
+    # For a solid, copy only its useful broad planar face.  A PanelNest layout
+    # is already flat on XY and must be preferred whenever it exists.  Generic
+    # imports keep that safe default: upright solids are skipped with a clear
+    # issue instead of guessing a cabinet face.  The explicit experimental
+    # ``flatten_solids`` path remains available to a caller that truly has no
+    # PanelNest layout to use.
+    source_shapes = [(shape, None)]
+    source_issues = []
     solids = list(getattr(shape, "Solids", []) or [])
     if solids:
         solid_faces = []
-        for solid in solids:
-            planar_faces = []
-            for face in list(getattr(solid, "Faces", []) or []):
-                try:
-                    normal = face.normalAt(0.0, 0.0)
-                    if abs(abs(float(normal.z)) - 1.0) <= 1.0e-8:
-                        planar_faces.append(face)
-                except Exception:
-                    continue
-            if planar_faces:
-                solid_faces.append(
-                    max(
-                        planar_faces,
-                        key=lambda face: float(getattr(face, "Area", 0.0)),
+        for solid_index, solid in enumerate(solids):
+            selected = _select_panel_face(solid)
+            if selected is None:
+                continue
+            _index, face, normal, _area = selected
+            projection = None
+            if abs(abs(normal[2]) - 1.0) > 1.0e-8:
+                if not flatten_solids:
+                    source_issues.append(
+                        ImportIssue(
+                            solid_index,
+                            "Solid",
+                            "Peça em pé ignorada: use Arquivo → Importar peças planas "
+                            "pelo PanelNest para ler o perfil sem executar nesting.",
+                        )
                     )
-                )
+                    continue
+                projection = _plane_projection(face, normal)
+            solid_faces.append((face, projection))
         if solid_faces:
-            source_shapes = solid_faces
+            source_shapes = _fuse_overlapping_xy_faces(solid_faces)
+        else:
+            source_shapes = []
 
     entities = []
-    issues = []
-    records = []
-    for source_shape in source_shapes:
+    issues = list(source_issues)
+    flattened_groups = []
+    # The child IDs survive staging transforms below.  Build the logical
+    # compound only after those transforms, keeping it in VectorDocument
+    # instead of storing geometric state in the scene.
+    compound_child_groups = []
+    for source_shape, projection in source_shapes:
+        outer_wire = getattr(source_shape, "OuterWire", None)
+
+        def wire_is_outer(candidate):
+            if candidate is None or outer_wire is None:
+                return False
+            try:
+                return bool(candidate.isSame(outer_wire))
+            except Exception:
+                return candidate is outer_wire
+
+        records = []
         local_covered_edges = []
         for wire in list(getattr(source_shape, "Wires", []) or []):
             wire_edges = list(
@@ -517,41 +1116,154 @@ def import_part_shape(
             if not is_covered:
                 records.append((None, [edge]))
 
-    for wire_index, (wire, wire_edges) in enumerate(records):
-        if len(wire_edges) == 1 and bool(getattr(wire_edges[0], "isClosed", lambda: False)()):
-            entity, message = _full_curve_entity(
-                wire_edges[0], api, layer_id, placement
-            )
-            if entity is not None:
-                entities.append(entity)
-            else:
-                issues.append(
-                    ImportIssue(wire_index, type(wire_edges[0].Curve).__name__, message or "Não suportada")
-                )
-            continue
-
-        spans = []
-        for edge_index, edge in enumerate(wire_edges):
-            span, message = _edge_to_span(edge, api, placement)
-            if span is not None:
-                spans.append(span)
-            else:
-                issues.append(
-                    ImportIssue(
-                        edge_index,
-                        type(getattr(edge, "Curve", edge)).__name__,
-                        message or "Aresta não suportada.",
-                    )
-                )
-        if spans:
-            entities.append(
-                _path_entity(
+        source_entities = []
+        for wire_index, (wire, wire_edges) in enumerate(records):
+            # A broad OCC face already knows the manufacturing role of each
+            # wire.  Preserve that fact as metadata; the UI later remaps it
+            # to document-local layers without changing the source Shape.
+            role = "design"
+            if wire is not None:
+                if wire_is_outer(wire):
+                    role = "cut_external"
+                elif len(wire_edges) == 1 and bool(
+                    getattr(wire_edges[0], "isClosed", lambda: False)()
+                ):
+                    curve = getattr(wire_edges[0], "Curve", None)
+                    radius = getattr(curve, "Radius", None)
+                    # A small circular edge is a drilled hole; a larger one
+                    # is an internal profile and must not be hidden in Furos.
+                    try:
+                        role = "drill" if float(radius) * 2.0 <= 12.0 + 1e-9 else "cut_internal"
+                    except (TypeError, ValueError):
+                        role = "drill"
+                else:
+                    role = "cut_internal"
+            elif len(wire_edges) == 1 and bool(
+                getattr(wire_edges[0], "isClosed", lambda: False)()
+            ):
+                # A standalone circular edge in a compound is still a drill
+                # even though OCC did not expose it through a Wire object.
+                curve_name = _curve_name(getattr(wire_edges[0], "Curve", None))
+                if "circle" in curve_name:
+                    curve = getattr(wire_edges[0], "Curve", None)
+                    radius = getattr(curve, "Radius", None)
+                    try:
+                        role = "drill" if float(radius) * 2.0 <= 12.0 + 1e-9 else "cut_internal"
+                    except (TypeError, ValueError):
+                        role = "drill"
+            role_metadata = {"import_role": role}
+            if len(wire_edges) == 1 and bool(getattr(wire_edges[0], "isClosed", lambda: False)()):
+                entity, message = _full_curve_entity(
+                    wire_edges[0],
                     api,
                     layer_id,
-                    spans,
-                    bool(wire is not None and wire.isClosed()),
+                    placement,
+                    projection,
+                    metadata=role_metadata,
                 )
+                if entity is not None:
+                    source_entities.append(entity)
+                else:
+                    issues.append(
+                        ImportIssue(wire_index, type(wire_edges[0].Curve).__name__, message or "Não suportada")
+                    )
+                continue
+
+            spans = []
+            for edge_index, edge in enumerate(wire_edges):
+                span, message = _edge_to_span(edge, api, placement, projection)
+                if span is not None:
+                    spans.append(span)
+                else:
+                    issues.append(
+                        ImportIssue(
+                            edge_index,
+                            type(getattr(edge, "Curve", edge)).__name__,
+                            message or "Aresta não suportada.",
+                        )
+                    )
+            if spans:
+                source_entities.append(
+                    _path_entity(
+                        api,
+                        layer_id,
+                        spans,
+                        bool(wire is not None and wire.isClosed()),
+                        metadata=role_metadata,
+                    )
+                )
+        if projection is None:
+            entities.extend(source_entities)
+            if compound_groups and len(source_entities) > 1:
+                compound_child_groups.append(
+                    tuple(str(entity.id) for entity in source_entities)
+                )
+        elif source_entities:
+            flattened_groups.append(source_entities)
+            if compound_groups and len(source_entities) > 1:
+                compound_child_groups.append(
+                    tuple(str(entity.id) for entity in source_entities)
+                )
+
+    # A local plane has no useful shared XY position with the assembly.  Put
+    # every flattened solid in a compact staging grid so that piece recognition
+    # never mistakes one panel for a hole of another before the organizer runs.
+    #
+    # This is deliberately *not* nesting: no rotation is chosen, no material
+    # sheet is consumed and no placement is persisted as a machining layout.
+    # It is simply the same safe presentation used by the Assembly→DXF macro:
+    # each broad face is flattened independently and parked near the others,
+    # instead of producing one enormous horizontal strip of vectors.
+    if flattened_groups:
+        from woodcam_editor.domain.primitives import Affine2D, Vec2
+
+        raw_max_x = max((entity.bounds().max_x for entity in entities), default=-25.0)
+        gap = 25.0
+        group_bounds = []
+        total_area = 0.0
+        widest = gap
+        for group in flattened_groups:
+            group_min_x = min(entity.bounds().min_x for entity in group)
+            group_min_y = min(entity.bounds().min_y for entity in group)
+            group_max_x = max(entity.bounds().max_x for entity in group)
+            group_max_y = max(entity.bounds().max_y for entity in group)
+            width = max(0.0, group_max_x - group_min_x)
+            height = max(0.0, group_max_y - group_min_y)
+            group_bounds.append((group, group_min_x, group_min_y, width, height))
+            total_area += (width + gap) * (height + gap)
+            widest = max(widest, width + gap)
+        # A square-root target keeps a cabinet import visually compact while
+        # remaining deterministic and very cheap for hundreds of panels.
+        target_row_width = max(widest, math.sqrt(total_area) * 1.25)
+        staging_x = raw_max_x + gap
+        staging_y = 0.0
+        row_height = 0.0
+        for group, group_min_x, group_min_y, width, height in group_bounds:
+            if staging_x > raw_max_x + gap and staging_x + width > raw_max_x + gap + target_row_width:
+                staging_x = raw_max_x + gap
+                staging_y += row_height + gap
+                row_height = 0.0
+            translation = Affine2D.translation(
+                Vec2(staging_x - group_min_x, staging_y - group_min_y)
             )
+            entities.extend(entity.transformed(translation) for entity in group)
+            staging_x += width + gap
+            row_height = max(row_height, height)
+
+    if compound_groups and compound_child_groups:
+        from woodcam_editor.domain.entities import GroupEntity
+
+        entities.extend(
+            GroupEntity(
+                layer_id=layer_id,
+                child_ids=child_ids,
+                metadata={
+                    "name": "Peça importada",
+                    "source_kind": "part_face_compound",
+                },
+            )
+            for child_ids in compound_child_groups
+        )
 
     metadata = {
         "source_kind": "part_shape",
@@ -560,21 +1272,56 @@ def import_part_shape(
     }
     source_layer_key = metadata["source_name"] or "part_shape:default"
     source_layer_name = metadata["source_label"] or metadata["source_name"] or "Forma importada"
+    role_layers = {
+        "cut_external": ImportLayerDescriptor(
+            source_key=source_layer_key + ":cut_external",
+            name="Corte externo",
+            color="#f97316",
+            purpose="cut",
+        ),
+        "cut_internal": ImportLayerDescriptor(
+            source_key=source_layer_key + ":cut_internal",
+            name="Corte interno",
+            color="#f59e0b",
+            purpose="pocket",
+        ),
+        "drill": ImportLayerDescriptor(
+            source_key=source_layer_key + ":drill",
+            name="Furos",
+            color="#2563eb",
+            purpose="drill",
+        ),
+    }
     marked_entities = []
     for entity in entities:
         entity_metadata = dict(getattr(entity, "metadata", {}) or {})
+        role = str(entity_metadata.get("import_role", "design") or "design")
+        entity_layer_key = (
+            source_layer_key + ":" + role if role in role_layers else source_layer_key
+        )
         entity_metadata.update(
             {
                 "source_format": "part_shape",
-                "source_layer_key": source_layer_key,
+                "source_layer_key": entity_layer_key,
             }
         )
         marked_entities.append(replace(entity, metadata=entity_metadata))
+    used_roles = {
+        str((getattr(entity, "metadata", {}) or {}).get("import_role", "") or "")
+        for entity in marked_entities
+    }
     layers = {
         source_layer_key: ImportLayerDescriptor(
             source_key=source_layer_key,
             name=source_layer_name,
             purpose="design",
-        )
+        ),
     }
+    layers.update(
+        {
+            key: descriptor
+            for key, descriptor in role_layers.items()
+            if key.rsplit(":", 1)[-1] in used_roles
+        }
+    )
     return ImportResult(tuple(marked_entities), tuple(issues), metadata, layers)

@@ -47,7 +47,13 @@ def mesh_data_from_object(obj, linear_deflection=0.08):
     shape = getattr(obj, "Shape", None)
     if shape is not None and not bool(getattr(shape, "isNull", lambda: True)()):
         points, facets = shape.tessellate(float(linear_deflection))
-        vertices = _placed_vertices(obj, points)
+        # ``TopoShape.tessellate`` já devolve os pontos no sistema global da
+        # Shape, incluindo o Placement do Part::Feature. Aplicar novamente o
+        # Placement aqui duplicava X/Y (por exemplo, uma peça em X=240 virava
+        # percurso em X=480), separando visualmente modelo e usinagem.
+        # ``Mesh.Topology``, ao contrário, continua local ao Mesh::Feature e
+        # por isso usa ``_placed_vertices`` no ramo acima.
+        vertices = [_xyz(point) for point in points]
         return MeshData.create(vertices, facets, getattr(obj, "Name", ""))
     raise ValueError(
         "O objeto selecionado não contém uma malha ou Shape 3D utilizável. "

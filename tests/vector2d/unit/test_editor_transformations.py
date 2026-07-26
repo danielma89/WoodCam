@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 
 from woodcam_editor.application import EditorController
-from woodcam_editor.domain import Layer, PathEntity, Vec2, VectorDocument
+from woodcam_editor.domain import Layer, PathEntity, Vec2, VectorDocument, WorkArea
 
 
 def rectangle(document, x, y, width, height, layer_id=None):
@@ -94,6 +94,20 @@ class EditorTransformationTests(unittest.TestCase):
         self.controller.undo()
         self.assertEqual(self.document.entities_by_id, originals)
 
+    def test_single_vector_aligns_to_work_area(self):
+        rectangle_entity = rectangle(self.document, 40.0, 50.0, 10.0, 20.0)
+        self.add(rectangle_entity)
+        self.document.work_area = WorkArea(0.0, 0.0, 100.0, 80.0)
+        self.controller.selection.replace((rectangle_entity.id,))
+
+        self.assertTrue(self.controller.align_selection("center"))
+        centered = self.document.get_entity(rectangle_entity.id).bounds()
+        self.assertAlmostEqual(centered.center.x, 50.0)
+        self.controller.undo()
+        self.assertTrue(self.controller.align_selection("top"))
+        aligned_top = self.document.get_entity(rectangle_entity.id).bounds()
+        self.assertAlmostEqual(aligned_top.max_y, 80.0)
+
     def test_locked_layer_rejects_entire_transform(self):
         locked = Layer(name="Travada", locked=True, order=1)
         self.document.add_layers((locked,))
@@ -108,4 +122,3 @@ class EditorTransformationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

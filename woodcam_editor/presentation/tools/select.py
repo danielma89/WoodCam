@@ -28,6 +28,9 @@ class SelectTool(EditorTool):
         self.dragging = False
         self.marquee = False
         self.selection_before = ()
+        self.resize_handle = None
+        self.resize_bounds = None
+        self.resize_preview = None
 
     def activate(self, entity_id=None):
         self.overlays.clear_nodes()
@@ -43,8 +46,29 @@ class SelectTool(EditorTool):
         self.press_screen = event.screen_pos
         self.press_scene = event.scene_pos
         self.selection_before = self.controller.selection.ids
-        self.hit_id = self.adapter.hit_test_body(self.view, event.screen_pos)
         shift = has_modifier(event.modifiers, SHIFT_MODIFIER)
+        if self.controller.selection.ids and not shift:
+            handle = self.overlays.hit_test_selection_handle(
+                self.view, event.screen_pos
+            )
+            if handle is not None:
+                self.resize_handle = handle
+                self.resize_bounds = self.controller.selection_bounds()
+                self.marquee = False
+                return
+        raw_hit_id = self.adapter.hit_test_body(self.view, event.screen_pos)
+        self.hit_id = self.controller.grouped_selection_id_for_hit(raw_hit_id)
+        # Aspire lets a selected set move when the drag starts in the empty
+        # area inside its transform bounds.  A body hit is not required in
+        # that case; otherwise a multi-selection looked frozen whenever the
+        # user grabbed the gap between two vectors.
+        if self.hit_id is None and self.controller.selection.ids and not shift:
+            bounds = self.controller.selection_bounds()
+            if bounds is not None and bounds.contains_point(
+                self.controller.vec(event.scene_pos.x(), event.scene_pos.y()),
+                tolerance=0.0,
+            ):
+                self.hit_id = self.controller.selection.primary_id or self.controller.selection.ids[0]
         if self.hit_id is not None:
             if shift:
                 self.controller.selection.toggle(self.hit_id)
@@ -59,6 +83,17 @@ class SelectTool(EditorTool):
     def pointer_move(self, event):
         if self.press_screen is None:
             return
+        if self.resize_handle is not None and self.resize_bounds is not None:
+            bounds = self._resized_bounds(event.scene_pos)
+            if bounds is not None:
+                self.dragging = True
+                self.resize_preview = bounds
+                self.overlays.show_selection_transform(bounds)
+                self.overlays.show_measure(
+                    "%.3f × %.3f mm" % (bounds[2] - bounds[0], bounds[3] - bounds[1]),
+                    event.scene_pos,
+                )
+            return
         distance = screen_distance(self.press_screen, event.screen_pos)
         if distance < self.drag_threshold and not self.dragging:
             return
@@ -71,6 +106,15 @@ class SelectTool(EditorTool):
             return
         delta = event.scene_pos - self.press_scene
         self.adapter.preview_translation(self.controller.selection.ids, delta)
+        bounds = self.controller.selection_bounds()
+        if bounds is not None:
+            # The scene is only a projection during drag.  Move the transient
+            # selection frame by the same delta so it never lags behind the
+            # previewed vectors; the document command still happens once on
+            # mouse release.
+            self.overlays.show_selection_transform(
+                bounds.translated(self.controller.vec(delta.x(), delta.y()))
+            )
         self.overlays.show_measure(
             "ΔX %.3f mm   ΔY %.3f mm" % (delta.x(), delta.y()),
             event.scene_pos,
@@ -80,13 +124,36 @@ class SelectTool(EditorTool):
         if self.press_screen is None:
             return
         shift = has_modifier(event.modifiers, SHIFT_MODIFIER)
+        if self.resize_handle is not None and self.resize_bounds is not None:
+            bounds = self.resize_preview or self._resized_bounds(event.scene_pos)
+            self.overlays.clear_transient()
+            if bounds is not None:
+                self.controller.set_selection_bounds(
+                    bounds[0],
+                    bounds[1],
+                    bounds[2] - bounds[0],
+                    bounds[3] - bounds[1],
+                    preserve_ratio=shift,
+                )
+            self._reset()
+            if self.controller.selection.ids:
+                self.overlays.show_selection_transform(
+                    self.controller.selection_bounds()
+                )
+            return
         if self.dragging and self.marquee:
             crossing = event.screen_pos.x() < self.press_screen.x()
-            ids = self.adapter.select_in_screen_rect(
+            raw_ids = self.adapter.select_in_screen_rect(
                 self.view,
                 self.press_screen,
                 event.screen_pos,
                 crossing=crossing,
+            )
+            ids = tuple(
+                dict.fromkeys(
+                    self.controller.grouped_selection_id_for_hit(entity_id)
+                    for entity_id in raw_ids
+                )
             )
             if shift:
                 result = list(self.selection_before)
@@ -108,12 +175,43 @@ class SelectTool(EditorTool):
         self.overlays.clear_transient()
         self._reset()
 
+    def _resized_bounds(self, scene_pos):
+        """Return a normalized preview bounds tuple for one screen handle.
+
+        Handle indices are clockwise from visual top-left.  The bounds are
+        kept in model (Y-up) coordinates and never mutate the document during
+        pointer movement; commit happens once on release through the
+        controller's transform command.
+        """
+        bounds = self.resize_bounds
+        if bounds is None or self.resize_handle is None:
+            return None
+        x = float(scene_pos.x())
+        y = float(scene_pos.y())
+        min_x = float(bounds.min_x)
+        min_y = float(bounds.min_y)
+        max_x = float(bounds.max_x)
+        max_y = float(bounds.max_y)
+        epsilon = 1.0e-6
+        index = int(self.resize_handle)
+        if index in (0, 6, 7):
+            min_x = min(x, max_x - epsilon)
+        if index in (2, 3, 4):
+            max_x = max(x, min_x + epsilon)
+        # On screen, top is the larger Y value in the model.
+        if index in (0, 1, 2):
+            max_y = max(y, min_y + epsilon)
+        if index in (4, 5, 6):
+            min_y = min(y, max_y - epsilon)
+        return min_x, min_y, max_x, max_y
+
     def pointer_double_click(self, event):
         entity_id = self.adapter.hit_test_body(self.view, event.screen_pos)
         if entity_id is None:
             return
         self.controller.selection.select_only(entity_id)
         self.manager.activate(EditorMode.NODE_EDIT, entity_id)
+        self.manager.editSelectionRequested.emit()
 
     def key_press(self, event):
         key = event.key()

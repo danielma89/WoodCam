@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .document import VectorDocument
 from .entities import CircleEntity, EllipseEntity, PathEntity
@@ -102,6 +102,35 @@ def _selected_entity_ids(
     return selected
 
 
+def _nearby_reference_pairs(
+    references: Sequence[NodeReference],
+    tolerance: float,
+) -> Iterator[Tuple[int, int]]:
+    """Yield only point pairs that can be within ``tolerance``.
+
+    The graph still uses the exact ``almost_equals`` predicate below.  This is
+    only a deterministic broad phase: a nine-cell neighbourhood avoids the
+    former O(n²) scan when an imported sheet contains thousands of tooth and
+    drill nodes.  A cell side equal to the tolerance is sufficient because two
+    points within that distance can differ by at most one cell in each axis.
+    """
+
+    cell_size = max(float(tolerance), DEFAULT_EPSILON)
+    buckets: Dict[Tuple[int, int], List[int]] = {}
+    for index, reference in enumerate(references):
+        cell = (
+            int(reference.point.x // cell_size),
+            int(reference.point.y // cell_size),
+        )
+        for offset_x in (-1, 0, 1):
+            for offset_y in (-1, 0, 1):
+                for previous in buckets.get(
+                    (cell[0] + offset_x, cell[1] + offset_y), ()
+                ):
+                    yield previous, index
+        buckets.setdefault(cell, []).append(index)
+
+
 def build_topology(
     document: VectorDocument,
     tolerance: float = DEFAULT_EPSILON,
@@ -126,13 +155,9 @@ def build_topology(
             references.append(NodeReference(entity.id, node.id, node.point, is_endpoint))
 
     union_find = _UnionFind(len(references))
-    # A simple O(n²) baseline is deliberately correct and dependency-free.  A
-    # spatial index can replace only this candidate search once measurements
-    # justify it, without changing graph semantics.
-    for left in range(len(references)):
-        for right in range(left + 1, len(references)):
-            if references[left].point.almost_equals(references[right].point, tolerance):
-                union_find.union(left, right)
+    for left, right in _nearby_reference_pairs(references, tolerance):
+        if references[left].point.almost_equals(references[right].point, tolerance):
+            union_find.union(left, right)
 
     grouped: Dict[int, List[NodeReference]] = {}
     for index, reference in enumerate(references):
@@ -236,12 +261,11 @@ def nearby_open_endpoint_pairs(
             endpoints.append(NodeReference(entity.id, nodes[0].id, nodes[0].point, True))
             endpoints.append(NodeReference(entity.id, nodes[-1].id, nodes[-1].point, True))
     result = []
-    for left in range(len(endpoints)):
-        for right in range(left + 1, len(endpoints)):
-            first, second = endpoints[left], endpoints[right]
-            distance = first.point.distance_to(second.point)
-            if minimum_distance < distance <= tolerance:
-                result.append(EndpointPair(first, second, distance))
+    for left, right in _nearby_reference_pairs(endpoints, tolerance):
+        first, second = endpoints[left], endpoints[right]
+        distance = first.point.distance_to(second.point)
+        if minimum_distance < distance <= tolerance:
+            result.append(EndpointPair(first, second, distance))
     return tuple(sorted(result, key=lambda pair: (pair.distance, pair.first.entity_id, pair.second.entity_id)))
 
 

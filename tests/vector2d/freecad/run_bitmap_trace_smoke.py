@@ -48,6 +48,21 @@ def main():
             entity.metadata.get("source_format") == "bitmap_trace"
             for entity in result.entities
         )
+        cropped = trace_bitmap(
+            source,
+            layer_id="layer",
+            options=BitmapTraceOptions(
+                threshold=128,
+                target_width_mm=45.0,
+                noise_pixels=2,
+                crop_x_px=102,
+                crop_y_px=25,
+                crop_width_px=55,
+                crop_height_px=50,
+            ),
+        )
+        assert len(cropped.entities) == 1, len(cropped.entities)
+        assert cropped.entities[0].metadata["trace_crop_width_px"] == 55
     emit("WoodCAM bitmap trace smoke: OK")
 
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import sys
 import math
+import json
 from pathlib import Path
 
 
@@ -19,6 +20,7 @@ sys.path.insert(0, str(ROOT))
 
 import FreeCAD  # noqa: E402
 import Part  # noqa: E402
+import Sketcher  # noqa: E402
 from pivy import coin  # noqa: E402
 from PySide6 import QtCore, QtWidgets  # noqa: E402
 
@@ -30,7 +32,6 @@ from woodcam_3d.coin_toolpath import (  # noqa: E402
 )
 from woodcam_3d.storage import decode_moves  # noqa: E402
 
-
 app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 first = FreeCAD.newDocument("WoodCAMEditorUiSmokeA")
@@ -40,6 +41,7 @@ dialog.show()
 app.processEvents()
 widget = dialog.vector_editor_widget
 assert widget is not None
+assert "Importar peças planas pelo PanelNest…" in widget._menu_actions["Arquivo"]
 
 # Os botões 3D do fluxo Aspire são operações nativas do WoodCAM: cada um tem
 # sua própria aba, configurações e persistência, sem esconder o Editor 2D.
@@ -56,6 +58,14 @@ visible_tab_texts = [
     for index in range(dialog.operation_tabs.count())
 ]
 assert [text for text in visible_tab_texts if text] == ["Trabalho", "Material"]
+# A identificação estável da operação não pode depender do texto traduzido da
+# aba. O menu diz "Furos", mas a aba de produção se chama "Furo".
+hole_tab_index = dialog._operation_tab_index("holes")
+assert hole_tab_index is not None
+assert dialog._tab_title(hole_tab_index) == "Furo"
+dialog._vector_editor_configure_toolpath("holes")
+assert dialog.operation_tabs.currentIndex() == hole_tab_index
+assert dialog._operation_mode_for_index(hole_tab_index) == "holes"
 dialog.operation_tabs.setCurrentIndex(0)
 app.processEvents()
 tab_bar_image = dialog.operation_tabs.tabBar().grab().toImage()
@@ -89,6 +99,20 @@ assert dialog.finish3d_strategy_combo.count() == 2
 assert dialog.rough3d_reverse_check.text()
 assert dialog.finish3d_reverse_check.text()
 assert dialog.operation_pass_labels["finish3d"].isHidden()
+
+# O botão no canto direito destaca exatamente o mesmo Editor 2D numa janela
+# nativa; fechar a janela devolve o widget e todo o seu estado à aba.
+assert dialog.detach_editor_button is dialog.operation_tabs.cornerWidget()
+editor_widget_identity = dialog.vector_editor_widget
+dialog._detach_vector_editor()
+app.processEvents()
+assert dialog._detached_editor_window is not None
+assert dialog.vector_editor_widget is editor_widget_identity
+assert editor_widget_identity.window() is dialog._detached_editor_window
+dialog._detached_editor_window.reject()
+app.processEvents()
+assert dialog.vector_editor_widget is editor_widget_identity
+assert editor_widget_identity.parentWidget() is dialog._vector_editor_tab
 
 # A vista CAM nunca pode continuar exibindo uma trajetória calculada com uma
 # fresa/stepover anterior. O resumo também expõe o passo físico real.
@@ -168,17 +192,54 @@ assert cut_line_set.numVertices[0] == len(large_moves)
 overlay.clear()
 assert fake_gui_document.ActiveView.scene.getNumChildren() == 0
 
-# A simulação 3D usa o overlay integral acima; somente a posição animada da
-# fresa é amostrada. Operações 2D conservam o rastro progressivo tradicional.
+# Desbaste, acabamento, Corte e Preenchimento usam o overlay integral acima;
+# somente a posição animada da fresa é amostrada. Furo conserva o rastro
+# progressivo tradicional.
 assert dialog._simulation_uses_exact_static_path(
     {"operation_mode": "finish3d"}
 )
 assert dialog._simulation_uses_exact_static_path(
     {"operation_mode": "rough3d"}
 )
-assert not dialog._simulation_uses_exact_static_path(
+assert dialog._simulation_uses_exact_static_path(
     {"operation_mode": "cut"}
 )
+assert not dialog._simulation_uses_exact_static_path(
+    {"operation_mode": "holes"}
+)
+assert dialog._simulation_uses_exact_static_path(
+    {"operation_mode": "pocket"}
+)
+captured_cut_overlay = {}
+captured_pocket_overlay = {}
+original_lightweight_overlay = dialog._set_lightweight_toolpath_overlay
+try:
+    dialog._set_lightweight_toolpath_overlay = lambda components: captured_cut_overlay.update(
+        components=components
+    )
+    assert dialog._show_exact_simulation_toolpath(
+        {"operation_mode": "cut", "tool_name": "Topo reto", "tool_diameter": 4.0},
+        large_moves,
+        "SIMULAÇÃO EXATA = G-CODE",
+    )
+    dialog._set_lightweight_toolpath_overlay = lambda components: captured_pocket_overlay.update(
+        components=components
+    )
+    assert dialog._show_exact_simulation_toolpath(
+        {"operation_mode": "pocket", "tool_name": "Topo reto", "tool_diameter": 4.0},
+        large_moves,
+        "SIMULAÇÃO EXATA = G-CODE",
+    )
+finally:
+    dialog._set_lightweight_toolpath_overlay = original_lightweight_overlay
+assert sum(
+    len(captured_cut_overlay["components"][key])
+    for key in ("rapid", "ramp", "cut", "corner")
+) == len(large_moves) - 1
+assert sum(
+    len(captured_pocket_overlay["components"][key])
+    for key in ("rapid", "ramp", "cut", "corner")
+) == len(large_moves) - 1
 interpolation_frames = [
     {"x": 0.0, "y": 2.0, "z": -1.0},
     {"x": 10.0, "y": 6.0, "z": -3.0},
@@ -352,6 +413,8 @@ assert states == [
 
 # Trabalho é apenas preview durante a digitação e vira um comando persistente
 # no editingFinished, mesmo antes de existir qualquer vetor.
+dialog.fields["job_origin_x"].setText("0")
+dialog.fields["job_origin_y"].setText("0")
 dialog.fields["job_width"].setText("321")
 dialog.fields["job_height"].setText("654")
 assert widget.document.work_area is None
@@ -397,6 +460,251 @@ dialog._sync_vector_editor_from_freecad_history()
 app.processEvents()
 assert widget.document.work_area.min_x == 40.0
 assert widget.document.work_area.min_y == 25.0
+
+# O Editor 2D ja fornece coordenadas absolutas dentro da area tracejada. O CAM
+# nao pode alinhar novamente os bounds do vetor pelo datum da aba Material:
+# isso separava visualmente o contorno de corte do vetor original. A origem da
+# maquina, entretanto, continua sendo o anchor da area de Trabalho.
+editor_cut_geometry = {
+    "contours": [[
+        (140.0, 140.0),
+        (240.0, 140.0),
+        (240.0, 240.0),
+        (140.0, 240.0),
+        (140.0, 140.0),
+    ]],
+    "holes": [],
+}
+previous_tab_index = dialog.operation_tabs.currentIndex()
+dialog.operation_tabs.setCurrentIndex(dialog._tab_index("Corte"))
+editor_cut_settings = dialog._collect_settings()
+dialog.operation_tabs.setCurrentIndex(previous_tab_index)
+editor_cut_settings.update(
+    outer_cut_side=ui.CUT_SIDE_ON_LINE,
+    cut_side=ui.CUT_SIDE_ON_LINE,
+    smart_entry=False,
+    use_ramp=False,
+    ramp_length=0.0,
+    return_to_start=False,
+    cut_tabs_enabled=False,
+    cut_separate_last_pass=False,
+)
+original_active_geometry = dialog._active_geometry
+original_editor_source = dialog._use_vector_editor_for_cam
+original_vector_document = dialog._vector_editor_document
+try:
+    dialog._active_geometry = lambda: editor_cut_geometry
+    dialog._use_vector_editor_for_cam = True
+    dialog._vector_editor_document = widget.document
+    editor_cut_moves = dialog._build_moves_from_selection(editor_cut_settings)
+finally:
+    dialog._active_geometry = original_active_geometry
+    dialog._use_vector_editor_for_cam = original_editor_source
+    dialog._vector_editor_document = original_vector_document
+assert editor_cut_settings["_xy_origin_offset"] == (0.0, 0.0)
+assert editor_cut_settings["_work_area_bounds"] == [40.0, 25.0, 361.0, 679.0]
+editor_cut_components = dialog._toolpath_components(
+    editor_cut_moves,
+    max_display_segments=None,
+)
+assert editor_cut_components["rapid"]
+assert editor_cut_components["rapid"][0][0][:2] == (40.0, 25.0)
+assert editor_cut_components["rapid"][0][1][:2] == (140.0, 240.0)
+feed_xy = [
+    (float(move["x"]), float(move["y"]))
+    for move in editor_cut_moves
+    if str(move.get("type", "")).startswith("feed_")
+    and move.get("x") is not None
+    and move.get("y") is not None
+]
+assert feed_xy
+assert min(point[0] for point in feed_xy) == 140.0
+assert max(point[0] for point in feed_xy) == 240.0
+assert min(point[1] for point in feed_xy) == 140.0
+assert max(point[1] for point in feed_xy) == 240.0
+
+# O caminho real relatado pelo usuario passa pelo intercâmbio
+# Editor 2D -> PanelNest e depois usa Corte/Aplicar com o Part::Feature
+# materializado selecionado. Esse Shape já está no XY final do Editor e não
+# pode ser ancorado outra vez no zero da área de Trabalho.
+panelnest_exchange_part = first.addObject(
+    "Part::Feature",
+    "WoodCAM2DPanelNestAbsoluteXYSmoke",
+)
+panelnest_exchange_part.Shape = Part.makeBox(100.0, 100.0, 15.0)
+panelnest_exchange_part.Placement.Base = FreeCAD.Vector(140.0, 140.0, 0.0)
+panelnest_exchange_part.addProperty(
+    "App::PropertyString",
+    "WoodCAMExchangeLayoutMode",
+)
+panelnest_exchange_part.WoodCAMExchangeLayoutMode = "preserve_editor_xy"
+first.recompute()
+panelnest_cut_settings = dict(editor_cut_settings)
+panelnest_cut_settings.pop("_editor_coordinates_absolute", None)
+panelnest_cut_settings.pop("_work_area_bounds", None)
+panelnest_geometry = ui._extract_geometry_from_object(panelnest_exchange_part)
+original_active_geometry = dialog._active_geometry
+original_editor_source = dialog._use_vector_editor_for_cam
+had_selection_api = hasattr(ui.FreeCADGui, "Selection")
+original_selection_api = getattr(ui.FreeCADGui, "Selection", None)
+
+
+class _PanelNestSmokeSelection:
+    @staticmethod
+    def getSelection():
+        return [panelnest_exchange_part]
+
+
+try:
+    dialog._active_geometry = lambda: panelnest_geometry
+    dialog._use_vector_editor_for_cam = False
+    # FreeCADCmd não cria a API Selection; o substituto contém exatamente o
+    # Part::Feature que a interface gráfica entrega nesse fluxo.
+    ui.FreeCADGui.Selection = _PanelNestSmokeSelection()
+    assert dialog._selected_freecad_geometry_is_absolute()
+    panelnest_cut_moves = dialog._build_moves_from_selection(
+        panelnest_cut_settings
+    )
+finally:
+    dialog._active_geometry = original_active_geometry
+    dialog._use_vector_editor_for_cam = original_editor_source
+    if had_selection_api:
+        ui.FreeCADGui.Selection = original_selection_api
+    else:
+        delattr(ui.FreeCADGui, "Selection")
+assert panelnest_cut_settings["_xy_origin_offset"] == (0.0, 0.0)
+panelnest_feed_xy = [
+    (float(move["x"]), float(move["y"]))
+    for move in panelnest_cut_moves
+    if str(move.get("type", "")).startswith("feed_")
+    and move.get("x") is not None
+    and move.get("y") is not None
+]
+assert panelnest_feed_xy
+assert min(point[0] for point in panelnest_feed_xy) == 140.0
+assert max(point[0] for point in panelnest_feed_xy) == 240.0
+assert min(point[1] for point in panelnest_feed_xy) == 140.0
+assert max(point[1] for point in panelnest_feed_xy) == 240.0
+first.removeObject(panelnest_exchange_part.Name)
+
+# Um Sketch/Part comum selecionado diretamente no FreeCAD também já entrega
+# coordenadas de documento. O datum define somente início/retorno; nunca pode
+# reposicionar o contorno para o zero global.
+plain_freecad_sketch = first.addObject(
+    "Sketcher::SketchObject",
+    "PlainAbsoluteXYSketchSmoke",
+)
+plain_freecad_sketch.addGeometry(
+    [
+        Part.LineSegment(FreeCAD.Vector(0, 0, 0), FreeCAD.Vector(100, 0, 0)),
+        Part.LineSegment(FreeCAD.Vector(100, 0, 0), FreeCAD.Vector(100, 100, 0)),
+        Part.LineSegment(FreeCAD.Vector(100, 100, 0), FreeCAD.Vector(0, 100, 0)),
+        Part.LineSegment(FreeCAD.Vector(0, 100, 0), FreeCAD.Vector(0, 0, 0)),
+    ],
+    False,
+)
+plain_freecad_sketch.Placement.Base = FreeCAD.Vector(140.0, 140.0, 0.0)
+first.recompute()
+plain_freecad_geometry = ui._extract_geometry_from_object(plain_freecad_sketch)
+plain_bounds = dialog._geometry_bounds(plain_freecad_geometry)
+assert plain_bounds == (140.0, 140.0, 240.0, 240.0), plain_bounds
+freecad_cut_settings = dict(editor_cut_settings)
+freecad_cut_settings.pop("_editor_coordinates_absolute", None)
+freecad_cut_settings.pop("_work_area_bounds", None)
+original_active_geometry = dialog._active_geometry
+original_editor_source = dialog._use_vector_editor_for_cam
+try:
+    dialog._active_geometry = lambda: plain_freecad_geometry
+    dialog._use_vector_editor_for_cam = False
+    freecad_cut_moves = dialog._build_moves_from_selection(freecad_cut_settings)
+finally:
+    dialog._active_geometry = original_active_geometry
+    dialog._use_vector_editor_for_cam = original_editor_source
+assert freecad_cut_settings["_xy_origin_offset"] == (0.0, 0.0)
+freecad_feed_xy = [
+    (float(move["x"]), float(move["y"]))
+    for move in freecad_cut_moves
+    if str(move.get("type", "")).startswith("feed_")
+    and move.get("x") is not None
+    and move.get("y") is not None
+]
+assert min(point[0] for point in freecad_feed_xy) == 140.0
+assert max(point[0] for point in freecad_feed_xy) == 240.0
+
+# A mesma invariável vale para Rebaixo/Preenchimento — o caso visual relatado
+# em que um Sketch criado na vista 3D era transportado para a origem.
+dialog.operation_tabs.setCurrentIndex(dialog._tab_index("Preenchimento"))
+freecad_pocket_settings = dialog._collect_settings()
+freecad_pocket_settings.update(
+    tool_diameter=4.0,
+    stepdown=2.0,
+    final_depth=2.0,
+    cut_depth=2.0,
+    safe_height=5.0,
+    return_to_start=False,
+)
+original_active_geometry = dialog._active_geometry
+original_editor_source = dialog._use_vector_editor_for_cam
+try:
+    dialog._active_geometry = lambda: plain_freecad_geometry
+    dialog._use_vector_editor_for_cam = False
+    freecad_pocket_moves = dialog._build_moves_from_selection(
+        freecad_pocket_settings
+    )
+finally:
+    dialog._active_geometry = original_active_geometry
+    dialog._use_vector_editor_for_cam = original_editor_source
+assert freecad_pocket_settings["_xy_origin_offset"] == (0.0, 0.0)
+pocket_feed_xy = [
+    (float(move["x"]), float(move["y"]))
+    for move in freecad_pocket_moves
+    if str(move.get("type", "")).startswith("feed_")
+    and move.get("x") is not None
+    and move.get("y") is not None
+]
+assert pocket_feed_xy
+assert min(point[0] for point in pocket_feed_xy) >= 140.0
+assert max(point[0] for point in pocket_feed_xy) <= 240.0
+first.removeObject(plain_freecad_sketch.Name)
+
+# Configurar/aplicar a área não exige nenhuma seleção 3D e deixa somente um
+# limite persistente sob a pasta canônica Área de trabalho.
+dialog.operation_tabs.setCurrentIndex(dialog._tab_index("Trabalho"))
+setup_settings = dialog._collect_work_setup_settings()
+original_selected_3d_source = dialog._selected_3d_source
+try:
+    dialog._selected_3d_source = lambda: (_ for _ in ()).throw(
+        ValueError("leitor 3D não deveria ser chamado")
+    )
+    dialog._show_work_area_preview(setup_settings)
+finally:
+    dialog._selected_3d_source = original_selected_3d_source
+preview_group = first.getObject("WoodCAM2D_Preview")
+assert preview_group is not None
+assert preview_group.Label == "Prévia da configuração"
+dialog._clear_existing_preview(first)
+dialog._ensure_persistent_work_area(first, setup_settings)
+work_area_group = first.getObject("WoodCAM2D_WorkArea")
+assert [child.Label for child in work_area_group.Group] == [
+    "Limite da área de trabalho",
+    "Datum XY do material",
+]
+
+# A árvore de produção tem uma única raiz e somente as três pastas pedidas.
+woodcam_root = first.getObject("WoodCAM")
+assert woodcam_root is not None
+assert [child.Label for child in woodcam_root.Group] == [
+    "Peças",
+    "Operações",
+    "Área de trabalho",
+]
+parts_group = first.getObject("WoodCAM_Parts")
+assert parts_group is not None
+assert first.getObject("WoodCAM2D_VectorDrawing") is None
+internal_vector_document = first.getObject("WoodCAM2D_VectorDocument")
+assert internal_vector_document in list(parts_group.Group)
+if hasattr(internal_vector_document.ViewObject, "ShowInTree"):
+    assert internal_vector_document.ViewObject.ShowInTree is False
 
 line_id = widget.controller.add_line(
     widget.controller.vec(10.0, 20.0),
@@ -452,6 +760,38 @@ first.redo()
 dialog._sync_vector_editor_from_freecad_history()
 app.processEvents()
 assert widget.pieces_panel.list.count() == 1
+
+# Uma peça importada é selecionada como grupo. O booleano deve expandir essa
+# identidade apenas para o cálculo OCC: um furo isolado da borda continua
+# pertencendo ao perfil, sem obrigar o operador a desagrupar a chapa.
+boolean_outer = widget.controller.add_rectangle(
+    widget.controller.vec(160.0, 40.0),
+    widget.controller.vec(260.0, 90.0),
+)
+boolean_hole = widget.controller.add_circle(
+    widget.controller.vec(210.0, 65.0), 8.0,
+)
+boolean_group = ui.GroupEntity(
+    layer_id=widget.document.active_layer_id,
+    child_ids=(boolean_outer, boolean_hole),
+    id="boolean-piece-group",
+)
+widget.controller.execute(ui.AddEntitiesCommand((boolean_group,)))
+widget.controller.selection.select_only(boolean_group.id)
+dialog._vector_editor_boolean_selection("difference")
+assert widget.workflow_preview_bar.is_active
+assert "Subtrair" in widget.workflow_preview_bar.summary_label.text()
+assert widget._workflow_revision == widget.document.revision, (
+    widget._workflow_revision,
+    widget.document.revision,
+)
+widget._apply_workflow_preview(widget.workflow_preview_bar.payload)
+assert not widget.workflow_preview_bar.is_active, widget.workflow_preview_bar.summary_label.text()
+assert boolean_group.id not in widget.document.entities_by_id
+assert any(
+    getattr(entity, "metadata", {}).get("source_kind") == "editor_boolean_compound"
+    for entity in widget.document.entities_by_id.values()
+)
 
 # Estado direto de UI (ex.: área de trabalho) também não pode se perder na troca.
 widget.document.metadata["ui_smoke_memory_marker"] = "document-A"
@@ -516,12 +856,15 @@ assert dialog._vector_editor_bound_freecad_document is first
 assert dialog._vector_editor_store.document is first
 assert dialog._vector_editor_session.document is first
 assert restored_widget.document.metadata["ui_smoke_memory_marker"] == "document-A"
-assert len(restored_widget.document.entities_by_id) == 2
+assert len(restored_widget.document.entities_by_id) == first_count_before_race
 assert restored_widget.document.work_area.width == 321.0
 assert restored_widget.document.work_area.height == 654.0
 assert restored_widget.document.work_area.min_x == 40.0
 assert restored_widget.document.work_area.min_y == 25.0
-assert next(iter(restored_widget.document.entities_by_id.values())).__class__.__name__ == "PathEntity"
+assert any(
+    entity.__class__.__name__ == "PathEntity"
+    for entity in restored_widget.document.entities_by_id.values()
+)
 
 # Diagnóstico abre lista detalhada e a ocorrência selecionada fica localizada.
 report = dialog._vector_editor_diagnose()
@@ -531,6 +874,86 @@ assert dialog._vector_validation_dialog is not None
 assert dialog._vector_validation_dialog.issues
 assert restored_widget.overlays.preview_item.isVisible()
 dialog._vector_validation_dialog.close()
+
+# Um caminho aberto independente continua no desenho e no diagnóstico, mas
+# não pode impedir que contornos fechados válidos virem relações Piece2D.
+# O reconhecimento não redesenha nem apaga o caminho aberto.
+open_entity_ids_before = {
+    issue.entity_ids[0]
+    for issue in report.by_code("OPEN_PATH")
+    if issue.entity_ids
+}
+recognized_with_open_path = dialog._vector_editor_create_pieces()
+assert recognized_with_open_path
+assert open_entity_ids_before <= set(restored_widget.document.entities_by_id)
+assert all(
+    open_entity_id not in piece.inner_path_ids
+    and open_entity_id != piece.outer_path_id
+    for open_entity_id in open_entity_ids_before
+    for piece in restored_widget.document.pieces_by_id.values()
+)
+assert "aberto(s) não entraram" in restored_widget.mode_label.text()
+
+# O envio precisa reconstruir as relações Piece2D imediatamente antes de
+# materializar. Um desenho pode ganhar novas chapas/furos depois do último
+# "Reconhecer peças e furos"; reutilizar relações antigas fazia exatamente
+# essas chapas e seus internos desaparecerem no PanelNest.
+stale_piece_count = len(restored_widget.document.pieces_by_id)
+late_outer_id = restored_widget.controller.add_rectangle(
+    restored_widget.controller.vec(270.0, 300.0),
+    restored_widget.controller.vec(340.0, 380.0),
+)
+late_hole_id = restored_widget.controller.add_circle(
+    restored_widget.controller.vec(305.0, 340.0), 4.0
+)
+assert len(restored_widget.document.pieces_by_id) == stale_piece_count
+# "Enviar PanelNest" é o intercâmbio do layout inteiro; uma seleção residual
+# de edição não pode transformar silenciosamente o comando em "enviar só a
+# seleção" e fazer as demais chapas desaparecerem.
+restored_widget.controller.selection.replace((late_outer_id, late_hole_id))
+expected_fresh_classification = ui.classify_document_pieces(restored_widget.document)
+assert any(piece.outer_id == late_outer_id for piece in expected_fresh_classification.pieces)
+
+
+class _EditorSendSelection:
+    @staticmethod
+    def clearSelection():
+        return None
+
+    @staticmethod
+    def addSelection(_object):
+        return None
+
+
+had_selection_api = hasattr(ui.FreeCADGui, "Selection")
+original_selection_api = getattr(ui.FreeCADGui, "Selection", None)
+try:
+    ui.FreeCADGui.Selection = _EditorSendSelection()
+    dialog._vector_editor_send_panelnest()
+finally:
+    if had_selection_api:
+        ui.FreeCADGui.Selection = original_selection_api
+    else:
+        delattr(ui.FreeCADGui, "Selection")
+exchange_root = first.getObject("WoodCAM_Parts")
+assert exchange_root is not None, restored_widget.mode_label.text()
+exchange_manifest = json.loads(exchange_root.WoodCAMExchangeManifestJson)
+assert len(exchange_manifest["parts"]) == len(expected_fresh_classification.pieces)
+late_payload = next(
+    part
+    for part in exchange_manifest["parts"]
+    if late_hole_id in {
+        entity_id
+        for piece in restored_widget.document.pieces_by_id.values()
+        if piece.id == part["id"]
+        for entity_id in piece.inner_path_ids
+    }
+)
+assert len(late_payload["circular_holes"]) == 1
+assert all(first.getObject(name) is not None for name in exchange_manifest["object_names"])
+assert set(exchange_manifest["object_names"]) <= {
+    child.Name for child in exchange_root.Group
+}
 
 # A limpeza de sobrelinhas exatas é escopada, preview-first e um único Undo.
 duplicate_circle_a = restored_widget.controller.add_circle(

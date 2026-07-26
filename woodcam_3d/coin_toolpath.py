@@ -66,12 +66,16 @@ class CoinToolpathOverlay:
             # O relevo sombreado é a referência principal. Os rápidos e
             # rampas não podem formar uma gaiola opaca em volta dele, e o
             # raster de corte precisa continuar legível sem encobrir a forma.
-            ("rapid", (0.42, 0.50, 0.68), 1.0, 0.94),
-            ("ramp", (0.95, 0.58, 0.04), 1.0, 0.86),
-            ("cut", (0.04, 0.22, 0.48), 1.0, 0.58),
-            ("corner", (0.48, 0.10, 0.62), 2.0, 0.70),
+            ("rapid", (0.42, 0.50, 0.68), 1.0, 0.94, None),
+            ("ramp", (0.95, 0.58, 0.04), 1.0, 0.86, None),
+            ("cut", (0.04, 0.22, 0.48), 1.0, 0.58, None),
+            ("corner", (0.48, 0.10, 0.62), 2.0, 0.70, None),
+            # A partida da origem da area precisa ter a mesma leitura clara
+            # da linha magenta tracejada exibida pelo Editor 2D. Os demais
+            # rapidos continuam discretos para nao encobrir relevos densos.
+            ("origin", (0.85, 0.27, 0.94), 2.0, 0.08, 0xF0F0),
         )
-        for key, color, width, transparency in specs:
+        for key, color, width, transparency, line_pattern in specs:
             point_lines = _edge_point_lines(components.get(key, ()))
             if not point_lines:
                 continue
@@ -83,6 +87,8 @@ class CoinToolpathOverlay:
             material.transparency = transparency
             style = coin.SoDrawStyle()
             style.lineWidth = width
+            if line_pattern is not None:
+                style.linePattern = int(line_pattern)
             coordinates = coin.SoCoordinate3()
             coordinates.point.setValues(0, len(points), points)
             line_set = coin.SoLineSet()

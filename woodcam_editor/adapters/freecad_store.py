@@ -16,10 +16,9 @@ from woodcam_editor.application.document_store import (
     StoredDocumentCorruptError,
     StoredDocumentInfo,
     VECTOR_DOCUMENT_FEATURE_NAME,
-    VECTOR_DOCUMENT_GROUP_LABEL,
-    VECTOR_DOCUMENT_GROUP_NAME,
     VectorDocumentStore,
 )
+from woodcam_tree import ensure_woodcam_tree
 
 
 PROPERTY_GROUP = "WoodCAM 2D"
@@ -238,18 +237,20 @@ class FreeCADDocumentStore(VectorDocumentStore):
         return bool(feature is not None and str(getattr(feature, "GeometryJSON", "") or "").strip())
 
     def _ensure_group(self):
-        group = self.document.getObject(VECTOR_DOCUMENT_GROUP_NAME)
-        if group is None:
-            group = self.document.addObject("App::DocumentObjectGroup", VECTOR_DOCUMENT_GROUP_NAME)
-            group.Label = VECTOR_DOCUMENT_GROUP_LABEL
-        return group
+        return ensure_woodcam_tree(self.document).parts
 
     def _ensure_feature(self):
         feature = self._feature()
         if feature is None:
             feature = self.document.addObject("Part::FeaturePython", VECTOR_DOCUMENT_FEATURE_NAME)
-            feature.Label = "WoodCAM 2D — Documento vetorial"
-            self._ensure_group().addObject(feature)
+        feature.Label = "Documento vetorial (interno)"
+        self._ensure_group().addObject(feature)
+        view_object = getattr(feature, "ViewObject", None)
+        if view_object is not None and hasattr(view_object, "ShowInTree"):
+            try:
+                view_object.ShowInTree = False
+            except Exception:
+                pass
         for property_type, property_name in PROPERTY_SPECS:
             if property_name not in list(getattr(feature, "PropertiesList", []) or []):
                 feature.addProperty(property_type, property_name, PROPERTY_GROUP)
@@ -278,6 +279,16 @@ class FreeCADDocumentStore(VectorDocumentStore):
         feature = self._feature()
         if feature is None:
             return None
+        # Abrir um FCStd antigo já compacta apenas a organização visual. A
+        # Shape/GeometryJSON de origem permanece intocada.
+        feature.Label = "Documento vetorial (interno)"
+        self._ensure_group().addObject(feature)
+        view_object = getattr(feature, "ViewObject", None)
+        if view_object is not None and hasattr(view_object, "ShowInTree"):
+            try:
+                view_object.ShowInTree = False
+            except Exception:
+                pass
         geometry_json = str(getattr(feature, "GeometryJSON", "") or "").strip()
         if not geometry_json:
             return None

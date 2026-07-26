@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -25,6 +26,9 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         from woodcam_editor.application import EditorMode
         from woodcam_editor.domain import (
             PathEntity,
+            Piece2D,
+            ReplacePiecesCommand,
+            SetDocumentMetadataCommand,
             SetWorkAreaCommand,
             Vec2,
             VectorDocument,
@@ -34,6 +38,9 @@ class EditorWidgetInteractionTests(unittest.TestCase):
 
         cls.EditorMode = EditorMode
         cls.PathEntity = PathEntity
+        cls.Piece2D = Piece2D
+        cls.ReplacePiecesCommand = ReplacePiecesCommand
+        cls.SetDocumentMetadataCommand = SetDocumentMetadataCommand
         cls.SetWorkAreaCommand = SetWorkAreaCommand
         cls.Vec2 = Vec2
         cls.VectorDocument = VectorDocument
@@ -142,9 +149,16 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         self.app.processEvents()
         self.assertLessEqual(self.widget.toolbar.sizeHint().width(), self.widget.width())
         self.assertLessEqual(self.widget.toolbar.height(), 30)
+        # The host must include the toolbar row and the optional horizontal
+        # scrollbar; otherwise the row is vertically clipped in a narrow dock.
+        self.assertGreaterEqual(self.widget.top_toolbar_scroll.height(), 48)
+        self.assertGreaterEqual(
+            self.widget.top_toolbar_scroll.viewport().height(),
+            self.widget.toolbar.height(),
+        )
         self.assertEqual(self.widget.drawing_toolbar.orientation(), QtCore.Qt.Vertical)
         self.assertEqual(self.widget.drawing_toolbar.width(), 40)
-        self.assertEqual(len(self.widget._mode_buttons), 9)
+        self.assertEqual(len(self.widget._mode_buttons), 11)
         rectangles = []
         for mode in (
             self.EditorMode.SELECT,
@@ -155,7 +169,9 @@ class EditorWidgetInteractionTests(unittest.TestCase):
             self.EditorMode.DRAW_CIRCLE,
             self.EditorMode.DRAW_ELLIPSE,
             self.EditorMode.DRAW_ARC,
+            self.EditorMode.DRAW_BEZIER,
             self.EditorMode.DRAW_POLYGON,
+            self.EditorMode.DRAW_STAR,
         ):
             button = self.widget._mode_buttons[mode]
             self.assertFalse(button.icon().isNull())
@@ -168,12 +184,18 @@ class EditorWidgetInteractionTests(unittest.TestCase):
             self.assertGreaterEqual(second.top() - first.bottom(), 2)
         for button in (
             self.widget.file_menu_button,
+            self.widget.edit_menu_button,
             self.widget.repair_menu_button,
             self.widget.fillet_menu_button,
             self.widget.pieces_menu_button,
             self.widget.cam_menu_button,
         ):
-            self.assertTrue(button.isVisible())
+            # In a narrow dock the top command strip scrolls horizontally
+            # instead of forcing the whole editor wider or dropping menus.
+            self.assertIs(button.parentWidget(), self.widget.toolbar)
+        self.assertGreater(
+            self.widget.top_toolbar_scroll.horizontalScrollBar().maximum(), 0
+        )
 
         self.assertFalse(
             self.widget.drawing_toolbar.findChildren(QtWidgets.QSpinBox)
@@ -183,6 +205,47 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         self.app.processEvents()
         self.assertTrue(self.widget.polygon_context.isVisible())
         self.assertIs(self.widget.polygon_sides.parent(), self.widget.polygon_context)
+        self.widget.activate_tool(self.EditorMode.DRAW_STAR)
+        self.app.processEvents()
+        self.assertTrue(self.widget.polygon_context.isVisible())
+        self.assertTrue(self.widget.star_inner_ratio.isVisible())
+        self.assertEqual(self.widget.polygon_context_label.text(), "Estrela — pontas")
+
+    def test_canvas_ctrl_a_and_delete_do_not_fall_through_to_host_actions(self):
+        self.widget.view.setFocus()
+        self.app.processEvents()
+        QtTest.QTest.keyClick(
+            self.widget.view,
+            QtCore.Qt.Key_A,
+            QtCore.Qt.ControlModifier,
+        )
+        self.app.processEvents()
+        self.assertEqual(self.widget.controller.selection.ids, (self.path_id,))
+
+        QtTest.QTest.keyClick(self.widget.view, QtCore.Qt.Key_Delete)
+        self.app.processEvents()
+        self.assertNotIn(self.path_id, self.document.entities_by_id)
+
+    def test_piece_recognition_does_not_rebuild_unrelated_vector_projection(self):
+        """Piece2D is topology metadata, not a reason to redraw a cabinet."""
+        item = self.widget.adapter.items_by_id[self.path_id]
+        item_type = type(item)
+        original_update = item_type.update_entity
+        updated_ids = []
+
+        def observe_update(graphics_item, entity):
+            updated_ids.append(str(entity.id))
+            return original_update(graphics_item, entity)
+
+        piece = self.Piece2D(
+            id="piece-performance",
+            name="Peça de teste",
+            outer_path_id=self.path_id,
+        )
+        with patch.object(item_type, "update_entity", new=observe_update):
+            self.widget.controller.execute(self.ReplacePiecesCommand((piece,)))
+        self.assertEqual(updated_ids, [])
+        self.assertIn(self.path_id, self.widget.adapter.items_by_id)
 
     def test_preview_confirmation_is_pinned_above_canvas(self):
         self.widget.begin_workflow_preview(
@@ -196,8 +259,10 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         self.assertIs(bar.parent(), self.widget.canvas_surface)
         self.assertTrue(bar.isVisible())
         self.assertEqual(bar.apply_button.text(), "Aplicar organização")
-        self.assertLessEqual(bar.geometry().bottom(), self.widget.view.geometry().top())
-        self.assertIs(self.widget.view.parent(), self.widget.canvas_surface)
+        bar_bottom = bar.mapTo(self.widget, QtCore.QPoint(0, bar.height())).y()
+        view_top = self.widget.view.mapTo(self.widget, QtCore.QPoint(0, 0)).y()
+        self.assertLessEqual(bar_bottom, view_top)
+        self.assertIs(self.widget.view.parent(), self.widget.ruler_surface)
 
     def test_compact_labels_and_menu_actions_explain_their_effect(self):
         self.assertEqual(self.widget.snap_checkbox.text(), "Imã (Snap)")
@@ -218,6 +283,83 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         trace_spy = QtTest.QSignalSpy(self.widget.traceBitmapRequested)
         self.widget._menu_actions["Arquivo"]["Vetorizar imagem…"].trigger()
         self.assertEqual(trace_spy.count(), 1)
+
+    def test_cam_plan_preview_is_a_non_mutating_editor_overlay(self):
+        """The Aspire-style plan view must not become vector geometry."""
+        before = dict(self.document.entities_by_id)
+        shown = self.widget.show_cut_toolpath_preview(
+            {
+                "rapid": [((0.0, 0.0, 20.0), (20.0, 0.0, 20.0))],
+                "ramp": [((20.0, 0.0, 20.0), (20.0, 0.0, 0.0))],
+                "cut": [((20.0, 0.0, 0.0), (80.0, 0.0, 0.0))],
+                "corner": [((80.0, 0.0, 0.0), (80.0, 30.0, 0.0))],
+                "entry_points": [(20.0, 0.0)],
+            }
+        )
+        self.assertTrue(shown)
+        self.assertEqual(self.document.entities_by_id, before)
+        self.assertFalse(self.widget.overlays.toolpath_items["cut"].path().isEmpty())
+        self.assertTrue(self.widget.overlays.toolpath_entry_item.isVisible())
+        self.widget.clear_cut_toolpath_preview()
+        self.assertTrue(self.widget.overlays.toolpath_items["cut"].path().isEmpty())
+        self.assertFalse(self.widget.overlays.toolpath_entry_item.isVisible())
+
+    def test_cam_menu_emits_editor_plan_preview_request(self):
+        show_spy = QtTest.QSignalSpy(self.widget.showCutToolpathRequested)
+        clear_spy = QtTest.QSignalSpy(self.widget.clearCutToolpathRequested)
+        actions = self.widget._menu_actions["CAM"]
+        actions["Ver percurso de Corte aqui"].trigger()
+        actions["Ocultar percurso"].trigger()
+        self.assertEqual(show_spy.count(), 1)
+        self.assertEqual(clear_spy.count(), 1)
+
+    def test_rulers_use_the_same_compact_thickness(self):
+        self.assertEqual(self.widget.horizontal_ruler.height(), 22)
+        self.assertEqual(self.widget.vertical_ruler.width(), 22)
+        self.assertEqual(self.widget.ruler_corner.width(), 22)
+        self.assertEqual(self.widget.ruler_corner.height(), 22)
+
+    def test_cam_menu_routes_cut_holes_and_pocket_without_bottom_button_clutter(self):
+        configure_spy = QtTest.QSignalSpy(self.widget.configureToolpathRequested)
+        show_spy = QtTest.QSignalSpy(self.widget.showToolpathRequested)
+        actions = self.widget._menu_actions["CAM"]
+
+        actions["Configurar/criar Rebaixo…"].trigger()
+        actions["Ver percurso de Furos aqui"].trigger()
+
+        self.assertEqual(configure_spy.count(), 1)
+        self.assertEqual(configure_spy.at(0)[0], "pocket")
+        self.assertEqual(show_spy.count(), 1)
+        self.assertEqual(show_spy.at(0)[0], "holes")
+
+    def test_virtual_sheets_are_named_without_becoming_vectors(self):
+        """Extra nesting sheets should read like separate Aspire material pages."""
+
+        before = dict(self.document.entities_by_id)
+        self.widget.controller.execute(
+            self.SetDocumentMetadataCommand(
+                "organization_sheet_bounds",
+                [[0.0, 0.0, 300.0, 200.0], [350.0, 0.0, 650.0, 200.0]],
+            )
+        )
+        self.app.processEvents()
+        self.assertEqual(self.document.entities_by_id, before)
+        self.assertEqual(len(self.widget.adapter.sheet_area_items), 2)
+        self.assertEqual(len(self.widget.adapter.sheet_label_items), 2)
+        self.assertEqual(
+            [item.text() for item in self.widget.adapter.sheet_label_items],
+            ["Chapa 01", "Chapa 02"],
+        )
+        self.widget.adapter.show_preview_sheet_bounds(
+            ((0.0, 0.0, 300.0, 200.0), (350.0, 0.0, 650.0, 200.0))
+        )
+        self.assertEqual(len(self.widget.adapter.preview_sheet_label_items), 2)
+        self.assertEqual(
+            [item.text() for item in self.widget.adapter.preview_sheet_label_items],
+            ["Chapa 01 — prévia", "Chapa 02 — prévia"],
+        )
+        self.widget.adapter.clear_preview_sheet_bounds()
+        self.assertFalse(self.widget.adapter.preview_sheet_label_items)
 
     def test_right_click_cancels_tool_and_workflow_then_clears_selection(self):
         viewport = self.widget.view.viewport()
@@ -294,11 +436,11 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         self.widget.activate_tool(self.EditorMode.DRAW_ELLIPSE)
         viewport = self.widget.view.viewport()
         QtTest.QTest.mouseClick(
-            viewport, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier,
+            viewport, QtCore.Qt.LeftButton, QtCore.Qt.ShiftModifier,
             self.viewport_point(100.0, 60.0),
         )
         QtTest.QTest.mouseClick(
-            viewport, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier,
+            viewport, QtCore.Qt.LeftButton, QtCore.Qt.ShiftModifier,
             self.viewport_point(140.0, 80.0),
         )
         self.app.processEvents()
@@ -307,8 +449,11 @@ class EditorWidgetInteractionTests(unittest.TestCase):
             if type(entity).__name__ == "EllipseEntity"
         ]
         self.assertEqual(len(ellipses), 1)
-        self.assertAlmostEqual(ellipses[0].radius_x, 40.0, places=6)
-        self.assertAlmostEqual(ellipses[0].radius_y, 20.0, places=6)
+        # The mouse path is quantized to whole screen pixels; geometry remains
+        # an exact EllipseEntity and the numerical panel is available when an
+        # exact 40 × 20 mm dimension is required.
+        self.assertAlmostEqual(ellipses[0].radius_x, 40.0, delta=1.0)
+        self.assertAlmostEqual(ellipses[0].radius_y, 20.0, delta=1.0)
 
     def test_exact_properties_apply_one_undoable_transform(self):
         self.widget.controller.selection.select_only(self.path_id)
@@ -449,12 +594,25 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         trim_spy = QtTest.QSignalSpy(self.widget.trimRequested)
         dogbone_spy = QtTest.QSignalSpy(self.widget.dogboneRequested)
         panelnest_spy = QtTest.QSignalSpy(self.widget.sendPanelNestRequested)
+        join_open_spy = QtTest.QSignalSpy(self.widget.joinOpenPathsRequested)
         repair_actions = self.widget._menu_actions["Reparar"]
+        edit_actions = self.widget._menu_actions["Editar"]
         fillet_actions = self.widget._menu_actions["Filetes"]
         self.assertIn("Fechar caminho / unir próximas", repair_actions)
+        self.assertIn("Unir vetores abertos (por tolerância)", repair_actions)
         self.assertIn("Unir 2 pontas (reta)", repair_actions)
         self.assertIn("Projetar ponta na geometria", repair_actions)
         self.assertIn("Limpar sobrelinhas/duplicados…", repair_actions)
+        self.assertIn("Soldar vetores sobrepostos", edit_actions)
+        self.assertIn("Subtrair vetores (criar furo/recorte interno)", edit_actions)
+        self.assertIn("Interseção de vetores", edit_actions)
+        self.assertIn("Inverter direção dos vetores", edit_actions)
+        self.assertIn("Editar texto vetorial…", edit_actions)
+        self.assertTrue(
+            self.widget.findChild(QtWidgets.QToolButton, "drawingActionTextovetorial")
+        )
+        repair_actions["Unir vetores abertos (por tolerância)"].trigger()
+        self.assertEqual(join_open_spy.count(), 1)
         self.assertIn(
             "Importar itens da árvore…",
             self.widget._menu_actions["Arquivo"],
@@ -532,6 +690,19 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         )
         self.app.processEvents()
         self.assertEqual(self.widget.controller.selection.ids, (self.path_id,))
+
+    def test_canvas_keeps_focus_for_delete_shortcut(self):
+        self.widget.activate_tool(self.EditorMode.SELECT)
+        point = self.viewport_point(150.0, 100.0)
+        QtTest.QTest.mouseClick(
+            self.widget.view.viewport(), QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, point
+        )
+        self.app.processEvents()
+        self.assertTrue(self.widget.view.hasFocus())
+        self.assertEqual(self.widget.controller.selection.ids, (self.path_id,))
+        QtTest.QTest.keyClick(self.widget.view, QtCore.Qt.Key_Delete)
+        self.app.processEvents()
+        self.assertNotIn(self.path_id, self.document.entities_by_id)
 
     def test_offset_fillet_reliefs_and_extend_are_preview_first(self):
         from woodcam_editor.domain import AddEntitiesCommand

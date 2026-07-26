@@ -18,6 +18,7 @@ class CommandExecutionCancelled(RuntimeError):
 
 class EditorMode(str, Enum):
     SELECT = "select"
+    MEASURE = "measure"
     NODE_EDIT = "node_edit"
     DRAW_LINE = "draw_line"
     DRAW_POLYLINE = "draw_polyline"
@@ -25,7 +26,9 @@ class EditorMode(str, Enum):
     DRAW_CIRCLE = "draw_circle"
     DRAW_ELLIPSE = "draw_ellipse"
     DRAW_ARC = "draw_arc"
+    DRAW_BEZIER = "draw_bezier"
     DRAW_POLYGON = "draw_polygon"
+    DRAW_STAR = "draw_star"
     TRIM = "trim"
     EXTEND = "extend"
     OFFSET = "offset"
@@ -33,6 +36,7 @@ class EditorMode(str, Enum):
     DOGBONE = "dogbone"
     TBONE = "tbone"
     JOIN_ENDPOINTS = "join_endpoints"
+    JOIN_ENDPOINTS_SMOOTH = "join_endpoints_smooth"
     CONNECT = "connect"
     SPLICE = "splice"
     AUTO_DOGBONE = "auto_dogbone"
@@ -196,7 +200,10 @@ class EditorController:
             listener(change_set)
 
     def delete_selected(self) -> bool:
-        ids = self._editable_entity_ids(self.selection.ids)
+        selected_ids = tuple(self.selection.ids)
+        ids = self._editable_entity_ids(
+            tuple(selected_ids) + self.expand_group_children(selected_ids)
+        )
         if not ids:
             return False
         from woodcam_editor.domain import DeleteEntitiesCommand
@@ -208,7 +215,7 @@ class EditorController:
         return True
 
     def move_entities(self, entity_ids: Iterable[str], delta: Any) -> bool:
-        ids = self._editable_entity_ids(entity_ids)
+        ids = self._editable_entity_ids(self.expand_group_children(entity_ids))
         dx, dy = _xy(delta)
         if not ids or math.hypot(dx, dy) <= 1e-12:
             return False
@@ -225,8 +232,26 @@ class EditorController:
         self.execute(command)
         return True
 
+    def array_copy_selection(
+        self,
+        columns: int,
+        rows: int,
+        step_x: float,
+        step_y: float,
+    ) -> bool:
+        """Create an Aspire-style rectangular copy array from the selection."""
+
+        roots = tuple(self.selection.ids)
+        self._editable_entity_ids(self.expand_group_children(roots))
+        from woodcam_editor.domain import ArrayCopyCommand
+
+        command = ArrayCopyCommand(roots, columns, rows, step_x, step_y)
+        self.execute(command)
+        self.selection.replace(command.created_root_ids)
+        return True
+
     def transform_entities(self, entity_ids: Iterable[str], transform: Any) -> bool:
-        ids = self._editable_entity_ids(entity_ids)
+        ids = self._editable_entity_ids(self.expand_group_children(entity_ids))
         if not ids:
             return False
         from woodcam_editor.domain import TransformEntitiesCommand
@@ -264,6 +289,91 @@ class EditorController:
             )
         return tuple(entity_id for entity_id in ids if self.get_entity(entity_id) is not None)
 
+    def expand_group_children(self, entity_ids: Iterable[str]) -> Tuple[str, ...]:
+        """Resolve selected GroupEntity IDs to their drawable leaf vectors."""
+
+        from woodcam_editor.domain import GroupEntity
+
+        result = []
+        seen = set()
+
+        def visit(entity_id):
+            entity_id = str(entity_id)
+            if entity_id in seen:
+                return
+            seen.add(entity_id)
+            entity = self.get_entity(entity_id)
+            if isinstance(entity, GroupEntity):
+                for child_id in entity.child_ids:
+                    visit(child_id)
+                return
+            if entity is not None:
+                result.append(entity_id)
+
+        for entity_id in entity_ids:
+            visit(entity_id)
+        return tuple(result)
+
+    def grouped_selection_id_for_hit(self, entity_id: Optional[str]) -> Optional[str]:
+        """Return the outermost group containing a clicked child, if any."""
+
+        if entity_id is None:
+            return None
+        from woodcam_editor.domain import GroupEntity
+
+        parent_by_child = {}
+        for candidate in self.document.entities_by_id.values():
+            if isinstance(candidate, GroupEntity):
+                for child_id in candidate.child_ids:
+                    parent_by_child[str(child_id)] = candidate.id
+        current = str(entity_id)
+        visited = set()
+        while current in parent_by_child and current not in visited:
+            visited.add(current)
+            current = str(parent_by_child[current])
+        return current
+
+    def canonical_group_selection(self, entity_ids: Iterable[str]) -> Tuple[str, ...]:
+        """Replace selected children with their outermost persistent group.
+
+        This is used by Ctrl+A and grouping commands.  It ensures a global
+        selection sees an existing group as one object, exactly as a user
+        expects after clicking any member of that group.
+        """
+
+        result = []
+        for entity_id in entity_ids:
+            resolved = self.grouped_selection_id_for_hit(str(entity_id))
+            if resolved is not None and resolved not in result:
+                result.append(resolved)
+        return tuple(result)
+
+    def reverse_path_directions(
+        self, entity_ids: Optional[Iterable[str]] = None
+    ) -> Tuple[str, ...]:
+        """Reverse selected drawable paths, expanding a selected piece group.
+
+        Circles and ellipses have no independent traversal direction in the
+        editor domain, so they are intentionally left untouched.  This lets an
+        imported board group keep its holes while its outer/inner PathEntity
+        contours are reversed together in one Undo step.
+        """
+
+        from woodcam_editor.domain import PathEntity, ReversePathDirectionCommand
+
+        selected = self.selection.ids if entity_ids is None else tuple(entity_ids)
+        leaf_ids = self.expand_group_children(selected)
+        path_ids = tuple(
+            entity_id
+            for entity_id in leaf_ids
+            if isinstance(self.get_entity(entity_id), PathEntity)
+        )
+        if not path_ids:
+            return ()
+        self._editable_entity_ids(path_ids)
+        self.execute(ReversePathDirectionCommand(path_ids))
+        return path_ids
+
     def rotate_selection(self, angle_degrees: float) -> bool:
         bounds = self.selection_bounds()
         if bounds is None or abs(float(angle_degrees)) <= 1e-12:
@@ -293,13 +403,25 @@ class EditorController:
         return self.transform_entities(self.selection.ids, transform)
 
     def align_selection(self, alignment: str) -> bool:
-        ids = self._editable_entity_ids(self.selection.ids)
-        if len(ids) < 2:
+        ids = self._editable_entity_ids(self.expand_group_children(self.selection.ids))
+        if not ids:
             return False
         bounds_by_id = {entity_id: self.get_entity(entity_id).bounds() for entity_id in ids}
+        # With one vector, alignment is relative to the persisted work area,
+        # matching the CAD/CAM convention.  With two or more vectors, retain
+        # the original selection-to-selection behavior.
         selection_bounds = None
-        for bounds in bounds_by_id.values():
-            selection_bounds = bounds if selection_bounds is None else selection_bounds.union(bounds)
+        if len(ids) == 1 and self.document.work_area is not None:
+            work_area = self.document.work_area
+            selection_bounds = type(next(iter(bounds_by_id.values())))(
+                work_area.min_x,
+                work_area.min_y,
+                work_area.max_x,
+                work_area.max_y,
+            )
+        else:
+            for bounds in bounds_by_id.values():
+                selection_bounds = bounds if selection_bounds is None else selection_bounds.union(bounds)
         alignment = str(alignment).lower()
         commands = []
         from woodcam_editor.domain import CompositeCommand, MoveEntitiesCommand
@@ -327,7 +449,7 @@ class EditorController:
         return True
 
     def distribute_selection(self, axis: str) -> bool:
-        ids = self._editable_entity_ids(self.selection.ids)
+        ids = self._editable_entity_ids(self.expand_group_children(self.selection.ids))
         if len(ids) < 3:
             return False
         bounds_by_id = {entity_id: self.get_entity(entity_id).bounds() for entity_id in ids}
@@ -368,7 +490,7 @@ class EditorController:
 
     def selection_bounds(self) -> Any:
         result = None
-        for entity_id in self.selection.ids:
+        for entity_id in self.expand_group_children(self.selection.ids):
             entity = self.get_entity(entity_id)
             bounds_method = getattr(entity, "bounds", None) if entity else None
             if not callable(bounds_method):
@@ -433,9 +555,89 @@ class EditorController:
         method = getattr(entity, "with_node_moved", None)
         return method(node_id, position) if callable(method) else None
 
+    @staticmethod
+    def bezier_handle_id(span_id: str, handle: str) -> str:
+        if handle not in ("control1", "control2"):
+            raise ValueError("Bézier handle must be control1 or control2")
+        return "bezier:%s:%s" % (str(span_id), handle)
+
+    @staticmethod
+    def parse_bezier_handle_id(handle_id: str) -> Optional[Tuple[str, str]]:
+        prefix, separator, remainder = str(handle_id).partition(":")
+        if prefix != "bezier" or not separator:
+            return None
+        span_id, separator, handle = remainder.rpartition(":")
+        if not separator or not span_id or handle not in ("control1", "control2"):
+            return None
+        return span_id, handle
+
+    def bezier_handle_position(self, entity_id: str, handle_id: str) -> Any:
+        parsed = self.parse_bezier_handle_id(handle_id)
+        if parsed is None:
+            raise ValueError("invalid Bézier handle ID")
+        span_id, handle = parsed
+        entity = self.get_entity(entity_id)
+        for span in tuple(getattr(entity, "spans", ()) or ()):
+            if str(getattr(span, "id", "")) == span_id and hasattr(span, handle):
+                return getattr(span, handle)
+        raise KeyError("unknown Bézier handle %s" % handle_id)
+
+    def preview_bezier_handle(self, entity_id: str, handle_id: str, position: Any) -> Any:
+        parsed = self.parse_bezier_handle_id(handle_id)
+        if parsed is None:
+            return None
+        span_id, handle = parsed
+        entity = self.get_entity(entity_id)
+        if entity is None:
+            return None
+        from dataclasses import replace
+        from woodcam_editor.domain import CubicBezierSpan
+
+        replacement_spans = []
+        found = False
+        point = self.vec(*_xy(position))
+        for span in tuple(getattr(entity, "spans", ()) or ()):
+            if str(getattr(span, "id", "")) != span_id:
+                replacement_spans.append(span)
+                continue
+            if not isinstance(span, CubicBezierSpan):
+                return None
+            replacement_spans.append(replace(span, **{handle: point}))
+            found = True
+        return replace(entity, spans=tuple(replacement_spans)) if found else None
+
+    def move_bezier_handle(self, entity_id: str, handle_id: str, new_position: Any) -> bool:
+        parsed = self.parse_bezier_handle_id(handle_id)
+        if parsed is None:
+            return False
+        old = self.bezier_handle_position(entity_id, handle_id)
+        nx, ny = _xy(new_position)
+        if math.hypot(nx - old.x, ny - old.y) <= 1e-12:
+            return False
+        from woodcam_editor.domain import MoveBezierHandleCommand
+
+        span_id, handle = parsed
+        self.execute(MoveBezierHandleCommand(entity_id, span_id, handle, self.vec(nx, ny)))
+        return True
+
     def node_positions(self, entity_id: str) -> Tuple[Tuple[str, Any], ...]:
         entity = self.get_entity(entity_id)
         return self.node_positions_for_entity(entity)
+
+    def editable_handle_positions(self, entity_id: str) -> Tuple[Tuple[str, Any, str], ...]:
+        entity = self.get_entity(entity_id)
+        return self.editable_handle_positions_for_entity(entity)
+
+    @classmethod
+    def editable_handle_positions_for_entity(cls, entity: Any) -> Tuple[Tuple[str, Any, str], ...]:
+        result = [(node_id, point, "node") for node_id, point in cls.node_positions_for_entity(entity)]
+        from woodcam_editor.domain import CubicBezierSpan
+
+        for span in tuple(getattr(entity, "spans", ()) or ()):
+            if isinstance(span, CubicBezierSpan):
+                result.append((cls.bezier_handle_id(span.id, "control1"), span.control1, "bezier_control"))
+                result.append((cls.bezier_handle_id(span.id, "control2"), span.control2, "bezier_control"))
+        return tuple(result)
 
     @staticmethod
     def node_positions_for_entity(entity: Any) -> Tuple[Tuple[str, Any], ...]:
@@ -459,10 +661,15 @@ class EditorController:
     def add_line(self, start: Any, end: Any) -> Optional[str]:
         return self.add_polyline((start, end), closed=False)
 
-    def add_polyline(self, points: Sequence[Any], closed: bool = False) -> Optional[str]:
+    def add_polyline(
+        self,
+        points: Sequence[Any],
+        closed: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
         if len(points) < (3 if closed else 2):
             return None
-        entity = self._path_entity(points, closed)
+        entity = self._path_entity(points, closed, metadata=metadata)
         self._add_entities((entity,))
         self.selection.select_only(str(entity.id))
         return str(entity.id)
@@ -527,7 +734,47 @@ class EditorController:
             )
             for index in range(sides)
         )
-        return self.add_polyline(points, closed=True)
+        return self.add_polyline(
+            points,
+            closed=True,
+            metadata={"primitive": "polygon", "polygon_sides": sides},
+        )
+
+    def add_star(
+        self,
+        center: Any,
+        outer_radius: float,
+        points: int = 5,
+        inner_ratio: float = 0.45,
+        rotation: float = 0.0,
+    ) -> Optional[str]:
+        """Create one closed path with alternating outer and inner star tips.
+
+        A star is stored as ordinary exact line spans, rather than as a Qt-only
+        drawing primitive, so it keeps the same node editing, CAM and Undo
+        behavior as every other closed vector.
+        """
+        outer_radius = float(outer_radius)
+        points = max(3, int(points))
+        inner_ratio = min(0.95, max(0.05, float(inner_ratio)))
+        if outer_radius <= 1e-12:
+            return None
+        cx, cy = _xy(center)
+        vertices = []
+        step = math.pi / float(points)
+        for index in range(points * 2):
+            radius = outer_radius if index % 2 == 0 else outer_radius * inner_ratio
+            angle = float(rotation) + index * step
+            vertices.append(self.vec(cx + radius * math.cos(angle), cy + radius * math.sin(angle)))
+        return self.add_polyline(
+            tuple(vertices),
+            closed=True,
+            metadata={
+                "primitive": "star",
+                "star_points": points,
+                "star_inner_ratio": inner_ratio,
+            },
+        )
 
     def add_arc_three_points(self, start: Any, through: Any, end: Any) -> Optional[str]:
         center = self._circumcenter(start, through, end)
@@ -560,7 +807,52 @@ class EditorController:
         self.selection.select_only(str(entity.id))
         return str(entity.id)
 
-    def _path_entity(self, points: Sequence[Any], closed: bool) -> Any:
+    def add_bezier(self, start: Any, control1: Any, control2: Any, end: Any) -> Optional[str]:
+        """Add one exact cubic Bézier as one atomic document command.
+
+        The control handles intentionally remain geometry owned by the span;
+        they are not presentation-only handles and no sampled polyline is
+        inserted into ``VectorDocument``.
+        """
+        start = self.vec(*_xy(start))
+        control1 = self.vec(*_xy(control1))
+        control2 = self.vec(*_xy(control2))
+        end = self.vec(*_xy(end))
+        if (
+            start.almost_equals(end, 1.0e-12)
+            and start.almost_equals(control1, 1.0e-12)
+            and start.almost_equals(control2, 1.0e-12)
+        ):
+            return None
+        from woodcam_editor.domain import CubicBezierSpan, PathEntity
+
+        span = _construct(
+            CubicBezierSpan,
+            id=_uuid("span"),
+            start=start,
+            control1=control1,
+            control2=control2,
+            end=end,
+        )
+        entity = _construct(
+            PathEntity,
+            id=_uuid("path"),
+            layer_id=self._active_layer_id(),
+            spans=(span,),
+            closed=False,
+            node_ids=(_uuid("node"), _uuid("node")),
+            metadata={},
+        )
+        self._add_entities((entity,))
+        self.selection.select_only(str(entity.id))
+        return str(entity.id)
+
+    def _path_entity(
+        self,
+        points: Sequence[Any],
+        closed: bool,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Any:
         from woodcam_editor.domain import LineSpan, PathEntity
 
         values = tuple(self.vec(*_xy(point)) for point in points)
@@ -579,7 +871,7 @@ class EditorController:
             spans=spans,
             closed=bool(closed),
             node_ids=tuple(_uuid("node") for _ in range(node_count)),
-            metadata={},
+            metadata=dict(metadata or {}),
         )
 
     def _add_entities(self, entities: Iterable[Any]) -> None:
@@ -727,6 +1019,7 @@ class EditorController:
         second_entity_id: str,
         second_endpoint: str,
         tolerance: float = 0.2,
+        mode: str = "line",
     ) -> Any:
         """Pure preview for an explicit point-to-point join.
 
@@ -735,12 +1028,23 @@ class EditorController:
         """
 
         self._editable_entity_ids((first_entity_id, second_entity_id))
-        from woodcam_editor.domain import join_path_entities_with_line
+        from woodcam_editor.domain import (
+            join_path_entities_with_line,
+            join_path_entities_with_smooth_curve,
+        )
         from woodcam_editor.geometry.modifiers import ModifierPreview
 
         first = self.get_entity(first_entity_id)
         second = self.get_entity(second_entity_id)
-        joined = join_path_entities_with_line(
+        mode = str(mode or "line").lower()
+        if mode not in ("line", "smooth"):
+            raise ValueError("modo de união deve ser 'line' ou 'smooth'")
+        joiner = (
+            join_path_entities_with_smooth_curve
+            if mode == "smooth"
+            else join_path_entities_with_line
+        )
+        joined = joiner(
             first,
             second,
             first_endpoint,
@@ -756,7 +1060,7 @@ class EditorController:
             (joined,),
             {
                 "distance_mm": float(distance),
-                "join_mode": "merge" if distance <= float(tolerance) else "line",
+                "join_mode": "merge" if distance <= float(tolerance) else mode,
                 "first_endpoint": first_endpoint,
                 "second_endpoint": second_endpoint,
             },
@@ -768,6 +1072,7 @@ class EditorController:
             return False
         self._editable_entity_ids(entity.id for entity in preview.original_entities)
         from woodcam_editor.domain import (
+            ApplyBooleanPreviewCommand,
             ApplyModifierPreviewCommand,
             ConnectEndpointToGeometryCommand,
             SplicePathToContourCommand,
@@ -777,13 +1082,17 @@ class EditorController:
             "connect_endpoint_to_geometry": ConnectEndpointToGeometryCommand,
             "splice_open_path_to_contour": SplicePathToContourCommand,
         }.get(preview.operation, ApplyModifierPreviewCommand)
+        if str(preview.operation).startswith("boolean_"):
+            command_class = ApplyBooleanPreviewCommand
         if preview.operation == "auto_corner_reliefs":
             from woodcam_editor.domain import AutoCornerReliefsCommand
 
             command_class = AutoCornerReliefsCommand
-        self.execute(command_class(preview))
+        command = command_class(preview)
+        self.execute(command)
         result_ids = tuple(entity.id for entity in preview.result_entities)
-        self.selection.replace(result_ids)
+        group_id = str(getattr(command, "group_id", "") or "")
+        self.selection.replace((group_id,) if group_id else result_ids)
         return True
 
     def preview_connect_endpoint(
@@ -911,13 +1220,21 @@ class EditorController:
 
         return Vec2(float(x), float(y))
 
-    def snap(self, point: Any, pixels_per_mm: float, excluded_ids: Iterable[str] = (), disabled: bool = False):
+    def snap(
+        self,
+        point: Any,
+        pixels_per_mm: float,
+        excluded_ids: Iterable[str] = (),
+        disabled: bool = False,
+        reference_point: Any = None,
+    ):
         return self.snap_engine.snapped_point(
             point,
             self.document,
             pixels_per_mm,
             excluded_entity_ids=excluded_ids,
             disabled=disabled,
+            reference_point=reference_point,
         )
 
     @staticmethod

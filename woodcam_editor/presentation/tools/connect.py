@@ -146,6 +146,7 @@ class JoinEndpointsTool(TwoStageRepairTool):
     """Join two endpoints chosen by the operator, even across entities."""
 
     mode = EditorMode.JOIN_ENDPOINTS
+    join_mode = "line"
     instruction = "Unir 2 pontas: clique a primeira ponta de um caminho aberto."
 
     def pick_source(self, event):
@@ -173,15 +174,28 @@ class JoinEndpointsTool(TwoStageRepairTool):
             target.entity_id,
             target.endpoint,
             tolerance,
+            mode=self.join_mode,
         )
         distance = float(preview.metadata.get("distance_mm", 0.0))
         mode = preview.metadata.get("join_mode")
         action = (
             "fundir no mesmo ponto"
             if mode == "merge"
-            else "criar uma reta entre as pontas"
+            else (
+                "criar uma curva suave entre as pontas"
+                if mode == "smooth"
+                else "criar uma reta entre as pontas"
+            )
         )
         return preview, "Abertura %.3f mm — %s" % (distance, action)
+
+
+class JoinEndpointsSmoothTool(JoinEndpointsTool):
+    """Same explicit two-endpoint workflow, with a tangent Bézier bridge."""
+
+    mode = EditorMode.JOIN_ENDPOINTS_SMOOTH
+    join_mode = "smooth"
+    instruction = "Unir 2 pontas com curva suave: clique a primeira ponta aberta."
 
 
 class SpliceTool(TwoStageRepairTool):
@@ -228,6 +242,7 @@ class SpliceTool(TwoStageRepairTool):
 __all__ = [
     "ConnectTool",
     "JoinEndpointsTool",
+    "JoinEndpointsSmoothTool",
     "SpliceTool",
     "TwoStageRepairTool",
 ]

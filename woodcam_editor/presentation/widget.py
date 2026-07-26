@@ -13,7 +13,7 @@ from woodcam_editor.application import (
     EditorMode,
 )
 
-from .compat import Signal, QtCore, QtGui, QtWidgets, qt_enum
+from .compat import CTRL_MODIFIER, Signal, QtCore, QtGui, QtWidgets, qt_enum
 from .icons import tool_icon
 from .overlays import OverlayLayer
 from .panels import (
@@ -25,8 +25,31 @@ from .panels import (
 )
 from .scene_adapter import SceneAdapter
 from .tools import ToolManager
-from .view import VectorGraphicsView
+from .view import RulerWidget, VectorGraphicsView
 from .workflows import WorkflowPreviewBar
+
+
+class _ResponsiveTopToolBar(QtWidgets.QToolBar):
+    """Keeps a dense Aspire-like command strip usable in a narrow task panel.
+
+    The toolbar itself retains its natural minimum width inside a horizontal
+    scroll host, so no command disappears.  Reporting the available viewport
+    width as the size hint prevents Qt from forcing the whole editor wider than
+    a docked FreeCAD task panel.
+    """
+
+    def sizeHint(self):  # noqa: N802 - Qt virtual name
+        hint = super(_ResponsiveTopToolBar, self).sizeHint()
+        parent = self.parentWidget()
+        available = parent.width() if parent is not None else 0
+        if available > 0:
+            hint.setWidth(min(hint.width(), available))
+        return hint
+
+    def minimumSizeHint(self):  # noqa: N802 - Qt virtual name
+        # QScrollArea needs the natural minimum width to expose a horizontal
+        # scrollbar.  It must not receive the capped reporting size above.
+        return super(_ResponsiveTopToolBar, self).minimumSizeHint()
 
 
 class Editor2DWidget(QtWidgets.QWidget):
@@ -34,15 +57,33 @@ class Editor2DWidget(QtWidgets.QWidget):
     selectionChanged = Signal(object)
     modeChanged = Signal(str)
     importSketchRequested = Signal()
+    importPanelNestPartsRequested = Signal()
     diagnoseRequested = Signal()
     repairRequested = Signal()
     cleanupDuplicatesRequested = Signal()
+    booleanUnionRequested = Signal()
+    booleanDifferenceRequested = Signal()
+    booleanIntersectionRequested = Signal()
+    booleanOverlapRequested = Signal()
+    reverseDirectionRequested = Signal()
+    createTextRequested = Signal()
+    editTextRequested = Signal()
+    groupRequested = Signal()
+    ungroupRequested = Signal()
+    closePathRequested = Signal(str)
+    joinOpenPathsRequested = Signal()
+    fitCurvesRequested = Signal()
+    createContourRequested = Signal()
     createPiecesRequested = Signal()
     organizePiecesRequested = Signal()
     organizePiecesFastRequested = Signal()
     organizePiecesThoroughRequested = Signal()
     useInCamRequested = Signal()
     sendPanelNestRequested = Signal()
+    showCutToolpathRequested = Signal()
+    showToolpathRequested = Signal(str)
+    configureToolpathRequested = Signal(str)
+    clearCutToolpathRequested = Signal()
     pieceSelected = Signal(str)
     trimRequested = Signal()
     extendRequested = Signal()
@@ -87,8 +128,16 @@ class Editor2DWidget(QtWidgets.QWidget):
             self.overlays,
             self,
         )
+        self._application = QtWidgets.QApplication.instance()
+        if self._application is not None:
+            # FreeCAD registers global Ctrl+A/Delete actions.  An application
+            # filter lets the focused canvas own these editor operations
+            # before the host tree has a chance to consume them.
+            self._application.installEventFilter(self)
         self._workflow_apply_callback = None
         self._workflow_revision = None
+        self._focus_mode = False
+        self._side_panel_hidden = False
         self._mode_buttons = {}
         self._build_ui()
         self._connect_session()
@@ -108,16 +157,66 @@ class Editor2DWidget(QtWidgets.QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(3)
 
-        self.toolbar = QtWidgets.QToolBar(self)
+        # Keep the window-like expand/retract control outside the horizontally
+        # scrollable command strip.  It therefore remains visible even when
+        # the editor is docked in a narrow FreeCAD task panel.
+        toolbar_row = QtWidgets.QHBoxLayout()
+        toolbar_row.setContentsMargins(0, 0, 0, 0)
+        toolbar_row.setSpacing(2)
+
+        self.top_toolbar_scroll = QtWidgets.QScrollArea(self)
+        self.top_toolbar_scroll.setObjectName("editorTopToolbarScroll")
+        self.top_toolbar_scroll.setWidgetResizable(False)
+        self.top_toolbar_scroll.setSizeAdjustPolicy(
+            qt_enum(QtWidgets.QAbstractScrollArea, "AdjustIgnored", "SizeAdjustPolicy")
+        )
+        self.top_toolbar_scroll.setMinimumWidth(0)
+        self.top_toolbar_scroll.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Fixed,
+        )
+        self.top_toolbar_scroll.setFrameShape(
+            qt_enum(QtWidgets.QFrame, "NoFrame", "Shape")
+        )
+        self.top_toolbar_scroll.setHorizontalScrollBarPolicy(
+            qt_enum(QtCore.Qt, "ScrollBarAsNeeded", "ScrollBarPolicy")
+        )
+        self.top_toolbar_scroll.setVerticalScrollBarPolicy(
+            qt_enum(QtCore.Qt, "ScrollBarAlwaysOff", "ScrollBarPolicy")
+        )
+        self.toolbar = _ResponsiveTopToolBar(self.top_toolbar_scroll)
         self.toolbar.setObjectName("editorTopToolbar")
         self.toolbar.setMovable(False)
         self.toolbar.setFloatable(False)
         self.toolbar.setIconSize(QtCore.QSize(16, 16))
+        # The scroll host also reserves room for its horizontal scrollbar.
+        # A 31 px host left only a thin strip of the command row visible in a
+        # narrow FreeCAD task panel, making menu labels and spin boxes appear
+        # vertically clipped.  Keep the natural toolbar on one line and give
+        # the viewport enough height for both the controls and the scrollbar.
+        self.toolbar.setMinimumHeight(30)
         self.toolbar.setStyleSheet(
             "QToolBar { spacing: 2px; padding: 1px; border: 0; }"
             "QToolButton { padding: 2px; margin: 0; }"
         )
-        root.addWidget(self.toolbar)
+        self.top_toolbar_scroll.setWidget(self.toolbar)
+        self.top_toolbar_scroll.setFixedHeight(48)
+
+        self.focus_button = QtWidgets.QToolButton(self)
+        self.focus_button.setObjectName("focusModeButton")
+        self.focus_button.setAccessibleName("Ocultar painel lateral")
+        self.focus_button.setCheckable(True)
+        # The old native maximize glyph looked like a second window control and
+        # hid the fact that this action only folds the right-hand inspector.
+        # The actual control is the narrow tab on the splitter; keep this
+        # legacy button out of the crowded toolbar row.
+        self.focus_button.setFixedSize(22, 30)
+        self.focus_button.hide()
+        self.focus_button.clicked.connect(self._toggle_focus_mode)
+        toolbar_row.addWidget(self.top_toolbar_scroll, 1)
+        toolbar_row.addWidget(self.focus_button, 0, QtCore.Qt.AlignTop)
+        root.addLayout(toolbar_row)
+        self._update_focus_button()
 
         self._menu_actions = {}
         self._button_group = QtWidgets.QButtonGroup(self)
@@ -126,10 +225,30 @@ class Editor2DWidget(QtWidgets.QWidget):
             "Arquivo",
             (
                 ("Importar itens da árvore…", self.importSketchRequested.emit),
+                ("Importar peças planas pelo PanelNest…", self.importPanelNestPartsRequested.emit),
                 ("Importar arquivo", self.importRequested.emit),
                 ("Vetorizar imagem…", self.traceBitmapRequested.emit),
                 ("Criar relevo 3D por imagem…", self.createReliefRequested.emit),
                 ("Exportar", self.exportRequested.emit),
+            ),
+        )
+        self.edit_menu_button = self._add_menu_button(
+            "Editar",
+            (
+                ("Agrupar objetos", self.groupRequested.emit),
+                ("Desagrupar objetos", self.ungroupRequested.emit),
+                ("Medir / inspecionar", lambda: self.activate_tool(EditorMode.MEASURE)),
+                # Aspire distinguishes a geometric weld from a compound part:
+                # profiles that overlap are welded, while a contour entirely
+                # inside a board becomes an exact internal loop of that board.
+                ("Soldar vetores sobrepostos", self.booleanUnionRequested.emit),
+                ("Subtrair vetores (criar furo/recorte interno)", self.booleanDifferenceRequested.emit),
+                ("Interseção de vetores", self.booleanIntersectionRequested.emit),
+                ("Sobrepor vetores (último recorta os anteriores)", self.booleanOverlapRequested.emit),
+                ("Inverter direção dos vetores", self.reverseDirectionRequested.emit),
+                ("Editar texto vetorial…", self.editTextRequested.emit),
+                ("Ajustar arcos/círculos aos vetores…", self.fitCurvesRequested.emit),
+                ("Criar contorno (offset)…", self.createContourRequested.emit),
             ),
         )
         self.repair_menu_button = self._add_menu_button(
@@ -138,9 +257,26 @@ class Editor2DWidget(QtWidgets.QWidget):
                 ("Diagnosticar", self.diagnoseRequested.emit),
                 ("Limpar sobrelinhas/duplicados…", self.cleanupDuplicatesRequested.emit),
                 ("Fechar caminho / unir próximas", self.repairRequested.emit),
+                ("Unir vetores abertos (por tolerância)", self.joinOpenPathsRequested.emit),
+                (
+                    "Fechar caminho com reta",
+                    lambda: self.closePathRequested.emit("line"),
+                ),
+                (
+                    "Fechar caminho com curva suave",
+                    lambda: self.closePathRequested.emit("smooth"),
+                ),
+                (
+                    "Fechar aproximando as pontas",
+                    lambda: self.closePathRequested.emit("midpoint"),
+                ),
                 (
                     "Unir 2 pontas (reta)",
                     lambda: self._activate_modifier(EditorMode.JOIN_ENDPOINTS),
+                ),
+                (
+                    "Unir 2 pontas (curva suave)",
+                    lambda: self._activate_modifier(EditorMode.JOIN_ENDPOINTS_SMOOTH),
                 ),
                 (
                     "Projetar ponta na geometria",
@@ -210,6 +346,13 @@ class Editor2DWidget(QtWidgets.QWidget):
             "CAM",
             (
                 ("Usar Editor 2D como fonte", self.useInCamRequested.emit),
+                ("Configurar/criar Corte…", lambda: self.configureToolpathRequested.emit("cut")),
+                ("Configurar/criar Furos…", lambda: self.configureToolpathRequested.emit("holes")),
+                ("Configurar/criar Rebaixo…", lambda: self.configureToolpathRequested.emit("pocket")),
+                ("Ver percurso de Corte aqui", self.showCutToolpathRequested.emit),
+                ("Ver percurso de Furos aqui", lambda: self.showToolpathRequested.emit("holes")),
+                ("Ver percurso de Rebaixo aqui", lambda: self.showToolpathRequested.emit("pocket")),
+                ("Ocultar percurso", self.clearCutToolpathRequested.emit),
                 ("Enviar PanelNest", self.sendPanelNestRequested.emit),
             ),
         )
@@ -243,6 +386,15 @@ class Editor2DWidget(QtWidgets.QWidget):
         self.snap_checkbox.setChecked(True)
         self.snap_checkbox.toggled.connect(self._toggle_snap)
         self.toolbar.addWidget(self.snap_checkbox)
+        self.smart_snap_checkbox = QtWidgets.QCheckBox("Orto/ângulo", self)
+        self.smart_snap_checkbox.setObjectName("smartSnap")
+        self.smart_snap_checkbox.setToolTip(
+            "Durante desenho e medição, prende ao horizontal, vertical e a "
+            "múltiplos de 15° a partir do último ponto. Shift ignora todo snap."
+        )
+        self.smart_snap_checkbox.setChecked(True)
+        self.smart_snap_checkbox.toggled.connect(self._toggle_smart_snap)
+        self.toolbar.addWidget(self.smart_snap_checkbox)
         self.grid_spacing = QtWidgets.QDoubleSpinBox(self)
         self.grid_spacing.setObjectName("gridSpacing")
         self.grid_spacing.setAccessibleName("Espaçamento da grade")
@@ -256,26 +408,30 @@ class Editor2DWidget(QtWidgets.QWidget):
         self.grid_spacing.setFixedWidth(68)
         self.grid_spacing.valueChanged.connect(self._set_grid_spacing)
         self.toolbar.addWidget(self.grid_spacing)
+
+        self.nesting_spacing = QtWidgets.QDoubleSpinBox(self)
+        self.nesting_spacing.setObjectName("nestingSpacing")
+        self.nesting_spacing.setAccessibleName("Espaçamento entre peças para nesting")
+        self.nesting_spacing.setToolTip(
+            "Folga mínima entre peças no nesting, em milímetros. "
+            "Use a folga que precisa sobrar entre os cortes/fresa."
+        )
+        self.nesting_spacing.setRange(0.0, 1000.0)
+        self.nesting_spacing.setDecimals(2)
+        self.nesting_spacing.setSingleStep(1.0)
+        self.nesting_spacing.setSuffix(" mm entre peças")
+        self.nesting_spacing.setValue(10.0)
+        self.nesting_spacing.setFixedWidth(132)
+        # Nesting clearance is a job-specific decision, so it is requested at
+        # the moment the user starts organizing instead of permanently
+        # consuming the narrow command strip.
+        self.nesting_spacing.hide()
         self.toolbar.addSeparator()
-        self.toolbar.addWidget(QtWidgets.QLabel(" Unir ", self))
-        self.join_tolerance = QtWidgets.QDoubleSpinBox(self)
-        self.join_tolerance.setRange(0.001, 1000.0)
-        self.join_tolerance.setDecimals(3)
-        self.join_tolerance.setValue(0.2)
-        self.join_tolerance.setSuffix(" mm")
-        self.join_tolerance.setToolTip(
-            "Tolerância geométrica para unir pontas abertas; não é o raio de captura do mouse."
-        )
-        self.join_tolerance.setFixedWidth(68)
-        self.join_tolerance.valueChanged.connect(
-            lambda value: self.tool_manager.set_modifier_parameters(
-                {"join_tolerance": float(value)}
-            )
-        )
-        self.tool_manager.set_modifier_parameters(
-            {"join_tolerance": float(self.join_tolerance.value())}
-        )
-        self.toolbar.addWidget(self.join_tolerance)
+        # Keep the natural command-strip width as scrollable content.  The
+        # toolbar reports the dock width to its layout, while this minimum is
+        # what lets a narrow FreeCAD panel reveal remaining commands by
+        # horizontal scrolling instead of clipping them.
+        self.toolbar.setMinimumWidth(QtWidgets.QToolBar.sizeHint(self.toolbar).width())
         self.use_cam_action.setToolTip(
             "Usa os vetores persistidos do Editor 2D como fonte das operações CAM; "
             "desmarcado, o WoodCAM continua usando a seleção do FreeCAD."
@@ -305,7 +461,14 @@ class Editor2DWidget(QtWidgets.QWidget):
         self._add_mode_button("Círculo", EditorMode.DRAW_CIRCLE, "C", "circle")
         self._add_mode_button("Elipse", EditorMode.DRAW_ELLIPSE, "E", "ellipse")
         self._add_mode_button("Arco", EditorMode.DRAW_ARC, "A", "arc")
+        self._add_mode_button("Bézier", EditorMode.DRAW_BEZIER, "B", "bezier")
         self._add_mode_button("Polígono", EditorMode.DRAW_POLYGON, "G", "polygon")
+        self._add_mode_button("Estrela", EditorMode.DRAW_STAR, None, "star")
+        self.drawing_toolbar.addSeparator()
+        self._add_drawing_action_button(
+            "Texto vetorial", "text", self.createTextRequested.emit,
+            "Criar texto vetorial em curvas",
+        )
 
         # Tool-specific options live above the canvas instead of consuming the
         # narrow vertical drawing rail.  This prevents the sides control from
@@ -315,15 +478,32 @@ class Editor2DWidget(QtWidgets.QWidget):
         polygon_context_layout = QtWidgets.QHBoxLayout(self.polygon_context)
         polygon_context_layout.setContentsMargins(6, 2, 6, 2)
         polygon_context_layout.setSpacing(5)
-        polygon_context_layout.addWidget(QtWidgets.QLabel("Polígono — lados", self))
+        self.polygon_context_label = QtWidgets.QLabel("Polígono — lados", self)
+        polygon_context_layout.addWidget(self.polygon_context_label)
         self.polygon_sides = QtWidgets.QSpinBox(self.polygon_context)
         self.polygon_sides.setObjectName("polygonSides")
         self.polygon_sides.setRange(3, 64)
         self.polygon_sides.setValue(3)
         self.polygon_sides.setToolTip("Número de lados do polígono")
         self.polygon_sides.setFixedWidth(58)
-        self.polygon_sides.valueChanged.connect(self.tool_manager.set_polygon_sides)
+        self.polygon_sides.valueChanged.connect(self._set_shape_sides)
         polygon_context_layout.addWidget(self.polygon_sides)
+        self._star_points_initialized = False
+        self.star_inner_ratio_label = QtWidgets.QLabel("Interno (%)", self.polygon_context)
+        polygon_context_layout.addWidget(self.star_inner_ratio_label)
+        self.star_inner_ratio = QtWidgets.QSpinBox(self.polygon_context)
+        self.star_inner_ratio.setObjectName("starInnerRatio")
+        self.star_inner_ratio.setRange(5, 95)
+        self.star_inner_ratio.setValue(45)
+        self.star_inner_ratio.setSuffix(" %")
+        self.star_inner_ratio.setToolTip("Profundidade das pontas internas da estrela")
+        self.star_inner_ratio.setFixedWidth(72)
+        self.star_inner_ratio.valueChanged.connect(
+            lambda value: self.tool_manager.set_star_inner_ratio(float(value) / 100.0)
+        )
+        polygon_context_layout.addWidget(self.star_inner_ratio)
+        self.star_inner_ratio_label.hide()
+        self.star_inner_ratio.hide()
         polygon_context_layout.addStretch(1)
         self.polygon_context.hide()
 
@@ -339,6 +519,12 @@ class Editor2DWidget(QtWidgets.QWidget):
             qt_enum(QtCore.Qt, "Horizontal", "Orientation"), self
         )
         self.content_splitter.setChildrenCollapsible(True)
+        self.content_splitter.setHandleWidth(8)
+        self.content_splitter.setOpaqueResize(True)
+        self.content_splitter.setStyleSheet(
+            "QSplitter::handle { background: #cbd5e1; }"
+            "QSplitter::handle:hover { background: #60a5fa; }"
+        )
         self.canvas_host = QtWidgets.QWidget(self.content_splitter)
         self.canvas_host.setObjectName("editorCanvasHost")
         canvas_layout = QtWidgets.QHBoxLayout(self.canvas_host)
@@ -354,8 +540,36 @@ class Editor2DWidget(QtWidgets.QWidget):
         # never enters the side-panel scroll area or falls below the canvas.
         canvas_surface_layout.addWidget(self.workflow_preview_bar, 0)
         canvas_surface_layout.addWidget(self.polygon_context, 0)
-        canvas_surface_layout.addWidget(self.view, 1)
+        self.ruler_surface = QtWidgets.QWidget(self.canvas_surface)
+        ruler_grid = QtWidgets.QGridLayout(self.ruler_surface)
+        ruler_grid.setContentsMargins(0, 0, 0, 0)
+        ruler_grid.setSpacing(0)
+        self.ruler_corner = QtWidgets.QFrame(self.ruler_surface)
+        self.ruler_corner.setFixedSize(22, 22)
+        self.ruler_corner.setStyleSheet("background: #e2e8f0; border: 0;")
+        self.horizontal_ruler = RulerWidget(self.view, True, self.ruler_surface)
+        self.vertical_ruler = RulerWidget(self.view, False, self.ruler_surface)
+        ruler_grid.addWidget(self.ruler_corner, 0, 0)
+        ruler_grid.addWidget(self.horizontal_ruler, 0, 1)
+        ruler_grid.addWidget(self.vertical_ruler, 1, 0)
+        ruler_grid.addWidget(self.view, 1, 1)
+        ruler_grid.setColumnStretch(1, 1)
+        ruler_grid.setRowStretch(1, 1)
+        canvas_surface_layout.addWidget(self.ruler_surface, 1)
         canvas_layout.addWidget(self.canvas_surface, 1)
+        self.side_toggle_button = QtWidgets.QToolButton(self.canvas_host)
+        self.side_toggle_button.setObjectName("sidePanelToggleButton")
+        self.side_toggle_button.setFixedWidth(22)
+        self.side_toggle_button.setText("‹")
+        self.side_toggle_button.setAccessibleName("Ocultar painel lateral")
+        self.side_toggle_button.setToolTip("Ocultar somente o painel lateral")
+        self.side_toggle_button.clicked.connect(self._toggle_side_panel)
+        self.side_toggle_button.setStyleSheet(
+            "QToolButton { background: #e2e8f0; border: 1px solid #94a3b8; "
+            "border-radius: 3px; font-size: 17px; font-weight: bold; }"
+            "QToolButton:hover { background: #bfdbfe; }"
+        )
+        canvas_layout.addWidget(self.side_toggle_button, 0)
         self.content_splitter.addWidget(self.canvas_host)
         self.side_scroll = QtWidgets.QScrollArea(self.content_splitter)
         self.side_scroll.setWidgetResizable(True)
@@ -384,6 +598,9 @@ class Editor2DWidget(QtWidgets.QWidget):
         self.tool_manager.previewAvailabilityChanged.connect(
             self.modifier_panel.set_auto_preview_available
         )
+        self.tool_manager.editSelectionRequested.connect(
+            self._show_editing_panels
+        )
         self.tool_manager.set_modifier_parameters(self.modifier_panel.parameters())
         side_layout.addWidget(self.layer_panel)
         side_layout.addWidget(self.pieces_panel)
@@ -392,12 +609,28 @@ class Editor2DWidget(QtWidgets.QWidget):
         side_layout.addWidget(self.modifier_panel)
         self.modifier_panel.hide()
         side_layout.addStretch(1)
-        self.side_scroll.setMinimumWidth(250)
-        self.side_scroll.setMaximumWidth(370)
+        self.side_scroll.setMinimumWidth(340)
+        self.side_scroll.setMaximumWidth(480)
+        self.side_panel.setMinimumWidth(340)
         self.side_scroll.setWidget(self.side_panel)
         self.content_splitter.addWidget(self.side_scroll)
+        # The tolerance is contextual: it appears in the repair panel only
+        # while one of the endpoint-join tools is active.
+        self.join_tolerance = self.modifier_panel.join_tolerance
+        self.tool_manager.set_modifier_parameters(self.modifier_panel.parameters())
+        # The indices are valid only after both panes have been inserted.
+        # Keeping both panes non-collapsible also prevents a divider drag from
+        # turning into a page/window drag when the task panel is narrow.
+        self.content_splitter.setCollapsible(0, False)
+        self.content_splitter.setCollapsible(1, False)
         self.content_splitter.setStretchFactor(0, 1)
         self.content_splitter.setStretchFactor(1, 0)
+        self.content_splitter.handle(1).setToolTip(
+            "Arraste para aumentar ou reduzir o painel lateral"
+        )
+        self.content_splitter.handle(1).setCursor(
+            qt_enum(QtCore.Qt, "SizeHorCursor", "CursorShape")
+        )
         root.addWidget(self.content_splitter, 1)
 
         status = QtWidgets.QHBoxLayout()
@@ -414,6 +647,7 @@ class Editor2DWidget(QtWidgets.QWidget):
         status.addSpacing(12)
         status.addWidget(self.position_label)
         root.addLayout(status)
+        QtCore.QTimer.singleShot(0, self._restore_side_panel_size)
 
     def _add_mode_button(self, label, mode, shortcut=None, icon_name=None):
         button = QtWidgets.QToolButton(self)
@@ -428,8 +662,7 @@ class Editor2DWidget(QtWidgets.QWidget):
         button.setIcon(tool_icon(icon_name or mode.value))
         button.setIconSize(QtCore.QSize(22, 22))
         button.setFixedSize(34, 34)
-        if shortcut:
-            button.setToolTip("%s (%s)" % (label, shortcut))
+        button.setToolTip("%s (%s)" % (label, shortcut) if shortcut else label)
         button.clicked.connect(lambda checked=False, value=mode: self.tool_manager.activate(value))
         self._button_group.addButton(button)
         self.drawing_toolbar.addWidget(button)
@@ -450,6 +683,24 @@ class Editor2DWidget(QtWidgets.QWidget):
         button.setToolTip(str(tooltip or label))
         button.clicked.connect(lambda _checked=False: callback())
         self.toolbar.addWidget(button)
+        return button
+
+    def _add_drawing_action_button(self, label, icon_name, callback, tooltip=None):
+        """Add a one-shot action to the compact vertical drawing rail."""
+
+        button = QtWidgets.QToolButton(self)
+        button.setObjectName("drawingAction" + label.replace(" ", ""))
+        button.setText(label)
+        button.setAccessibleName(label)
+        button.setToolButtonStyle(
+            qt_enum(QtCore.Qt, "ToolButtonIconOnly", "ToolButtonStyle")
+        )
+        button.setIcon(tool_icon(icon_name))
+        button.setIconSize(QtCore.QSize(22, 22))
+        button.setFixedSize(34, 34)
+        button.setToolTip(str(tooltip or label))
+        button.clicked.connect(lambda _checked=False: callback())
+        self.drawing_toolbar.addWidget(button)
         return button
 
     def _add_action_button(self, label, callback):
@@ -482,6 +733,61 @@ class Editor2DWidget(QtWidgets.QWidget):
         self._menu_actions[str(label)] = actions
         return button
 
+    def _toggle_focus_mode(self, checked=False):
+        """Fold only the inspector; the drawing toolbar must remain usable."""
+        self._focus_mode = not self._focus_mode
+        self._set_side_panel_visible(not self._focus_mode)
+        self._update_focus_button()
+        self.view.setFocus()
+
+    def _restore_side_panel_size(self):
+        if self._focus_mode:
+            return
+        self._set_side_panel_visible(True)
+
+    def _set_side_panel_visible(self, visible):
+        visible = bool(visible)
+        self._side_panel_hidden = not visible
+        self.side_scroll.setVisible(visible)
+        # The tab stays on the splitter edge in both states.  Hiding it when
+        # the panel is open made the only available control look like a
+        # maximize button and also made it impossible to discover the drawer.
+        self.side_toggle_button.setVisible(True)
+        if visible:
+            width = max(self.content_splitter.width(), 1)
+            panel_width = min(400, max(340, width // 3))
+            self.content_splitter.setSizes(
+                [max(120, width - panel_width), panel_width]
+            )
+            self.side_toggle_button.setText("›")
+            self.side_toggle_button.setAccessibleName("Ocultar painel lateral")
+            self.side_toggle_button.setToolTip("Ocultar somente o painel lateral")
+        else:
+            self.content_splitter.setSizes([max(self.content_splitter.width(), 1), 0])
+            self.side_toggle_button.setText("‹")
+            self.side_toggle_button.setAccessibleName("Mostrar painel lateral")
+            self.side_toggle_button.setToolTip("Mostrar somente o painel lateral")
+
+    def _toggle_side_panel(self):
+        self._set_side_panel_visible(self._side_panel_hidden)
+        self._focus_mode = bool(self._side_panel_hidden)
+        self.focus_button.setChecked(self._focus_mode)
+        self._update_focus_button()
+        if not self._side_panel_hidden:
+            self.side_scroll.setFocus()
+
+    def _update_focus_button(self):
+        """Keep the hidden compatibility button semantically in sync."""
+        self.focus_button.setIcon(QtGui.QIcon())
+        self.focus_button.setText("‹" if self._focus_mode else "›")
+        self.focus_button.setAccessibleName(
+            "Mostrar painel lateral" if self._focus_mode else "Ocultar painel lateral"
+        )
+        self.focus_button.setToolTip(
+            "Mostrar somente o painel lateral" if self._focus_mode
+            else "Ocultar somente o painel lateral"
+        )
+
     def _show_panel_message(self, text):
         self.mode_label.setText(str(text))
 
@@ -493,7 +799,14 @@ class Editor2DWidget(QtWidgets.QWidget):
         self.tool_manager.activate(mode)
         self.modifier_panel.set_mode(mode)
         self.modifier_panel.show()
+        self.side_scroll.ensureWidgetVisible(self.modifier_panel)
         self.view.setFocus()
+
+    def _show_editing_panels(self):
+        """Keep numeric transforms visible after Aspire-style double-click."""
+        self.properties_panel.show()
+        self.transform_panel.show()
+        self.side_scroll.ensureWidgetVisible(self.properties_panel)
 
     def _connect_session(self):
         self.controller.subscribe_document(self._document_changed)
@@ -504,6 +817,45 @@ class Editor2DWidget(QtWidgets.QWidget):
         self.view.cursorMoved.connect(self._cursor_moved)
         self.view.keyPressed.connect(self._workflow_key_press)
         self.view.cancelRequested.connect(self._cancel_to_select)
+        self.view.viewChanged.connect(self._sync_selection_transform)
+
+    def _sync_selection_transform(self):
+        if self.controller.mode == EditorMode.SELECT and self.controller.selection.ids:
+            self.overlays.show_selection_transform(self.controller.selection_bounds())
+        else:
+            self.overlays.clear_selection_transform()
+
+    def eventFilter(self, watched, event):
+        key_press = qt_enum(QtCore.QEvent, "KeyPress", "Type")
+        if event.type() == key_press and self._canvas_has_keyboard_focus():
+            key = event.key()
+            modifiers = event.modifiers()
+            if (
+                key == qt_enum(QtCore.Qt, "Key_A", "Key")
+                and bool(modifiers & CTRL_MODIFIER)
+            ):
+                self.controller.selection.replace(
+                    self.controller.canonical_group_selection(
+                        self.adapter.editable_visible_entity_ids()
+                    )
+                )
+                event.accept()
+                return True
+            if key in (
+                qt_enum(QtCore.Qt, "Key_Delete", "Key"),
+                qt_enum(QtCore.Qt, "Key_Backspace", "Key"),
+            ) and modifiers == qt_enum(QtCore.Qt, "NoModifier", "KeyboardModifier"):
+                self.delete_selected()
+                event.accept()
+                return True
+        return super(Editor2DWidget, self).eventFilter(watched, event)
+
+    def _canvas_has_keyboard_focus(self):
+        app = self._application or QtWidgets.QApplication.instance()
+        focus = app.focusWidget() if app is not None else None
+        return focus is self.view or (
+            focus is not None and self.view.isAncestorOf(focus)
+        )
 
     def _document_changed(self, change_set=None):
         if change_set is None:
@@ -512,7 +864,18 @@ class Editor2DWidget(QtWidgets.QWidget):
             self.adapter.set_document(self.controller.document)
         else:
             self.adapter.refresh(change_set)
+        # A plan-view toolpath is derived from the previous vector geometry.
+        # Never leave it looking valid after a geometric/layer mutation.
+        if change_set is None or any(
+            bool(getattr(change_set, name, ()))
+            for name in ("added", "changed", "removed", "layers_changed")
+        ):
+            self.clear_cut_toolpath_preview()
         self._sync_nodes()
+        # Commands such as move/resize update the document before the
+        # selection signal is emitted.  Refresh the transient frame here too
+        # so it never lags one operation behind the vector.
+        self._sync_selection_transform()
         if (
             self.workflow_preview_bar.is_active
             and self._workflow_revision is not None
@@ -543,15 +906,36 @@ class Editor2DWidget(QtWidgets.QWidget):
             EditorMode.DOGBONE,
             EditorMode.TBONE,
             EditorMode.JOIN_ENDPOINTS,
+            EditorMode.JOIN_ENDPOINTS_SMOOTH,
             EditorMode.CONNECT,
             EditorMode.SPLICE,
             EditorMode.AUTO_DOGBONE,
             EditorMode.AUTO_TBONE,
         }
         self.modifier_panel.setVisible(mode in modifier_modes)
-        self.polygon_context.setVisible(mode == EditorMode.DRAW_POLYGON)
+        polygon_or_star = mode in (EditorMode.DRAW_POLYGON, EditorMode.DRAW_STAR)
+        self.polygon_context.setVisible(polygon_or_star)
+        if mode == EditorMode.DRAW_STAR:
+            self.polygon_context_label.setText("Estrela — pontas")
+            if not self._star_points_initialized:
+                # The standard Aspire-style star starts with five tips; later
+                # visits keep the user-selected count in this shared field.
+                self.polygon_sides.setValue(5)
+                self._star_points_initialized = True
+            self.polygon_sides.setToolTip("Número de pontas da estrela")
+            self.star_inner_ratio_label.show()
+            self.star_inner_ratio.show()
+            self.tool_manager.set_star_points(self.polygon_sides.value())
+            self.tool_manager.set_star_inner_ratio(self.star_inner_ratio.value() / 100.0)
+        else:
+            self.polygon_context_label.setText("Polígono — lados")
+            self.polygon_sides.setToolTip("Número de lados do polígono")
+            self.star_inner_ratio_label.hide()
+            self.star_inner_ratio.hide()
         if mode in modifier_modes:
             self.modifier_panel.set_mode(mode)
+            self.side_scroll.ensureWidgetVisible(self.modifier_panel)
+        self._sync_selection_transform()
         self.modeChanged.emit(mode.value)
 
     def _selection_changed(self, ids):
@@ -559,6 +943,10 @@ class Editor2DWidget(QtWidgets.QWidget):
         self.selection_label.setText("%d selecionado%s" % (count, "" if count == 1 else "s"))
         self.delete_button.setEnabled(bool(count))
         self._sync_nodes()
+        if self.controller.mode == EditorMode.SELECT and ids:
+            self.overlays.show_selection_transform(self.controller.selection_bounds())
+        else:
+            self.overlays.clear_selection_transform()
         if self.controller.mode in (
             EditorMode.AUTO_DOGBONE,
             EditorMode.AUTO_TBONE,
@@ -580,6 +968,27 @@ class Editor2DWidget(QtWidgets.QWidget):
 
     def _cursor_moved(self, point):
         self.position_label.setText("X %.3f   Y %.3f mm" % (point.x(), point.y()))
+
+    def show_toolpath_preview(self, components, operation_label="Corte"):
+        """Show a non-destructive, exact-XY CAM overlay in the 2D editor."""
+        shown = self.overlays.show_toolpath_preview(components)
+        if shown:
+            self._show_panel_message(
+                "Percurso de %s: cinza = usinagem, magenta tracejado = rápido, "
+                "setas = sentido. É só uma vista; vetores e G-code não foram alterados."
+                % str(operation_label)
+            )
+        else:
+            self._show_panel_message("O percurso não possui deslocamentos XY para mostrar no plano.")
+        self.view.setFocus()
+        return shown
+
+    def show_cut_toolpath_preview(self, components):
+        """Compatibility wrapper for integrations written before generic CAM."""
+        return self.show_toolpath_preview(components, "Corte")
+
+    def clear_cut_toolpath_preview(self):
+        self.overlays.clear_toolpath_preview()
 
     def _snap_status(self, text):
         self.snap_label.setText(("Snap: " + text) if text else "")
@@ -611,10 +1020,22 @@ class Editor2DWidget(QtWidgets.QWidget):
         for name in ("endpoint", "intersection", "midpoint", "center", "quadrant", "on_geometry", "grid"):
             setattr(settings, name, bool(enabled))
 
+    def _toggle_smart_snap(self, enabled):
+        settings = self.controller.snap_engine.settings
+        for name in ("horizontal", "vertical", "angle", "perpendicular", "tangent"):
+            setattr(settings, name, bool(enabled))
+
     def _set_grid_spacing(self, value):
         spacing = float(value)
         self.controller.snap_engine.settings.grid_spacing_mm = spacing
         self.view.set_grid_spacing(spacing)
+
+    def _set_shape_sides(self, value):
+        """Route the shared count field to the active regular/star polygon tool."""
+        if self.controller.mode == EditorMode.DRAW_STAR:
+            self.tool_manager.set_star_points(value)
+        else:
+            self.tool_manager.set_polygon_sides(value)
 
     def activate_tool(self, mode):
         """Public integration hook; accepts ``EditorMode`` or its string value."""
@@ -726,8 +1147,12 @@ class Editor2DWidget(QtWidgets.QWidget):
         self.view.fit_model_rect(rect)
 
     def fit_selection(self):
+        self.fit_entities(self.controller.selection.ids)
+
+    def fit_entities(self, entity_ids):
+        """Frame entities without changing the current selection state."""
         rect = QtCore.QRectF()
-        for entity_id in self.controller.selection.ids:
+        for entity_id in entity_ids:
             item = self.adapter.items_by_id.get(entity_id)
             if item is not None:
                 bounds = item.mapToScene(item.path()).boundingRect()

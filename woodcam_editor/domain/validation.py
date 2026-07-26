@@ -347,6 +347,60 @@ def _flat_segments(entity, deflection: float) -> Tuple[_FlatSegment, ...]:
     return ()
 
 
+def _segment_intersection_candidates(
+    segments: Sequence[_FlatSegment],
+    tolerance: float,
+):
+    """Yield unique broad-phase candidates for segment intersection.
+
+    Importing a furniture skeleton can produce thousands of small segments
+    (teeth, holes and repeated construction details).  Testing every segment
+    against every other turns a read-only Diagnose click into O(n²) work.  The
+    grid below indexes expanded segment bounding boxes; it may return harmless
+    false positives, but cannot omit a pair whose segments meet within the
+    requested tolerance.  Exact intersection remains the authoritative test.
+    """
+
+    if len(segments) < 2:
+        return
+    min_x = min(min(item.start.x, item.end.x) for item in segments)
+    max_x = max(max(item.start.x, item.end.x) for item in segments)
+    min_y = min(min(item.start.y, item.end.y) for item in segments)
+    max_y = max(max(item.start.y, item.end.y) for item in segments)
+    span = max(max_x - min_x, max_y - min_y)
+    # About sqrt(n) cells across the dominant dimension keeps ordinary source
+    # segments in very few buckets while long members still remain bounded.
+    cell_size = max(
+        float(tolerance),
+        span / max(1.0, math.sqrt(float(len(segments)))),
+        DEFAULT_EPSILON,
+    )
+    buckets: Dict[Tuple[int, int], List[int]] = {}
+    emitted = set()
+    padding = max(float(tolerance), DEFAULT_EPSILON)
+    for index, segment in enumerate(segments):
+        left = min(segment.start.x, segment.end.x) - padding
+        right = max(segment.start.x, segment.end.x) + padding
+        bottom = min(segment.start.y, segment.end.y) - padding
+        top = max(segment.start.y, segment.end.y) + padding
+        min_col = int(math.floor((left - min_x) / cell_size))
+        max_col = int(math.floor((right - min_x) / cell_size))
+        min_row = int(math.floor((bottom - min_y) / cell_size))
+        max_row = int(math.floor((top - min_y) / cell_size))
+        cells = []
+        for column in range(min_col, max_col + 1):
+            for row in range(min_row, max_row + 1):
+                cell = (column, row)
+                cells.append(cell)
+                for previous in buckets.get(cell, ()):
+                    pair = (previous, index)
+                    if pair not in emitted:
+                        emitted.add(pair)
+                        yield pair
+        for cell in cells:
+            buckets.setdefault(cell, []).append(index)
+
+
 def _adjacent(left: _FlatSegment, right: _FlatSegment) -> bool:
     if left.entity_id != right.entity_id:
         return False
@@ -360,6 +414,41 @@ def _closed_entity_points(entity, deflection: float) -> Tuple[Vec2, ...]:
     if isinstance(entity, (CircleEntity, EllipseEntity)):
         return entity.flatten(deflection, include_closure=False)
     return ()
+
+
+def _physical_import_scope(entity) -> Optional[Tuple[str, ...]]:
+    """Return the explicit physical-board scope carried by an import.
+
+    A direct Assembly import contains many boards whose local flattened
+    profiles can legitimately occupy the same coordinates before staging or
+    after an operator moves them.  They are not duplicate vectors, touching
+    contours or branches of one part.  The importer stamps each leaf with a
+    stable physical instance; PanelNest uses an equivalent instance key.
+    Unscoped hand-drawn vectors intentionally remain comparable with every
+    other vector so normal editor diagnostics retain their existing meaning.
+    """
+
+    metadata = dict(getattr(entity, "metadata", {}) or {})
+    batch = str(metadata.get("import_batch_id", "") or "")
+    instance = str(
+        metadata.get("panelnest_instance_id", "")
+        or metadata.get("source_tree_instance_id", "")
+        or ""
+    )
+    if instance:
+        return ("physical-instance", batch, instance)
+    if batch:
+        return ("import-batch", batch)
+    return None
+
+
+def _same_physical_scope(first, second) -> bool:
+    """Whether two entities may describe the same manufacturing profile."""
+
+    first_scope = _physical_import_scope(first)
+    second_scope = _physical_import_scope(second)
+    # Manual/unscoped drawing can intentionally intersect an imported part.
+    return first_scope is None or second_scope is None or first_scope == second_scope
 
 
 def entities_have_boundary_only_contact(
@@ -611,17 +700,25 @@ def validate_document(
         deflection=deflection,
         include_non_cam_layers=include_non_cam_layers,
     ):
-        original_id = duplicate_ids[0]
-        for duplicate_id in duplicate_ids[1:]:
-            issues.append(
-                _make_issue(
-                    Severity.ERROR,
-                    "DUPLICATE_ENTITY",
-                    "Geometria duplicada sobreposta.",
-                    entity_ids=(original_id, duplicate_id),
-                    suggested_actions=("delete_duplicate",),
+        by_scope: Dict[Optional[Tuple[str, ...]], List[str]] = {}
+        for entity_id in duplicate_ids:
+            entity = document.entities_by_id.get(entity_id)
+            if entity is not None:
+                by_scope.setdefault(_physical_import_scope(entity), []).append(entity_id)
+        for same_scope_ids in by_scope.values():
+            if len(same_scope_ids) < 2:
+                continue
+            original_id = same_scope_ids[0]
+            for duplicate_id in same_scope_ids[1:]:
+                issues.append(
+                    _make_issue(
+                        Severity.ERROR,
+                        "DUPLICATE_ENTITY",
+                        "Geometria duplicada sobreposta.",
+                        entity_ids=(original_id, duplicate_id),
+                        suggested_actions=("delete_duplicate",),
+                    )
                 )
-            )
 
     for pair in nearby_open_endpoint_pairs(
         document,
@@ -629,6 +726,10 @@ def validate_document(
         minimum_distance=geometric_tolerance,
         entity_ids=cam_entity_ids,
     ):
+        first = document.entities_by_id.get(pair.first.entity_id)
+        second = document.entities_by_id.get(pair.second.entity_id)
+        if first is None or second is None or not _same_physical_scope(first, second):
+            continue
         issues.append(
             _make_issue(
                 Severity.WARNING,
@@ -694,22 +795,33 @@ def validate_document(
         segments.extend(_flat_segments(entity, deflection))
     intersections_by_pair: Dict[Tuple[str, str], List[Vec2]] = {}
     spans_by_pair: Dict[Tuple[str, str], set] = {}
-    for left_index, left in enumerate(segments):
-        for right in segments[left_index + 1 :]:
-            if _adjacent(left, right):
-                continue
-            intersections = segment_intersections(
-                left.start,
-                left.end,
-                right.start,
-                right.end,
-                geometric_tolerance,
-            )
-            if not intersections:
-                continue
-            pair = tuple(sorted((left.entity_id, right.entity_id)))
-            intersections_by_pair.setdefault(pair, []).extend(item.point for item in intersections)
-            spans_by_pair.setdefault(pair, set()).update((left.span_id, right.span_id))
+    for left_index, right_index in _segment_intersection_candidates(
+        segments, geometric_tolerance
+    ):
+        left = segments[left_index]
+        right = segments[right_index]
+        if _adjacent(left, right):
+            continue
+        left_entity = document.entities_by_id.get(left.entity_id)
+        right_entity = document.entities_by_id.get(right.entity_id)
+        if (
+            left_entity is None
+            or right_entity is None
+            or not _same_physical_scope(left_entity, right_entity)
+        ):
+            continue
+        intersections = segment_intersections(
+            left.start,
+            left.end,
+            right.start,
+            right.end,
+            geometric_tolerance,
+        )
+        if not intersections:
+            continue
+        pair = tuple(sorted((left.entity_id, right.entity_id)))
+        intersections_by_pair.setdefault(pair, []).extend(item.point for item in intersections)
+        spans_by_pair.setdefault(pair, set()).update((left.span_id, right.span_id))
     for pair in sorted(intersections_by_pair):
         points = _deduplicate_points(intersections_by_pair[pair], geometric_tolerance)
         self_intersection = pair[0] == pair[1]

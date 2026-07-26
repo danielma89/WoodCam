@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 
-from .compat import DASH_LINE, NO_BRUSH, QtCore, QtGui, QtWidgets
+from .compat import DASH_LINE, NO_BRUSH, QtCore, QtGui, QtWidgets, qt_enum
 from .items import EntityGraphicsItem, entity_painter_path
 
 
@@ -42,16 +42,30 @@ class SceneAdapter:
         self.document = document
         self.selection = selection
         self.items_by_id = {}
+        # Selection is session state.  Keep its rendered counterpart so a
+        # Ctrl+A on a large imported layout does not walk every QGraphicsItem
+        # just to discover that its pen already has the right colour.
+        self._rendered_selection = set()
         self._preview_ids = set()
         self.sheet_area_items = []
         self.preview_sheet_area_items = []
+        # Page labels are presentation-only.  The persisted source of truth is
+        # still ``organization_sheet_bounds``; a label must never become a
+        # drawable vector or affect nesting/CAM selection.
+        self.sheet_label_items = []
+        self.preview_sheet_label_items = []
         self.work_area_item = QtWidgets.QGraphicsRectItem()
         pen = QtGui.QPen(QtGui.QColor("#0ea5e9"), 1.5)
         pen.setCosmetic(True)
         pen.setStyle(DASH_LINE)
         self.work_area_item.setPen(pen)
-        self.work_area_item.setBrush(QtGui.QBrush(NO_BRUSH))
-        self.work_area_item.setZValue(1.0)
+        # A subtle sheet fill makes the usable material unmistakable without
+        # hiding vectors.  Geometry remains above it; the surrounding canvas
+        # stays neutral, like a CAD/CAM nesting sheet.
+        fill = QtGui.QColor("#bae6fd")
+        fill.setAlpha(62)
+        self.work_area_item.setBrush(QtGui.QBrush(fill))
+        self.work_area_item.setZValue(-10.0)
         self.scene.addItem(self.work_area_item)
         self.set_work_area(getattr(document, "work_area", None))
         self.refresh()
@@ -77,16 +91,51 @@ class SceneAdapter:
         return getattr(self.document, "entities_by_id", {}).get(entity_id)
 
     def refresh(self, change_set=None):
+        """Synchronize only the visible projection affected by a command.
+
+        ``Piece2D`` and document-metadata commands do not change vector
+        geometry.  Rebuilding every ``QGraphicsPathItem`` after those commands
+        made a large imported cabinet appear to freeze even though recognising
+        pieces itself had already finished.  The document/change-set remains
+        the authority: this method merely avoids repainting unrelated scene
+        projections.
+        """
         work_area_changed = change_set is None or bool(
             getattr(change_set, "work_area_changed", False)
         )
         if work_area_changed:
             self.set_work_area(getattr(self.document, "work_area", None))
         current = {str(entity.id): entity for entity in self.entities()}
-        for entity_id in tuple(self.items_by_id):
-            if entity_id not in current:
-                self.scene.removeItem(self.items_by_id.pop(entity_id))
-        for entity_id, entity in current.items():
+        if change_set is None:
+            removed_ids = tuple(
+                entity_id
+                for entity_id in self.items_by_id
+                if entity_id not in current
+            )
+            sync_ids = set(current)
+        else:
+            # A command names every entity whose persisted geometry changed.
+            # Layer edits additionally require refreshing only the entities
+            # on those layers, so visibility/lock state remains correct.
+            removed_ids = tuple(getattr(change_set, "removed", ()) or ())
+            sync_ids = set(getattr(change_set, "added", ()) or ())
+            sync_ids.update(getattr(change_set, "changed", ()) or ())
+            changed_layers = set(getattr(change_set, "layers_changed", ()) or ())
+            if changed_layers:
+                sync_ids.update(
+                    entity_id
+                    for entity_id, entity in current.items()
+                    if str(getattr(entity, "layer_id", "")) in changed_layers
+                )
+        for entity_id in tuple(str(value) for value in removed_ids):
+            item = self.items_by_id.pop(entity_id, None)
+            if item is not None:
+                self.scene.removeItem(item)
+                self._rendered_selection.discard(entity_id)
+        for entity_id in sorted(str(value) for value in sync_ids):
+            entity = current.get(entity_id)
+            if entity is None:
+                continue
             item = self.items_by_id.get(entity_id)
             if item is None:
                 item = EntityGraphicsItem(entity)
@@ -95,20 +144,65 @@ class SceneAdapter:
             else:
                 item.update_entity(entity)
             layer = getattr(self.document, "layers_by_id", {}).get(getattr(entity, "layer_id", None))
-            item.setVisible(bool(getattr(layer, "visible", True)))
+            # GroupEntity is a persistent relationship, not duplicated scene
+            # geometry.  Its child vectors remain the only drawable items.
+            is_group = type(entity).__name__ == "GroupEntity"
+            item.setVisible(not is_group and bool(getattr(layer, "visible", True)))
             item.editor_locked = bool(getattr(layer, "locked", False))
         self.update_selection()
         geometry_bounds_changed = change_set is None or any(
             bool(getattr(change_set, name, ()))
             for name in ("added", "changed", "removed", "layers_changed")
         )
-        if geometry_bounds_changed:
+        requires_full_scene_bounds = change_set is None or any(
+            bool(getattr(change_set, name, ()))
+            for name in ("added", "removed", "layers_changed")
+        )
+        if requires_full_scene_bounds:
             self._update_scene_rect()
+        elif geometry_bounds_changed:
+            # Dragging one item used to scan every imported vector again on
+            # mouse release.  Scene bounds only need to grow for an ordinary
+            # move/edit; leaving harmless empty space behind is preferable to
+            # a visible pause after every confirmed command.
+            self._expand_scene_rect_for(
+                getattr(change_set, "changed", ())
+            )
 
     def update_selection(self):
-        selected = set(self.selection.ids if self.selection is not None else ())
-        for entity_id, item in self.items_by_id.items():
-            item.set_editor_selected(entity_id in selected)
+        selected = set(self._expanded_selection_ids(
+            self.selection.ids if self.selection is not None else ()
+        ))
+        selected.intersection_update(self.items_by_id)
+        changed = selected.symmetric_difference(self._rendered_selection)
+        for entity_id in changed:
+            item = self.items_by_id.get(entity_id)
+            if item is not None:
+                item.set_editor_selected(entity_id in selected)
+        self._rendered_selection = selected
+
+    def _expanded_selection_ids(self, entity_ids):
+        """Map selected persistent groups to their visible leaf vectors."""
+
+        mapping = getattr(self.document, "entities_by_id", {}) or {}
+        result = set()
+        visited = set()
+
+        def visit(entity_id):
+            entity_id = str(entity_id)
+            if entity_id in visited:
+                return
+            visited.add(entity_id)
+            entity = mapping.get(entity_id)
+            if type(entity).__name__ == "GroupEntity":
+                for child_id in getattr(entity, "child_ids", ()):
+                    visit(child_id)
+            elif entity_id in self.items_by_id:
+                result.add(entity_id)
+
+        for entity_id in entity_ids:
+            visit(entity_id)
+        return result
 
     def editable_visible_entity_ids(self):
         return tuple(
@@ -151,7 +245,7 @@ class SceneAdapter:
             self.scene.removeItem(item)
         items[:] = []
 
-    def _append_sheet_rect(self, bounds, items, color):
+    def _append_sheet_rect(self, bounds, items, color, label_items=None, label=""):
         rect = self._work_area_rect(bounds)
         if rect.isNull() or rect.width() <= 0.0 or rect.height() <= 0.0:
             return
@@ -164,29 +258,116 @@ class SceneAdapter:
         item.setZValue(1.0)
         self.scene.addItem(item)
         items.append(item)
+        if label_items is not None and label:
+            text = QtWidgets.QGraphicsSimpleTextItem(str(label))
+            text.setBrush(QtGui.QBrush(QtGui.QColor(color)))
+            font = text.font()
+            font.setBold(True)
+            font.setPointSize(9)
+            text.setFont(font)
+            # The view deliberately flips Y for the CAD coordinate system.
+            # Keep page names upright and screen-readable at every zoom.
+            ignore_transform = qt_enum(
+                QtWidgets.QGraphicsItem,
+                "ItemIgnoresTransformations",
+                "GraphicsItemFlag",
+            )
+            text.setFlag(ignore_transform, True)
+            text.setPos(rect.left() + 7.0, rect.top() + 7.0)
+            text.setZValue(2.0)
+            text.setAcceptedMouseButtons(
+                QtCore.Qt.NoButton
+                if hasattr(QtCore.Qt, "NoButton")
+                else QtCore.Qt.MouseButton.NoButton
+            )
+            self.scene.addItem(text)
+            label_items.append(text)
 
     def _sync_sheet_areas(self):
         self._clear_rect_items(self.sheet_area_items)
+        self._clear_rect_items(self.sheet_label_items)
         values = tuple(
             (getattr(self.document, "metadata", {}) or {}).get(
                 "organization_sheet_bounds", ()
             )
             or ()
         )
-        # The first page is already represented by work_area_item.
-        for bounds in values[1:]:
-            self._append_sheet_rect(bounds, self.sheet_area_items, "#0ea5e9")
+        # The first page is already represented by work_area_item, but it
+        # receives the same visual identity as the virtual pages alongside it.
+        for index, bounds in enumerate(values, start=1):
+            if index == 1:
+                rect = self._work_area_rect(bounds)
+                if rect.width() > 0.0 and rect.height() > 0.0:
+                    # Keep the first material boundary explicit after an
+                    # organization command; metadata refreshes must not make
+                    # the table outline appear to disappear.
+                    self._append_sheet_rect(
+                        bounds,
+                        self.sheet_area_items,
+                        "#0ea5e9",
+                    )
+                    self._append_sheet_label(
+                        rect, self.sheet_label_items, "#0369a1", "Chapa 01"
+                    )
+                continue
+            self._append_sheet_rect(
+                bounds,
+                self.sheet_area_items,
+                "#0ea5e9",
+                self.sheet_label_items,
+                "Chapa %02d" % index,
+            )
 
     def show_preview_sheet_bounds(self, bounds_values):
         self.clear_preview_sheet_bounds()
-        for bounds in tuple(bounds_values or ())[1:]:
+        for index, bounds in enumerate(tuple(bounds_values or ()), start=1):
+            if index == 1:
+                rect = self._work_area_rect(bounds)
+                if rect.width() > 0.0 and rect.height() > 0.0:
+                    self._append_sheet_label(
+                        rect,
+                        self.preview_sheet_label_items,
+                        "#d946ef",
+                        "Chapa 01 — prévia",
+                    )
+                continue
             self._append_sheet_rect(
-                bounds, self.preview_sheet_area_items, "#d946ef"
+                bounds,
+                self.preview_sheet_area_items,
+                "#d946ef",
+                self.preview_sheet_label_items,
+                "Chapa %02d — prévia" % index,
             )
         self._update_scene_rect()
 
     def clear_preview_sheet_bounds(self):
         self._clear_rect_items(self.preview_sheet_area_items)
+        self._clear_rect_items(self.preview_sheet_label_items)
+
+    def _append_sheet_label(self, rect, label_items, color, label):
+        """Add an upright, non-interactive label to an existing page rect."""
+
+        text = QtWidgets.QGraphicsSimpleTextItem(str(label))
+        text.setBrush(QtGui.QBrush(QtGui.QColor(color)))
+        font = text.font()
+        font.setBold(True)
+        font.setPointSize(9)
+        text.setFont(font)
+        ignore_transform = qt_enum(
+            QtWidgets.QGraphicsItem,
+            "ItemIgnoresTransformations",
+            "GraphicsItemFlag",
+        )
+        text.setFlag(ignore_transform, True)
+        text.setPos(rect.left() + 7.0, rect.top() + 7.0)
+        text.setZValue(2.0)
+        text.setAcceptedMouseButtons(
+            QtCore.Qt.NoButton
+            if hasattr(QtCore.Qt, "NoButton")
+            else QtCore.Qt.MouseButton.NoButton
+        )
+        self.scene.addItem(text)
+        label_items.append(text)
 
     def _update_scene_rect(self):
         rect = self.work_area_item.rect() if self.work_area_item.isVisible() else QtCore.QRectF()
@@ -201,11 +382,52 @@ class SceneAdapter:
         margin = max(50.0, max(rect.width(), rect.height()) * 0.08)
         self.scene.setSceneRect(rect.adjusted(-margin, -margin, margin, margin))
 
+    def _expand_scene_rect_for(self, entity_ids):
+        current = self.scene.sceneRect()
+        changed_bounds = QtCore.QRectF()
+        for entity_id in tuple(entity_ids or ()):
+            item = self.items_by_id.get(str(entity_id))
+            if item is None:
+                continue
+            bounds = item.mapToScene(item.path()).boundingRect()
+            changed_bounds = (
+                bounds
+                if changed_bounds.isNull()
+                else changed_bounds.united(bounds)
+            )
+        if changed_bounds.isNull():
+            return
+        if current.isNull():
+            self._update_scene_rect()
+            return
+        if current.contains(changed_bounds):
+            return
+        expanded = current.united(changed_bounds)
+        margin = max(50.0, max(changed_bounds.width(), changed_bounds.height()) * 0.08)
+        self.scene.setSceneRect(
+            expanded.adjusted(-margin, -margin, margin, margin)
+        )
+
     def hit_test_body(self, view, screen_pos, radius_px=7.0):
         screen_point = QtCore.QPointF(screen_pos)
         candidates = []
         transform = view.viewportTransform()
-        for entity_id, item in self.items_by_id.items():
+        scene_point = view.mapToScene(screen_point.toPoint())
+        radius_mm = float(radius_px) / max(1.0e-12, view.pixels_per_mm())
+        query = QtCore.QRectF(
+            scene_point.x() - radius_mm,
+            scene_point.y() - radius_mm,
+            radius_mm * 2.0,
+            radius_mm * 2.0,
+        )
+        mode = getattr(QtCore.Qt, "IntersectsItemBoundingRect", None)
+        if mode is None:
+            mode = QtCore.Qt.ItemSelectionMode.IntersectsItemBoundingRect
+        nearby_items = self.scene.items(query, mode)
+        for item in nearby_items:
+            if not isinstance(item, EntityGraphicsItem):
+                continue
+            entity_id = item.entity_id
             if not item.isVisible() or getattr(item, "editor_locked", False):
                 continue
             scene_path = item.mapToScene(item.path())
@@ -354,7 +576,15 @@ class SceneAdapter:
         rect = QtCore.QRectF(QtCore.QPointF(first_screen), QtCore.QPointF(current_screen)).normalized()
         transform = view.viewportTransform()
         selected = []
-        for entity_id, item in self.items_by_id.items():
+        scene_polygon = view.mapToScene(rect.toAlignedRect())
+        mode = getattr(QtCore.Qt, "IntersectsItemBoundingRect", None)
+        if mode is None:
+            mode = QtCore.Qt.ItemSelectionMode.IntersectsItemBoundingRect
+        nearby_items = self.scene.items(scene_polygon.boundingRect(), mode)
+        for item in nearby_items:
+            if not isinstance(item, EntityGraphicsItem):
+                continue
+            entity_id = item.entity_id
             if not item.isVisible() or getattr(item, "editor_locked", False):
                 continue
             screen_path = transform.map(item.mapToScene(item.path()))
@@ -368,7 +598,7 @@ class SceneAdapter:
         dx = delta.x() if callable(getattr(delta, "x", None)) else delta.x
         dy = delta.y() if callable(getattr(delta, "y", None)) else delta.y
         self.clear_preview()
-        for entity_id in entity_ids:
+        for entity_id in self._expanded_selection_ids(entity_ids):
             item = self.items_by_id.get(str(entity_id))
             if item is not None:
                 item.setPos(float(dx), float(dy))

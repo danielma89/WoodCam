@@ -13,6 +13,7 @@ from woodcam_editor.adapters.woodcam_geometry import (
     GeometryAdapterError,
     document_to_woodcam_geometry,
 )
+from woodcam_tree import PARTS_GROUP_NAME, ensure_woodcam_tree
 
 
 @dataclass(frozen=True)
@@ -147,8 +148,8 @@ class PanelNestExchangeResult:
 
 
 _AUTO_PANELNEST = object()
-EXCHANGE_ROOT_NAME = "WoodCAM2DPanelNestExchange"
-EXCHANGE_ROOT_LABEL = "WoodCAM 2D — PanelNest (layout do Editor preservado)"
+EXCHANGE_ROOT_NAME = PARTS_GROUP_NAME
+EXCHANGE_ROOT_LABEL = "Peças"
 EXCHANGE_SCHEMA_VERSION = 1
 EXCHANGE_PROPERTY_GROUP = "WoodCAM 2D / PanelNest"
 EXCHANGE_LAYOUT_MODE = "preserve_editor_xy"
@@ -955,7 +956,6 @@ def _remove_previous_exchange(freecad_document: Any) -> None:
     for child in reversed(children):
         if str(getattr(child, "WoodCAMExchangeType", "") or "") == "panel_part":
             freecad_document.removeObject(child.Name)
-    freecad_document.removeObject(root.Name)
 
 
 def _panelnest_recognized_count(module: Any, objects: Sequence[Any]) -> tuple[int, Optional[str]]:
@@ -1047,7 +1047,7 @@ def send_document_to_panelnest(
             transaction_open = True
         if replace_existing:
             _remove_previous_exchange(document)
-        root = document.addObject("App::DocumentObjectGroup", EXCHANGE_ROOT_NAME)
+        root = ensure_woodcam_tree(document).parts
         root.Label = EXCHANGE_ROOT_LABEL
         _set_string(root, "WoodCAMExchangeType", "panelnest_exchange_root")
         _set_integer(root, "WoodCAMExchangeSchemaVersion", EXCHANGE_SCHEMA_VERSION)

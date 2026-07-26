@@ -20,6 +20,10 @@ Implementado:
 
 - documento vetorial próprio em milímetros, com IDs estáveis, camadas, peças e
   serialização determinística dentro do arquivo FCStd;
+- no menu `CAM`, `Ver percurso de Corte aqui` sobrepõe no próprio Editor 2D a
+  lista exata de movimentos que alimenta o G-code: vermelho para usinagem,
+  laranja para entradas e cinza tracejado para rápidos. É uma vista transitória
+  e não cria vetores nem altera a operação; qualquer edição do desenho a oculta;
 - histórico integrado ao Undo/Redo do FreeCAD, inclusive após fechar e reabrir
   a janela do WoodCAM;
 - seleção do vetor inteiro com um clique, movimento por arraste e edição de nós
@@ -29,14 +33,18 @@ Implementado:
   cancela a ferramenta/prévia e volta ao modo Selecionar;
 - zoom, pan, grade, eixos, área real da aba `Trabalho`, janela direcional de
   seleção e alvos de mouse independentes do zoom;
-- desenho exato de linha, polilinha, retângulo/quadrado, círculo, elipse, arco e
-  polígonos/triângulos, com balões de medida durante o gesto;
+- desenho exato de linha, polilinha, retângulo/quadrado, círculo, elipse, arco,
+  polígonos/triângulos e estrelas paramétricas (pontas e profundidade interna),
+  com balões de medida durante o gesto;
 - painel numérico para X, Y, largura e altura sem escala implícita; círculo com
   raio/diâmetro e elipse com raio X, raio Y e rotação; mover, girar, escalar,
   espelhar, alinhar e distribuir com um Undo por operação;
 - snap em extremidade, meio, centro, quadrante, interseção, geometria e grade;
   espaçamento da grade visual e do snap é o mesmo, mas ligar/desligar Snap não
   esconde a grade;
+- smart-snap a partir do ponto de desenho ativo: horizontal, vertical, ângulos
+  configuráveis, perpendicular em retas/arcos e tangente em círculos/arcos;
+  ele é uma prévia sob o cursor e nunca cria restrições implícitas;
 - camadas com nome, cor, finalidade, visibilidade, bloqueio e movimentação da
   seleção entre camadas;
 - diagnóstico de vetores abertos, duplicados, spans nulos, cruzamentos,
@@ -51,6 +59,13 @@ Implementado:
   medida da abertura e reta de ligação sem deformar os vetores), projeção de
   ponta a reta/arco/círculo, emenda sem ramificação, trim, extend, offset e
   filete com prévia antes de alterar o documento;
+- `Unir vetores abertos (por tolerância)` para vários caminhos selecionados:
+  percorre somente pontas compatíveis dentro da medida informada, sem criar
+  pontes sobre lacunas grandes, sempre com prévia e um único Undo;
+- `Editar → Subtrair vetores (criar furo/recorte interno)` transforma uma
+  chapa externa e qualquer contorno fechado dentro dela em uma peça composta,
+  mesmo quando o furo não toca a borda; `Soldar vetores` fica reservado aos
+  perfis fechados que se sobrepõem fisicamente;
 - dogbone e T-bone manuais e automáticos como arcos integrados ao contorno —
   não círculos soltos —, limitados deliberadamente a cantos internos lineares
   de 90 graus;
@@ -64,6 +79,11 @@ Implementado:
   no diálogo e malha temporária na vista 3D; a
   confirmação cria um objeto leve, undoable e desenhado por Coin3D no FCStd,
   sem inserir pixels no `VectorDocument` nem manter uma malha topológica pesada;
+- criação de texto vetorial por fonte instalada, convertido explicitamente em
+  contornos fechados portáteis; letras, vazados e acentos ficam agrupados como
+  um único objeto e podem seguir para CAM/DXF sem depender da fonte no outro PC;
+  o mesmo grupo pode ser reeditado depois para trocar conteúdo, fonte, tamanho
+  e estilo sem perder a posição ou a operação de Undo;
 - exportação DXF/SVG e preservação de camadas, nomes e cores nos formatos que
   suportam esses dados;
 - classificação de contorno externo, furos e recortes internos; metadados de
@@ -173,12 +193,14 @@ Ainda nao implementado:
 - pontes/tabs;
 - otimizacao entre varias operacoes;
 - pos-processador Mach3;
-- texto e modelagem 3D interativa; desbaste/acabamento 3D de três eixos já
-  existem, mas reentrâncias (*undercuts*) exigem outra fixação ou CAM de
+- edição tipográfica posterior à conversão e modelagem 3D interativa;
+  desbaste/acabamento 3D de três eixos já existem, mas reentrâncias (*undercuts*) exigem outra fixação ou CAM de
   quatro/cinco eixos;
-- desenho interativo de Bezier e booleanos vetoriais gerais;
-- smart-snap tangente/perpendicular. Bezier cubica importada continua
-  preservada pelo modelo quando o formato de origem for suportado.
+- booleanos gerais para caminhos abertos continuam fora de escopo; os fechados
+  (soldar, subtrair e interseção) já usam OCC com prévia/Undo;
+- Bézier cúbica pode ser desenhada com quatro cliques (início, controle 1,
+  controle 2 e fim), preservando a curva exata; importações também a preservam
+  quando o formato de origem suportar.
 
 ## Instalacao local
 
@@ -389,6 +411,9 @@ permissão para modificar a fonte.
 5. Confira primeiro as abas `Trabalho` e `Material`: defina tipo de trabalho, tamanho X/Y/Z da área, Z-zero, origem XY, posição inicial, espessura e cotas de segurança.
 6. Na aba `Fresas`, cadastre ou ajuste as ferramentas; nas abas de usinagem use `Selecionar...` para escolher uma delas.
 7. Na aba `Corte`, escolha o lado dos contornos externos; furos/contornos internos são enviados automaticamente como corte interno.
+   Toda geometria 2D — Editor, PanelNest, Sketch, face ou Shape selecionado no
+   FreeCAD — permanece no XY do documento. O datum da área define somente a
+   saída e o retorno da ferramenta; nunca reposiciona a peça no zero global.
 8. Na aba `Furo`, escolha profundidade, ferramenta, interpolação helicoidal, furação faseada, retração, permanência e ordem dos furos.
 9. Na aba `Preenchimento`, escolha Offset ou Raster, passo lateral, sobremetal e passe de perfil.
 10. Para relevos ou STL, selecione um único modelo 3D e configure `Desbaste 3D`;
@@ -405,16 +430,52 @@ permissão para modificar a fonte.
     operação e a fresa; nas abas Editor 2D, Trabalho, Material, Fresas,
     diagnóstico ou simulação ele pede que uma operação seja aberta.
 12. Clique em `Pré-visualizar` para conferir a trajetória temporária da aba ativa.
-13. Clique em `Aplicar` para guardar a operação na árvore `WoodCAM 2D — Operações`. Cada tipo recebe sua própria numeração e não substitui as operações já aplicadas.
+    Nas operações 3D, a ligação inicial entre o datum da área de trabalho e a
+    primeira peça aparece em magenta tracejado; ela é apenas visual e não
+    reposiciona o modelo nem altera os movimentos usados pelo G-code.
+13. Clique em `Aplicar` para guardar a operação em `WoodCAM → Operações`. A
+    árvore possui uma única raiz `WoodCAM`, com `Peças`, `Operações` e
+    `Área de trabalho`; cada tipo de operação recebe sua própria numeração e
+    não substitui as operações já aplicadas.
 14. Use a aba `Simulação e Salvar`, selecione **uma** operação aplicada e confira
     o rodapé `APLICADO = G-CODE`, inclusive o passo físico mostrado. Se trocar a
     fresa ou o stepover, a trajetória antiga desaparece e só volta após novo
     `Pré-visualizar` ou `Aplicar`.
+    Corte e Preenchimento/Rebaixo usam uma projeção Coin leve: o percurso é
+    desenhado uma vez e somente a fresa é animada, preservando a lista integral
+    do G-code sem reconstruir milhares de segmentos a cada quadro.
 15. Clique em `Gerar G-code`. Para uma operação 3D, o rodapé muda para
     `G-CODE GERADO = VISTA`: a tela e o arquivo foram alimentados pela mesma
     lista de movimentos. Os percursos 3D usam os sufixos `_desbaste_3d` e
     `_acabamento_3d`; se um arquivo já existir, o WoodCAM acrescenta `_02`,
     `_03` etc.
+
+No canto direito da barra de abas, o botão de maximizar destaca o mesmo Editor
+2D em uma janela nativa. Fechar essa janela devolve a mesma sessão à aba, com
+documento, seleção e histórico preservados.
+
+No Editor 2D, o menu `CAM` concentra o fluxo de percurso sem ocupar a faixa
+inferior: ele abre a configuração existente de Corte, Furos ou Rebaixo e pode
+projetar qualquer um desses percursos no próprio plano. A projeção é somente
+visual e usa exatamente os movimentos do G-code. O botão inferior
+`Percursos 2D` oferece as mesmas escolhas quando o usuário está em outra aba.
+O encaminhamento usa o identificador interno da operação, portanto diferenças
+de apresentação como `Furos` no menu e `Furo` na aba não impedem abrir a
+configuração nem aplicar a operação.
+
+Ao enviar peças ao PanelNest, círculos pequenos importados como polilinhas
+fechadas são reconhecidos de forma conservadora como furos (até 12 mm, com
+circularidade validada). Assim, o furo continua vinculado ao contorno externo
+e chega ao sólido/PanelNest como cilindro, sem promover o recorte a peça solta.
+Caminhos abertos independentes permanecem no desenho e no diagnóstico, mas não
+impedem o reconhecimento e o envio das demais peças fechadas válidas. Erros
+geométricos reais da própria peça continuam bloqueando o envio.
+
+`Enviar PanelNest` sempre refaz as relações `Piece2D` a partir dos vetores
+atuais e envia o layout completo. Uma seleção residual no Editor não limita o
+intercâmbio silenciosamente; todas as peças válidas, suas quantidades, furos e
+recortes internos seguem juntas, preservando XY e rotação. O rodapé informa as
+contagens de peças, ocorrências, furos e recortes realmente materializados.
 
 ## Arquivos principais
 

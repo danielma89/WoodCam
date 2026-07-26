@@ -13,9 +13,9 @@ from dataclasses import dataclass, field, replace
 from typing import FrozenSet, Iterable, List, Optional, Sequence, Tuple
 
 from .document import Piece2D, VectorDocument, WorkArea
-from .entities import PathEntity, VectorEntity
-from .primitives import Affine2D, GeometryError, InvariantError, Vec2
-from .spans import LineSpan
+from .entities import CircleEntity, EllipseEntity, GroupEntity, PathEntity, VectorEntity
+from .primitives import Affine2D, GeometryError, InvariantError, Vec2, new_id
+from .spans import CubicBezierSpan, LineSpan
 
 
 class CommandStateError(RuntimeError):
@@ -131,6 +131,203 @@ class AddEntitiesCommand(Command):
         return DocumentChangeSet(added=frozenset(entity.id for entity in self.entities))
 
 
+class ArrayCopyCommand(Command):
+    """Duplicate selected objects into an exact rectangular array.
+
+    Every duplicate receives fresh entity/span/node IDs.  A selected group is
+    copied as a new group together with its children, so a furniture panel
+    made of outer profile plus holes remains one selectable compound.  The
+    original vectors are never transformed or replaced.
+    """
+
+    label = "Copiar em matriz"
+
+    def __init__(
+        self,
+        entity_ids: Iterable[str],
+        columns: int,
+        rows: int,
+        step_x: float,
+        step_y: float,
+    ) -> None:
+        super().__init__()
+        self.entity_ids = tuple(dict.fromkeys(str(value) for value in entity_ids))
+        self.columns = int(columns)
+        self.rows = int(rows)
+        self.step_x = float(step_x)
+        self.step_y = float(step_y)
+        self.created_root_ids: Tuple[str, ...] = ()
+        if not self.entity_ids:
+            raise ValueError("ArrayCopyCommand requires at least one entity")
+        if self.columns < 1 or self.rows < 1:
+            raise ValueError("a matriz exige ao menos uma coluna e uma linha")
+        if self.columns * self.rows < 2:
+            raise ValueError("a matriz precisa criar ao menos uma cópia")
+
+    @staticmethod
+    def _clone_leaf(entity: VectorEntity, transform: Affine2D) -> VectorEntity:
+        """Transform a drawable entity and renew every editable identity."""
+
+        transformed = entity.transformed(transform)
+        metadata = {
+            **dict(getattr(transformed, "metadata", {}) or {}),
+            "copy_source_id": str(entity.id),
+        }
+        if isinstance(transformed, PathEntity):
+            return replace(
+                transformed,
+                id=new_id("path"),
+                spans=tuple(replace(span, id=new_id("span")) for span in transformed.spans),
+                node_ids=tuple(new_id("node") for _ in transformed.node_ids),
+                metadata=metadata,
+            )
+        if isinstance(transformed, CircleEntity):
+            return replace(
+                transformed,
+                id=new_id("circle"),
+                center_node_id=new_id("node"),
+                radius_node_id=new_id("node"),
+                metadata=metadata,
+            )
+        if isinstance(transformed, EllipseEntity):
+            return replace(
+                transformed,
+                id=new_id("ellipse"),
+                center_node_id=new_id("node"),
+                metadata=metadata,
+            )
+        raise GeometryError("tipo de vetor não suportado pela cópia em matriz")
+
+    def _mutate(self, document: VectorDocument) -> DocumentChangeSet:
+        missing = set(self.entity_ids) - set(document.entities_by_id)
+        if missing:
+            raise KeyError("cannot copy unknown entities: %s" % ", ".join(sorted(missing)))
+
+        # Do not duplicate a selected child twice when its containing group is
+        # also selected by an external script. The UI normally canonicalizes
+        # these selections already, but the command is the safety boundary.
+        selected = set(self.entity_ids)
+        grouped_children = set()
+        for entity_id in self.entity_ids:
+            entity = document.get_entity(entity_id)
+            if isinstance(entity, GroupEntity):
+                grouped_children.update(entity.child_ids)
+        roots = tuple(entity_id for entity_id in self.entity_ids if entity_id not in grouped_children)
+        if not roots:
+            raise GeometryError("a seleção da matriz não possui objetos raiz")
+
+        created = []
+        created_roots = []
+        for row in range(self.rows):
+            for column in range(self.columns):
+                if row == 0 and column == 0:
+                    continue
+                transform = Affine2D.translation(
+                    Vec2(column * self.step_x, row * self.step_y)
+                )
+                copies_by_source = {}
+
+                def clone(entity_id: str) -> str:
+                    entity_id = str(entity_id)
+                    if entity_id in copies_by_source:
+                        return copies_by_source[entity_id].id
+                    source = document.get_entity(entity_id)
+                    if source is None:
+                        raise KeyError("group contains unknown entity: %s" % entity_id)
+                    if isinstance(source, GroupEntity):
+                        child_ids = tuple(clone(child_id) for child_id in source.child_ids)
+                        copy = GroupEntity(
+                            layer_id=source.layer_id,
+                            child_ids=child_ids,
+                            metadata={
+                                **dict(source.metadata or {}),
+                                "copy_source_id": source.id,
+                            },
+                        )
+                    else:
+                        copy = self._clone_leaf(source, transform)
+                    copies_by_source[entity_id] = copy
+                    created.append(copy)
+                    return copy.id
+
+                created_roots.extend(clone(entity_id) for entity_id in roots)
+
+        document.add_entities(tuple(created), bump_revision=False)
+        self.created_root_ids = tuple(created_roots)
+        return DocumentChangeSet(added=frozenset(entity.id for entity in created))
+
+
+class GroupEntitiesCommand(Command):
+    """Persist a non-destructive object group for whole-object editing."""
+
+    label = "Agrupar vetores"
+
+    def __init__(self, entity_ids: Iterable[str], *, group_id: Optional[str] = None, name: str = "Grupo"):
+        super().__init__()
+        self.entity_ids = tuple(dict.fromkeys(str(value) for value in entity_ids))
+        self.group_id = str(group_id or "")
+        self.name = str(name or "Grupo")
+        if len(self.entity_ids) < 2:
+            raise ValueError("GroupEntitiesCommand requires at least two entities")
+
+    def _mutate(self, document: VectorDocument) -> DocumentChangeSet:
+        missing = set(self.entity_ids) - set(document.entities_by_id)
+        if missing:
+            raise KeyError("cannot group unknown entities: %s" % ", ".join(sorted(missing)))
+        children = tuple(document.get_entity(entity_id) for entity_id in self.entity_ids)
+        # A child already represented by an explicitly selected ancestor would
+        # make the same vector belong to two visible group branches.  The UI
+        # normally canonicalizes this selection, but the command is the
+        # safety boundary and must remain correct for scripts as well.
+        selected_ids = set(self.entity_ids)
+        selected_group_children = set()
+        for child in children:
+            if isinstance(child, GroupEntity):
+                selected_group_children.update(child.child_ids)
+        redundant = selected_ids.intersection(selected_group_children)
+        if redundant:
+            raise GeometryError(
+                "cannot group an object together with its selected parent group: %s"
+                % ", ".join(sorted(redundant))
+            )
+        layers = {entity.layer_id for entity in children}
+        if len(layers) != 1:
+            raise GeometryError("grouped entities must belong to the same layer")
+        group_values = {
+            "layer_id": children[0].layer_id,
+            "child_ids": self.entity_ids,
+            "metadata": {"name": self.name},
+        }
+        if self.group_id:
+            group_values["id"] = self.group_id
+        group = GroupEntity(**group_values)
+        document.add_entities((group,), bump_revision=False)
+        self.group_id = group.id
+        return DocumentChangeSet(added=frozenset((group.id,)))
+
+
+class UngroupEntitiesCommand(Command):
+    """Remove group relationships while retaining every child vector."""
+
+    label = "Desagrupar vetores"
+
+    def __init__(self, group_ids: Iterable[str]):
+        super().__init__()
+        self.group_ids = tuple(dict.fromkeys(str(value) for value in group_ids))
+        if not self.group_ids:
+            raise ValueError("UngroupEntitiesCommand requires one or more group IDs")
+
+    def _mutate(self, document: VectorDocument) -> DocumentChangeSet:
+        groups = []
+        for group_id in self.group_ids:
+            entity = document.get_entity(group_id)
+            if not isinstance(entity, GroupEntity):
+                raise GeometryError("entity %s is not a group" % group_id)
+            groups.append(entity)
+        document.remove_entities(tuple(group.id for group in groups), bump_revision=False)
+        return DocumentChangeSet(removed=frozenset(group.id for group in groups))
+
+
 class DeleteEntitiesCommand(Command):
     label = "Excluir vetores"
 
@@ -201,6 +398,100 @@ class ReplaceEntitiesCommand(Command):
         return DocumentChangeSet(changed=ids)
 
 
+class ReversePathDirectionCommand(Command):
+    """Reverse exact path traversal without changing its geometric shape.
+
+    CAM direction is meaningful for climb/conventional cutting and imported
+    vectors may arrive clockwise or counter-clockwise.  Reversing must keep
+    the entity and node IDs stable, so it is a normal atomic document command
+    rather than a scene-level visual trick.
+    """
+
+    label = "Inverter direção dos vetores"
+
+    def __init__(self, entity_ids: Iterable[str]):
+        super().__init__()
+        self.entity_ids = tuple(dict.fromkeys(str(entity_id) for entity_id in entity_ids))
+        if not self.entity_ids:
+            raise ValueError("ReversePathDirectionCommand requires one or more paths")
+
+    def _mutate(self, document: VectorDocument) -> DocumentChangeSet:
+        reversed_paths = []
+        for entity_id in self.entity_ids:
+            entity = document.get_entity(entity_id)
+            if not isinstance(entity, PathEntity):
+                raise GeometryError("ReversePathDirectionCommand requires PathEntity values")
+            reversed_paths.append(entity.reversed())
+        document.replace_entities(tuple(reversed_paths), bump_revision=False)
+        return DocumentChangeSet(changed=frozenset(self.entity_ids))
+
+
+class ReplaceTextOutlinesCommand(Command):
+    """Replace a text group's generated outlines while preserving its group ID."""
+
+    label = "Editar texto vetorial"
+
+    def __init__(
+        self,
+        group_id: str,
+        old_child_ids: Iterable[str],
+        replacement_entities: Iterable[VectorEntity],
+    ) -> None:
+        super().__init__()
+        self.group_id = str(group_id)
+        self.old_child_ids = tuple(dict.fromkeys(str(value) for value in old_child_ids))
+        self.replacement_entities = tuple(replacement_entities)
+        if not self.group_id or not self.old_child_ids:
+            raise ValueError("ReplaceTextOutlinesCommand requires an existing text group")
+        replacement_group = next(
+            (
+                entity
+                for entity in self.replacement_entities
+                if isinstance(entity, GroupEntity) and entity.id == self.group_id
+            ),
+            None,
+        )
+        if replacement_group is None:
+            raise ValueError("replacement text must retain its group ID")
+        self.replacement_group = replacement_group
+        self.replacement_children = tuple(
+            entity
+            for entity in self.replacement_entities
+            if entity.id != self.group_id
+        )
+        if not self.replacement_children:
+            raise ValueError("replacement text requires outline paths")
+        if set(replacement_group.child_ids) != {
+            entity.id for entity in self.replacement_children
+        }:
+            raise ValueError("replacement text group must reference exactly its new outlines")
+
+    def _mutate(self, document: VectorDocument) -> DocumentChangeSet:
+        group = document.get_entity(self.group_id)
+        if not isinstance(group, GroupEntity):
+            raise GeometryError("o grupo de texto original não existe mais")
+        if tuple(group.child_ids) != self.old_child_ids:
+            raise CommandStateError("o texto mudou; reabra a edição antes de aplicar")
+        missing = set(self.old_child_ids) - set(document.entities_by_id)
+        if missing:
+            raise KeyError("missing text outlines: %s" % ", ".join(sorted(missing)))
+        new_ids = {entity.id for entity in self.replacement_children}
+        collisions = new_ids.intersection(document.entities_by_id)
+        if collisions:
+            raise GeometryError("new text outline IDs already exist: %s" % ", ".join(sorted(collisions)))
+        # Replace the parent first so deleting old leaves cannot cascade-remove
+        # the stable text group.  Invariants are checked only after all three
+        # mutations have completed inside this one command.
+        document.replace_entities((self.replacement_group,), bump_revision=False)
+        document.add_entities(self.replacement_children, bump_revision=False)
+        document.remove_entities(self.old_child_ids, bump_revision=False)
+        return DocumentChangeSet(
+            added=frozenset(new_ids),
+            changed=frozenset((self.group_id,)),
+            removed=frozenset(self.old_child_ids),
+        )
+
+
 class MoveEntitiesCommand(TransformEntitiesCommand):
     label = "Mover vetores"
 
@@ -241,6 +532,52 @@ class MoveNodeCommand(Command):
             raise GeometryError("entity %s does not support node editing" % self.entity_id)
         moved = entity.with_node_moved(self.node_id, self.new_position)
         document.replace_entities((moved,), bump_revision=False)
+        return DocumentChangeSet(changed=frozenset((self.entity_id,)))
+
+
+class MoveBezierHandleCommand(Command):
+    """Move one cubic Bézier control handle without sampling the curve."""
+
+    label = "Mover controle Bézier"
+
+    def __init__(self, entity_id: str, span_id: str, handle: str, new_position: Vec2):
+        super().__init__()
+        if not entity_id or not span_id:
+            raise ValueError("MoveBezierHandleCommand requires entity and span IDs")
+        if handle not in ("control1", "control2"):
+            raise ValueError("Bézier handle must be control1 or control2")
+        if not isinstance(new_position, Vec2):
+            raise TypeError("new_position must be Vec2")
+        self.entity_id = str(entity_id)
+        self.span_id = str(span_id)
+        self.handle = str(handle)
+        self.new_position = new_position
+
+    def _mutate(self, document: VectorDocument) -> DocumentChangeSet:
+        entity = document.get_entity(self.entity_id)
+        if not isinstance(entity, PathEntity):
+            raise GeometryError("entity %s is not a path" % self.entity_id)
+        replacement_spans = []
+        found = False
+        for span in entity.spans:
+            if str(getattr(span, "id", "")) != self.span_id:
+                replacement_spans.append(span)
+                continue
+            if not isinstance(span, CubicBezierSpan):
+                raise GeometryError("span %s is not a cubic Bézier" % self.span_id)
+            values = {
+                "id": span.id,
+                "start": span.start,
+                "control1": span.control1,
+                "control2": span.control2,
+                "end": span.end,
+            }
+            values[self.handle] = self.new_position
+            replacement_spans.append(CubicBezierSpan(**values))
+            found = True
+        if not found:
+            raise KeyError("unknown Bézier span %s" % self.span_id)
+        document.replace_entities((replace(entity, spans=tuple(replacement_spans)),), bump_revision=False)
         return DocumentChangeSet(changed=frozenset((self.entity_id,)))
 
 
@@ -380,6 +717,49 @@ class ApplyModifierPreviewCommand(Command):
         )
 
 
+class ApplyBooleanPreviewCommand(ApplyModifierPreviewCommand):
+    """Apply a closed boolean and retain its multiple rings as one object.
+
+    The domain deliberately represents every exact ring independently (a
+    CircleEntity remains a true circle rather than becoming sampled points).
+    A boolean difference can therefore produce an outer ring plus detached
+    internal rings.  The persistent group is the compound-vector identity:
+    clicking, moving or deleting any child operates on the whole result, while
+    CAM/piece recognition still sees each exact contour.
+    """
+
+    label = "Aplicar booleano vetorial"
+
+    def __init__(self, preview, *, group_id: Optional[str] = None):
+        if not str(getattr(preview, "operation", "")).startswith("boolean_"):
+            raise ValueError("ApplyBooleanPreviewCommand requires a boolean preview")
+        super().__init__(preview)
+        self.group_id = str(group_id or "")
+
+    def _mutate(self, document: VectorDocument) -> DocumentChangeSet:
+        changes = super()._mutate(document)
+        result_ids = tuple(str(entity.id) for entity in self.preview.result_entities)
+        if len(result_ids) < 2:
+            self.group_id = ""
+            return changes
+        entities = tuple(document.get_entity(entity_id) for entity_id in result_ids)
+        layer_ids = {entity.layer_id for entity in entities if entity is not None}
+        if len(layer_ids) != 1 or any(entity is None for entity in entities):
+            raise InvariantError("boolean result must contain valid entities on one layer")
+        group = GroupEntity(
+            id=self.group_id or new_id("group"),
+            layer_id=next(iter(layer_ids)),
+            child_ids=result_ids,
+            metadata={
+                "name": "Booleano %s" % str(self.preview.operation).replace("boolean_", ""),
+                "source_kind": "editor_boolean_compound",
+            },
+        )
+        self.group_id = group.id
+        document.add_entities((group,), bump_revision=False)
+        return changes.merged(DocumentChangeSet(added=frozenset((group.id,))))
+
+
 class TrimLineSpanCommand(ApplyModifierPreviewCommand):
     label = "Aparar segmento linear"
     expected_operation = "trim_line"
@@ -511,6 +891,64 @@ def join_path_entities_with_line(
     )
 
 
+def join_path_entities_with_smooth_curve(
+    first: PathEntity,
+    second: PathEntity,
+    first_endpoint: str = "end",
+    second_endpoint: str = "start",
+    tolerance: float = 0.2,
+) -> PathEntity:
+    """Join two explicitly selected open endpoints with an exact Bézier bridge.
+
+    This is the Aspire-style "join with smooth curve" operation.  It never
+    moves a deliberate gap: the original paths retain their endpoints and a
+    cubic span is inserted with tangents inherited from both selected ends.
+    Near-coincident endpoints still use the ordinary midpoint merge, because
+    creating a microscopic curve would only harm the topology.
+    """
+
+    if first.closed or second.closed:
+        raise GeometryError("only open paths can be joined")
+    if first.id == second.id:
+        raise GeometryError("cannot join a path to itself")
+    if first.layer_id != second.layer_id:
+        raise GeometryError("paths on different layers cannot be joined directly")
+    first_endpoint = _endpoint_name(first_endpoint)
+    second_endpoint = _endpoint_name(second_endpoint)
+    left = first.reversed() if first_endpoint == "start" else first
+    right = second.reversed() if second_endpoint == "end" else second
+    gap = left.end.distance_to(right.start)
+    if gap <= float(tolerance):
+        return join_path_entities(
+            first, second, first_endpoint, second_endpoint, tolerance=float(tolerance)
+        )
+    try:
+        left_tangent = left.spans[-1].tangent_at(1.0)
+        right_tangent = right.spans[0].tangent_at(0.0)
+    except Exception as error:
+        raise GeometryError("não foi possível obter tangentes nas pontas selecionadas") from error
+    handle = gap / 3.0
+    bridge = CubicBezierSpan(
+        left.end,
+        left.end + left_tangent * handle,
+        right.start - right_tangent * handle,
+        right.start,
+    )
+    metadata = dict(left.metadata)
+    joined_from = list(metadata.get("joined_from", []))
+    joined_from.extend((first.id, second.id))
+    metadata["joined_from"] = list(dict.fromkeys(joined_from))
+    metadata["joined_with_smooth_curve_gap_mm"] = float(gap)
+    return PathEntity(
+        id=first.id,
+        layer_id=left.layer_id,
+        spans=left.spans + (bridge,) + right.spans,
+        closed=False,
+        node_ids=left.node_ids + right.node_ids,
+        metadata=metadata,
+    )
+
+
 class JoinPathsCommand(Command):
     label = "Unir caminhos abertos"
 
@@ -532,19 +970,19 @@ class JoinPathsCommand(Command):
         self.mode = str(mode).strip().lower()
         if self.tolerance < 0.0:
             raise ValueError("join tolerance cannot be negative")
-        if self.mode not in ("move", "line"):
-            raise ValueError("join mode must be 'move' or 'line'")
+        if self.mode not in ("move", "line", "smooth"):
+            raise ValueError("join mode must be 'move', 'line' or 'smooth'")
 
     def _mutate(self, document: VectorDocument) -> DocumentChangeSet:
         first = document.get_entity(self.first_path_id)
         second = document.get_entity(self.second_path_id)
         if not isinstance(first, PathEntity) or not isinstance(second, PathEntity):
             raise GeometryError("JoinPathsCommand requires two paths")
-        joiner = (
-            join_path_entities_with_line
-            if self.mode == "line"
-            else join_path_entities
-        )
+        joiner = {
+            "move": join_path_entities,
+            "line": join_path_entities_with_line,
+            "smooth": join_path_entities_with_smooth_curve,
+        }[self.mode]
         joined = joiner(
             first, second, self.first_endpoint, self.second_endpoint, self.tolerance
         )
@@ -556,14 +994,108 @@ class JoinPathsCommand(Command):
         )
 
 
+class JoinOpenPathsWithinToleranceCommand(Command):
+    """Join all compatible selected open paths within one explicit tolerance.
+
+    This is the batch counterpart to ``JoinPathsCommand`` and mirrors Aspire's
+    *Join Open Vectors*.  It deliberately never inserts a bridge or reaches
+    across a large gap: each accepted pair is merged at its midpoint only when
+    the actual endpoint distance is inside the supplied tolerance.
+    """
+
+    label = "Unir vetores abertos"
+
+    def __init__(self, entity_ids: Iterable[str], tolerance: float = 0.2):
+        super().__init__()
+        self.entity_ids = tuple(dict.fromkeys(str(entity_id) for entity_id in entity_ids))
+        self.tolerance = float(tolerance)
+        if len(self.entity_ids) < 2:
+            raise ValueError("Selecione pelo menos dois caminhos abertos")
+        if self.tolerance < 0.0:
+            raise ValueError("join tolerance cannot be negative")
+        self.joined_pairs: Tuple[Tuple[str, str, float], ...] = ()
+
+    @staticmethod
+    def _best_candidate(document: VectorDocument, active_ids: Sequence[str], ranks):
+        candidates = []
+        for first_index, first_id in enumerate(active_ids):
+            first = document.get_entity(first_id)
+            if not isinstance(first, PathEntity) or first.closed:
+                continue
+            for second_id in active_ids[first_index + 1:]:
+                second = document.get_entity(second_id)
+                if not isinstance(second, PathEntity) or second.closed:
+                    continue
+                if first.layer_id != second.layer_id:
+                    continue
+                for first_endpoint, first_point in (("start", first.start), ("end", first.end)):
+                    for second_endpoint, second_point in (("start", second.start), ("end", second.end)):
+                        distance = first_point.distance_to(second_point)
+                        candidates.append((
+                            distance,
+                            min(ranks[first_id], ranks[second_id]),
+                            max(ranks[first_id], ranks[second_id]),
+                            first_id,
+                            second_id,
+                            first_endpoint,
+                            second_endpoint,
+                        ))
+        if not candidates:
+            return None
+        # Stable ordering avoids a hidden geometry choice when several gaps
+        # have the same measure.  The selected order breaks ties, then IDs.
+        return min(candidates, key=lambda value: value[:5])
+
+    def _mutate(self, document: VectorDocument) -> DocumentChangeSet:
+        ranks = {entity_id: index for index, entity_id in enumerate(self.entity_ids)}
+        active_ids = [
+            entity_id for entity_id in self.entity_ids
+            if isinstance(document.get_entity(entity_id), PathEntity)
+            and not document.get_entity(entity_id).closed
+        ]
+        if len(active_ids) < 2:
+            raise GeometryError("Selecione pelo menos dois caminhos abertos")
+        changed = set()
+        removed = set()
+        joined = []
+        while len(active_ids) >= 2:
+            candidate = self._best_candidate(document, active_ids, ranks)
+            if candidate is None:
+                break
+            distance, _first_rank, _second_rank, first_id, second_id, first_endpoint, second_endpoint = candidate
+            if distance > self.tolerance:
+                break
+            # Preserve the earliest selected path ID as the surviving object.
+            if ranks[second_id] < ranks[first_id]:
+                first_id, second_id = second_id, first_id
+                first_endpoint, second_endpoint = second_endpoint, first_endpoint
+            first = document.get_entity(first_id)
+            second = document.get_entity(second_id)
+            joined_path = join_path_entities(
+                first, second, first_endpoint, second_endpoint, self.tolerance
+            )
+            document.remove_entities((second_id,), bump_revision=False)
+            document.replace_entities((joined_path,), bump_revision=False)
+            active_ids.remove(second_id)
+            changed.add(first_id)
+            removed.add(second_id)
+            joined.append((first_id, second_id, float(distance)))
+        if not joined:
+            raise GeometryError(
+                "Nenhuma ponta selecionada está dentro da tolerância de %.6g mm" % self.tolerance
+            )
+        self.joined_pairs = tuple(joined)
+        return DocumentChangeSet(changed=frozenset(changed), removed=frozenset(removed))
+
+
 class ClosePathCommand(Command):
     label = "Fechar caminho"
 
     def __init__(self, path_id: str, mode: str = "line"):
         super().__init__()
         mode = str(mode).lower()
-        if mode not in ("line", "midpoint"):
-            raise ValueError("close mode must be 'line' or 'midpoint'")
+        if mode not in ("line", "smooth", "midpoint"):
+            raise ValueError("close mode must be 'line', 'smooth' or 'midpoint'")
         self.path_id = path_id
         self.mode = mode
 
@@ -580,6 +1112,33 @@ class ClosePathCommand(Command):
                 closed=True,
                 node_ids=path.node_ids,
                 metadata=path.metadata,
+            )
+        elif self.mode == "smooth":
+            # Preserve both original endpoints and attach an exact Bezier
+            # bridge tangent to the existing first/last spans.  This is the
+            # vector-editor "close with smooth curve" behaviour: no node is
+            # teleported and no raster approximation enters the document.
+            gap = path.end.distance_to(path.start)
+            if gap <= 1.0e-12:
+                raise GeometryError("path endpoints already coincide")
+            first_tangent = path.spans[0].tangent_at(0.0)
+            last_tangent = path.spans[-1].tangent_at(1.0)
+            handle = gap / 3.0
+            closing = CubicBezierSpan(
+                path.end,
+                path.end + last_tangent * handle,
+                path.start - first_tangent * handle,
+                path.start,
+            )
+            metadata = dict(path.metadata)
+            metadata["closed_with"] = "smooth"
+            closed = PathEntity(
+                id=path.id,
+                layer_id=path.layer_id,
+                spans=path.spans + (closing,),
+                closed=True,
+                node_ids=path.node_ids,
+                metadata=metadata,
             )
         else:
             midpoint = path.start.lerp(path.end, 0.5)

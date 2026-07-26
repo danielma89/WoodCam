@@ -26,6 +26,7 @@ from woodcam_editor.geometry.modifiers import (
     preview_dogbone,
     preview_extend_line_span,
     preview_offset_closed_path,
+    preview_create_offset_contour,
     preview_tbone,
     preview_trim_at_point,
     preview_trim_line_span,
@@ -283,6 +284,34 @@ class ModifierCommandTests(unittest.TestCase):
         self.assertAlmostEqual(self.document.get_entity(self.path.id).bounds().width, 100)
         self.history.redo()
         self.assertAlmostEqual(self.document.get_entity(self.path.id).bounds().width, 110)
+
+    def test_create_offset_contour_preserves_source_and_adds_separate_vector(self):
+        preview = preview_create_offset_contour(self.path, 5)
+        self.assertEqual(preview.original_entities, (self.path,))
+        self.assertEqual(len(preview.result_entities), 2)
+        created = preview.result_entities[-1]
+        self.assertNotEqual(created.id, self.path.id)
+        self.history.execute(ApplyModifierPreviewCommand(preview))
+        self.assertIn(self.path.id, self.document.entities_by_id)
+        self.assertIn(created.id, self.document.entities_by_id)
+        self.assertAlmostEqual(self.document.get_entity(self.path.id).bounds().width, 100)
+        self.assertAlmostEqual(self.document.get_entity(created.id).bounds().width, 110)
+        self.history.undo()
+        self.assertIn(self.path.id, self.document.entities_by_id)
+        self.assertNotIn(created.id, self.document.entities_by_id)
+
+    def test_create_circle_contour_changes_radius_without_consuming_circle(self):
+        circle = CircleEntity(self.document.active_layer_id, Vec2(30, 30), 10, id="circle")
+        self.document.add_entities((circle,), bump_revision=False)
+        preview = preview_create_offset_contour(circle, -2)
+        created = preview.result_entities[-1]
+        self.assertEqual(created.radius, 8)
+        self.history.execute(ApplyModifierPreviewCommand(preview))
+        self.assertEqual(self.document.get_entity(circle.id).radius, 10)
+        self.assertEqual(self.document.get_entity(created.id).radius, 8)
+        self.history.undo()
+        self.assertIn(circle.id, self.document.entities_by_id)
+        self.assertNotIn(created.id, self.document.entities_by_id)
 
     def test_stale_preview_is_rejected_atomically(self):
         preview = preview_corner_fillet(self.path, self.path.node_ids[1], 5)

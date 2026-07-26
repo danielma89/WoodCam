@@ -6,7 +6,7 @@ from woodcam_editor.application import CommandExecutionCancelled, EditorMode
 
 from ..compat import CTRL_MODIFIER, SHIFT_MODIFIER, Signal, QtCore, QtWidgets, qt_enum
 from .base import has_modifier
-from .draw import ArcTool, CircleTool, EllipseTool, LineTool, PolygonTool, PolylineTool, RectangleTool
+from .draw import ArcTool, BezierTool, CircleTool, EllipseTool, LineTool, PolygonTool, StarTool, PolylineTool, RectangleTool
 from .node import NodeTool
 from .modifier import (
     AutomaticDogboneTool,
@@ -18,7 +18,8 @@ from .modifier import (
     TBoneTool,
     TrimTool,
 )
-from .connect import ConnectTool, JoinEndpointsTool, SpliceTool
+from .connect import ConnectTool, JoinEndpointsSmoothTool, JoinEndpointsTool, SpliceTool
+from .measure import MeasureTool
 from .select import SelectTool
 
 
@@ -26,6 +27,7 @@ class ToolManager(QtCore.QObject):
     statusChanged = Signal(str)
     snapChanged = Signal(str)
     previewAvailabilityChanged = Signal(bool)
+    editSelectionRequested = Signal()
 
     def __init__(self, view, controller, adapter, overlays, parent=None):
         super(ToolManager, self).__init__(parent)
@@ -35,6 +37,7 @@ class ToolManager(QtCore.QObject):
         self.overlays = overlays
         self.tools = {
             EditorMode.SELECT: SelectTool(self),
+            EditorMode.MEASURE: MeasureTool(self),
             EditorMode.NODE_EDIT: NodeTool(self),
             EditorMode.DRAW_LINE: LineTool(self),
             EditorMode.DRAW_POLYLINE: PolylineTool(self),
@@ -42,7 +45,9 @@ class ToolManager(QtCore.QObject):
             EditorMode.DRAW_CIRCLE: CircleTool(self),
             EditorMode.DRAW_ELLIPSE: EllipseTool(self),
             EditorMode.DRAW_ARC: ArcTool(self),
+            EditorMode.DRAW_BEZIER: BezierTool(self),
             EditorMode.DRAW_POLYGON: PolygonTool(self),
+            EditorMode.DRAW_STAR: StarTool(self),
             EditorMode.TRIM: TrimTool(self),
             EditorMode.EXTEND: ExtendTool(self),
             EditorMode.OFFSET: OffsetTool(self),
@@ -50,6 +55,7 @@ class ToolManager(QtCore.QObject):
             EditorMode.DOGBONE: DogboneTool(self),
             EditorMode.TBONE: TBoneTool(self),
             EditorMode.JOIN_ENDPOINTS: JoinEndpointsTool(self),
+            EditorMode.JOIN_ENDPOINTS_SMOOTH: JoinEndpointsSmoothTool(self),
             EditorMode.CONNECT: ConnectTool(self),
             EditorMode.SPLICE: SpliceTool(self),
             EditorMode.AUTO_DOGBONE: AutomaticDogboneTool(self),
@@ -83,6 +89,12 @@ class ToolManager(QtCore.QObject):
 
     def set_polygon_sides(self, sides):
         self.tools[EditorMode.DRAW_POLYGON].set_sides(sides)
+
+    def set_star_points(self, points):
+        self.tools[EditorMode.DRAW_STAR].set_points(points)
+
+    def set_star_inner_ratio(self, ratio):
+        self.tools[EditorMode.DRAW_STAR].set_inner_ratio(ratio)
 
     def set_snap_status(self, text):
         self.snapChanged.emit(text)
@@ -162,6 +174,7 @@ class ToolManager(QtCore.QObject):
             qt_enum(QtCore.Qt, "Key_C", "Key"): EditorMode.DRAW_CIRCLE,
             qt_enum(QtCore.Qt, "Key_E", "Key"): EditorMode.DRAW_ELLIPSE,
             qt_enum(QtCore.Qt, "Key_A", "Key"): EditorMode.DRAW_ARC,
+            qt_enum(QtCore.Qt, "Key_B", "Key"): EditorMode.DRAW_BEZIER,
             qt_enum(QtCore.Qt, "Key_G", "Key"): EditorMode.DRAW_POLYGON,
         }
         if key in shortcuts and modifiers == QtCore.Qt.NoModifier:
@@ -174,6 +187,7 @@ class ToolManager(QtCore.QObject):
     def _mode_label(mode):
         return {
             EditorMode.SELECT: "Selecionar — 1 clique seleciona; arraste move o corpo",
+            EditorMode.MEASURE: "Medir — dois pontos com Snap; não altera o desenho",
             EditorMode.NODE_EDIT: "Nós — clique seleciona; somente arrastar move",
             EditorMode.DRAW_LINE: "Linha — clique no início e no fim",
             EditorMode.DRAW_POLYLINE: "Polilinha — cliques; Enter termina; Tab fecha",
@@ -181,7 +195,9 @@ class ToolManager(QtCore.QObject):
             EditorMode.DRAW_CIRCLE: "Círculo — centro e raio",
             EditorMode.DRAW_ELLIPSE: "Elipse — centro, raio X e raio Y",
             EditorMode.DRAW_ARC: "Arco — início, ponto intermediário e fim",
+            EditorMode.DRAW_BEZIER: "Bézier — início, controle 1, controle 2 e fim",
             EditorMode.DRAW_POLYGON: "Polígono — centro e raio",
+            EditorMode.DRAW_STAR: "Estrela — centro e ponta externa",
             EditorMode.TRIM: "Trim — prévia no hover; clique aplica",
             EditorMode.EXTEND: "Extend — prévia na ponta; clique aplica",
             EditorMode.OFFSET: "Offset — prévia do contorno; clique aplica",
@@ -189,6 +205,7 @@ class ToolManager(QtCore.QObject):
             EditorMode.DOGBONE: "Dogbone — somente canto interno de 90°",
             EditorMode.TBONE: "T-bone — somente canto interno de 90°",
             EditorMode.JOIN_ENDPOINTS: "Unir 2 pontas — escolha exatamente as duas pontas",
+            EditorMode.JOIN_ENDPOINTS_SMOOTH: "Unir 2 pontas suave — escolha exatamente as duas pontas",
             EditorMode.CONNECT: "Projetar ponta — escolha a ponta e depois uma reta/curva alvo",
             EditorMode.SPLICE: "Emendar — escolha caminho aberto e contorno alvo",
             EditorMode.AUTO_DOGBONE: "Dogbone automático — revisar prévia total",

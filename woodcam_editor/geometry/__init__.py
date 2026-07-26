@@ -20,6 +20,7 @@ _MODIFIER_EXPORTS = {
     "preview_dogbone",
     "preview_extend_line_span",
     "preview_offset_closed_path",
+    "preview_create_offset_contour",
     "preview_tbone",
     "preview_splice_open_path_to_contour",
     "preview_trim_at_point",

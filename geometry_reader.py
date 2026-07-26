@@ -657,6 +657,22 @@ def _panelnest_cam_objects(objects):
 
 
 def _panelnest_cam_for_selection(obj):
+    exchange_type = str(getattr(obj, "WoodCAMExchangeType", "") or "")
+    if exchange_type == "panel_part":
+        return [obj]
+    if exchange_type == "panelnest_exchange_root":
+        exchange_parts = [
+            child
+            for child in list(getattr(obj, "Group", []) or [])
+            if str(getattr(child, "WoodCAMExchangeType", "") or "")
+            == "panel_part"
+        ]
+        if not exchange_parts:
+            raise ValueError(
+                "A pasta de peças do Editor 2D não contém nenhuma peça CAM."
+            )
+        return exchange_parts
+
     managed_type = _panelnest_managed_type(obj)
     is_cam_group = str(getattr(obj, "Name", "") or "") == "PanelNest_CAM_Chapas"
     if managed_type == PANELNEST_CAM_TYPE:

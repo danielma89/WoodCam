@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 
 from woodcam_editor.domain import (
     AddEntitiesCommand,
@@ -10,6 +11,7 @@ from woodcam_editor.domain import (
     DeleteEntitiesCommand,
     GeometryError,
     InMemoryCommandHistory,
+    JoinOpenPathsWithinToleranceCommand,
     JoinPathsCommand,
     Layer,
     MoveEntitiesCommand,
@@ -27,6 +29,7 @@ from woodcam_editor.domain import (
     document_to_dict,
     join_path_entities,
     join_path_entities_with_line,
+    join_path_entities_with_smooth_curve,
     validate_document,
 )
 
@@ -128,6 +131,23 @@ class CommandTests(unittest.TestCase):
         self.history.undo()
         self.assertEqual(len(self.document.get_entity(entity.id).spans), 2)
 
+    def test_close_smooth_adds_exact_bezier_bridge_and_undo_restores_open_path(self):
+        entity = path(
+            self.document,
+            (Vec2(0, 0), Vec2(10, 0), Vec2(10, 10)),
+            id="path-smooth",
+        )
+        self.document.add_entities((entity,), bump_revision=False)
+        self.history.execute(ClosePathCommand(entity.id, "smooth"))
+        closed = self.document.get_entity(entity.id)
+        self.assertTrue(closed.closed)
+        self.assertEqual(type(closed.spans[-1]).__name__, "CubicBezierSpan")
+        self.assertEqual(closed.spans[-1].start, Vec2(10, 10))
+        self.assertEqual(closed.spans[-1].end, Vec2(0, 0))
+        self.assertEqual(closed.metadata["closed_with"], "smooth")
+        self.history.undo()
+        self.assertFalse(self.document.get_entity(entity.id).closed)
+
     def test_composite_is_one_history_entry(self):
         first = CircleEntity(self.document.active_layer_id, Vec2(10, 10), 2, id="a")
         second = CircleEntity(self.document.active_layer_id, Vec2(20, 10), 2, id="b")
@@ -201,6 +221,66 @@ class JoinTests(unittest.TestCase):
         self.assertEqual(len(document.get_entity("first").spans), 3)
         self.assertNotIn("second", document.entities_by_id)
         history.undo()
+        self.assertEqual(set(document.entities_by_id), {"first", "second"})
+
+    def test_explicit_join_with_smooth_curve_preserves_endpoints_and_tangents(self):
+        document = VectorDocument.create_default()
+        first = path(document, (Vec2(0, 0), Vec2(10, 0)), id="first")
+        second = path(document, (Vec2(20, 5), Vec2(20, 15)), id="second")
+        joined = join_path_entities_with_smooth_curve(
+            first, second, "end", "start", tolerance=0.2
+        )
+        self.assertEqual(len(joined.spans), 3)
+        bridge = joined.spans[1]
+        self.assertEqual(type(bridge).__name__, "CubicBezierSpan")
+        self.assertEqual(bridge.start, first.end)
+        self.assertEqual(bridge.end, second.start)
+        self.assertAlmostEqual(bridge.tangent_at(0.0).x, 1.0)
+        self.assertAlmostEqual(bridge.tangent_at(0.0).y, 0.0)
+        self.assertAlmostEqual(bridge.tangent_at(1.0).x, 0.0)
+        self.assertAlmostEqual(bridge.tangent_at(1.0).y, 1.0)
+
+    def test_join_command_smooth_mode_is_one_undoable_operation(self):
+        document = VectorDocument.create_default()
+        first = path(document, (Vec2(0, 0), Vec2(10, 0)), id="first")
+        second = path(document, (Vec2(20, 5), Vec2(20, 15)), id="second")
+        document.add_entities((first, second), bump_revision=False)
+        history = InMemoryCommandHistory(document)
+        history.execute(JoinPathsCommand("first", "second", tolerance=0.2, mode="smooth"))
+        self.assertEqual(len(document.get_entity("first").spans), 3)
+        self.assertNotIn("second", document.entities_by_id)
+        history.undo()
+        self.assertEqual(set(document.entities_by_id), {"first", "second"})
+
+    def test_join_open_vectors_batches_a_chain_inside_tolerance_with_one_undo(self):
+        document = VectorDocument.create_default()
+        first = path(document, (Vec2(0, 0), Vec2(10, 0)), id="first")
+        second = path(document, (Vec2(10.05, 0), Vec2(20, 0)), id="second")
+        third = path(document, (Vec2(20.08, 0), Vec2(30, 0)), id="third")
+        document.add_entities((first, second, third), bump_revision=False)
+        history = InMemoryCommandHistory(document)
+
+        command = JoinOpenPathsWithinToleranceCommand(
+            ("first", "second", "third"), tolerance=0.1
+        )
+        history.execute(command)
+        self.assertEqual(set(document.entities_by_id), {"first"})
+        self.assertEqual(len(document.get_entity("first").spans), 3)
+        self.assertEqual(len(command.joined_pairs), 2)
+
+        history.undo()
+        self.assertEqual(set(document.entities_by_id), {"first", "second", "third"})
+
+    def test_join_open_vectors_never_bridges_a_gap_outside_tolerance(self):
+        document = VectorDocument.create_default()
+        first = path(document, (Vec2(0, 0), Vec2(10, 0)), id="first")
+        second = path(document, (Vec2(13, 0), Vec2(20, 0)), id="second")
+        document.add_entities((first, second), bump_revision=False)
+        history = InMemoryCommandHistory(document)
+        with self.assertRaises(GeometryError):
+            history.execute(
+                JoinOpenPathsWithinToleranceCommand(("first", "second"), tolerance=0.2)
+            )
         self.assertEqual(set(document.entities_by_id), {"first", "second"})
 
 
@@ -327,6 +407,36 @@ class TopologyAndValidationTests(unittest.TestCase):
         report = validate_document(document)
         self.assertTrue(report.by_code("CONTOUR_INTERSECTION"))
         self.assertFalse(report.by_code("TOUCHING_CONTOURS"))
+
+    def test_validation_ignores_contacts_between_distinct_imported_boards(self):
+        """Two staged physical boards may share XY without becoming errors."""
+
+        document = VectorDocument.create_default()
+        first = replace(
+            path(
+                document,
+                (Vec2(0, 0), Vec2(10, 0), Vec2(10, 10), Vec2(0, 10)),
+                True,
+                "board-a",
+            ),
+            metadata={"source_tree_instance_id": "001:board-a"},
+        )
+        second = replace(
+            path(
+                document,
+                (Vec2(0, 0), Vec2(10, 0), Vec2(10, 10), Vec2(0, 10)),
+                True,
+                "board-b",
+            ),
+            metadata={"source_tree_instance_id": "002:board-b"},
+        )
+        document.add_entities((first, second), bump_revision=False)
+
+        report = validate_document(document)
+        codes = {issue.code for issue in report.issues}
+        self.assertNotIn("DUPLICATE_ENTITY", codes)
+        self.assertNotIn("CONTOUR_INTERSECTION", codes)
+        self.assertNotIn("TOUCHING_CONTOURS", codes)
 
     def test_open_line_copies_covered_by_closed_contours_are_safe_overlines(self):
         from woodcam_editor.domain import redundant_open_overline_entity_ids

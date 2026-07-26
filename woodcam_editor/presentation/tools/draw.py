@@ -37,7 +37,7 @@ class TwoPointTool(EditorTool):
             return
         if event.button != LEFT_BUTTON:
             return
-        point, _candidate = self.snapped(event)
+        point, _candidate = self.snapped(event, reference_point=self.first)
         if self.first is None:
             self.first = point
         else:
@@ -48,7 +48,7 @@ class TwoPointTool(EditorTool):
     def pointer_move(self, event):
         if self.first is None:
             return
-        point, _candidate = self.snapped(event)
+        point, _candidate = self.snapped(event, reference_point=self.first)
         self.preview(self.first, point)
 
     def key_press(self, event):
@@ -164,6 +164,59 @@ class PolygonTool(TwoPointTool):
         self.controller.add_polygon(first, distance(first, second), self.sides, math.atan2(py - cy, px - cx))
 
 
+class StarTool(TwoPointTool):
+    """Aspire-style star: center click followed by an outer tip/radius."""
+
+    mode = EditorMode.DRAW_STAR
+
+    def __init__(self, manager, points=5, inner_ratio=0.45):
+        super(StarTool, self).__init__(manager)
+        self.points = max(3, int(points))
+        self.inner_ratio = min(0.95, max(0.05, float(inner_ratio)))
+
+    def set_points(self, points):
+        self.points = max(3, int(points))
+
+    def set_inner_ratio(self, ratio):
+        self.inner_ratio = min(0.95, max(0.05, float(ratio)))
+
+    def _vertices(self, first, current):
+        radius = distance(first, current)
+        cx, cy = xy(first)
+        px, py = xy(current)
+        rotation = math.atan2(py - cy, px - cx)
+        values = []
+        for index in range(self.points * 2):
+            current_radius = radius if index % 2 == 0 else radius * self.inner_ratio
+            angle = rotation + index * math.pi / self.points
+            values.append(self.controller.vec(
+                cx + current_radius * math.cos(angle),
+                cy + current_radius * math.sin(angle),
+            ))
+        return tuple(values)
+
+    def preview(self, first, current):
+        radius = distance(first, current)
+        self.overlays.show_path_preview(self._vertices(first, current), closed=True)
+        self.overlays.show_measure(
+            "%d pontas   R %.3f mm   interno %.0f%%" % (
+                self.points, radius, self.inner_ratio * 100.0,
+            ),
+            current,
+        )
+
+    def commit(self, first, second):
+        cx, cy = xy(first)
+        px, py = xy(second)
+        self.controller.add_star(
+            first,
+            distance(first, second),
+            self.points,
+            self.inner_ratio,
+            math.atan2(py - cy, px - cx),
+        )
+
+
 class PolylineTool(EditorTool):
     mode = EditorMode.DRAW_POLYLINE
 
@@ -188,7 +241,10 @@ class PolylineTool(EditorTool):
             return
         if event.button != LEFT_BUTTON:
             return
-        point, _candidate = self.snapped(event)
+        point, _candidate = self.snapped(
+            event,
+            reference_point=self.points[-1] if self.points else None,
+        )
         if self.points and distance(self.points[-1], point) <= 1e-9:
             return
         self.points.append(point)
@@ -199,7 +255,10 @@ class PolylineTool(EditorTool):
     def pointer_move(self, event):
         if not self.points:
             return
-        self.hover, _candidate = self.snapped(event)
+        self.hover, _candidate = self.snapped(
+            event,
+            reference_point=self.points[-1] if self.points else None,
+        )
         values = tuple(self.points) + (self.hover,)
         self.overlays.show_path_preview(values)
         self.overlays.show_measure("Trecho %.3f mm   pontos %d" % (distance(self.points[-1], self.hover), len(self.points)), self.hover)
@@ -281,4 +340,68 @@ class ArcTool(EditorTool):
             event.accept()
 
 
-__all__ = ["ArcTool", "CircleTool", "EllipseTool", "LineTool", "PolygonTool", "PolylineTool", "RectangleTool"]
+class BezierTool(EditorTool):
+    """Four-click exact cubic Bézier tool: start, handle 1, handle 2, end."""
+
+    mode = EditorMode.DRAW_BEZIER
+
+    def __init__(self, manager):
+        super(BezierTool, self).__init__(manager)
+        self.points = []
+
+    def activate(self, entity_id=None):
+        self.points = []
+        self.overlays.clear_transient()
+
+    def cancel(self):
+        super(BezierTool, self).cancel()
+        self.points = []
+
+    def pointer_press(self, event):
+        if event.button == RIGHT_BUTTON:
+            self.cancel()
+            return
+        if event.button != LEFT_BUTTON:
+            return
+        reference = self.points[-1] if self.points else None
+        point, _candidate = self.snapped(event, reference_point=reference)
+        self.points.append(point)
+        if len(self.points) == 4:
+            # The order deliberately follows the visible control polygon:
+            # início → controle 1 → controle 2 → fim.
+            self.controller.add_bezier(*self.points)
+            self.points = []
+            self.overlays.clear_transient()
+
+    def pointer_move(self, event):
+        if not self.points:
+            return
+        reference = self.points[-1]
+        point, _candidate = self.snapped(event, reference_point=reference)
+        if len(self.points) == 1:
+            # Until the first handle is selected, use the hover point both as
+            # control and endpoint. This makes the first curve preview useful.
+            start = self.points[0]
+            control1 = point
+            control2 = point
+            end = point
+        elif len(self.points) == 2:
+            start, control1 = self.points
+            control2 = point
+            end = point
+        else:
+            start, control1, control2 = self.points
+            end = point
+        self.overlays.show_bezier_preview(start, control1, control2, end)
+        self.overlays.show_measure("Bézier: ponto %d/4" % (len(self.points) + 1), point)
+
+    def key_press(self, event):
+        if event.key() == qt_enum(QtCore.Qt, "Key_Escape", "Key"):
+            if self.points:
+                self.cancel()
+            else:
+                self.manager.activate(EditorMode.SELECT)
+            event.accept()
+
+
+__all__ = ["ArcTool", "BezierTool", "CircleTool", "EllipseTool", "LineTool", "PolygonTool", "StarTool", "PolylineTool", "RectangleTool"]

@@ -15,6 +15,7 @@ from woodcam_editor.adapters.panelnest import (
     PanelNestBridgeError,
     send_document_to_panelnest,
 )
+from geometry_reader import resolve_selection_objects
 from woodcam_editor.domain.document import Piece2D, VectorDocument
 from woodcam_editor.domain.entities import CircleEntity, EllipseEntity, PathEntity
 from woodcam_editor.domain.primitives import Affine2D, Vec2
@@ -36,12 +37,25 @@ inner = PathEntity.from_points(
     closed=True,
 )
 hole = CircleEntity(layer_id, Vec2(180, 240), 5)
-vector_document.add_entities((outer, inner, hole))
+polyline_hole_points = tuple(
+    Vec2(
+        160.0 + 4.0 * math.cos(2.0 * math.pi * index / 16.0),
+        220.0 + 4.0 * math.sin(2.0 * math.pi * index / 16.0),
+    )
+    for index in range(16)
+)
+polyline_hole = PathEntity.from_points(
+    layer_id,
+    polyline_hole_points,
+    closed=True,
+    id="imported-polyline-hole",
+)
+vector_document.add_entities((outer, inner, hole, polyline_hole))
 piece = Piece2D(
     id="piece-bridge",
     name="Lateral com recortes",
     outer_path_id=outer.id,
-    inner_path_ids=(inner.id, hole.id),
+    inner_path_ids=(inner.id, hole.id, polyline_hole.id),
     quantity=2,
     material="MDF 18",
     thickness=18.0,
@@ -65,21 +79,31 @@ if result.contract.available:
         include_hidden=True,
     )
     assert len(recognized) == 2
-    assert all(len(part.holes) == 1 for part in recognized)
+    assert all(len(part.holes) == 2 for part in recognized)
 else:
     assert result.mode == "freecad_exchange"
 assert len(result.items) == 1
 assert len(result.object_names) == 2
 assert result.items[0].inner_profile_count == 1
-assert result.items[0].circular_hole_count == 1
+assert result.items[0].circular_hole_count == 2
 assert result.items[0].source_offset == (100.0, 200.0)
 
 root = document.getObject(result.group_name)
 assert root is not None
+woodcam_root = document.getObject("WoodCAM")
+assert woodcam_root is not None
+assert [child.Label for child in woodcam_root.Group] == [
+    "Peças",
+    "Operações",
+    "Área de trabalho",
+]
+assert root.Label == "Peças"
+assert document.getObject("WoodCAM2DPanelNestExchange") is None
 assert root.WoodCAMExchangeType == "panelnest_exchange_root"
 assert root.WoodCAMExchangeLayoutMode == "preserve_editor_xy"
 assert not root.WoodCAMPanelNestAutoNesting
 assert len(root.Group) == 2
+assert resolve_selection_objects([root]) == list(root.Group)
 manifest = json.loads(root.WoodCAMExchangeManifestJson)
 assert manifest["layout_mode"] == "preserve_editor_xy"
 assert manifest["automatic_nesting"] is False
@@ -89,7 +113,12 @@ assert manifest["placements"]["piece-bridge"] == {
     "rotation_mode": "baked_in_profile",
 }
 
-expected_volume = ((120.0 * 80.0) - (20.0 * 20.0) - (math.pi * 5.0 * 5.0)) * 18.0
+expected_volume = (
+    (120.0 * 80.0)
+    - (20.0 * 20.0)
+    - (math.pi * 5.0 * 5.0)
+    - (math.pi * 4.0 * 4.0)
+) * 18.0
 for object_name in result.object_names:
     feature = document.getObject(object_name)
     assert feature is not None
@@ -110,7 +139,7 @@ for object_name in result.object_names:
     assert abs(feature.Shape.Volume - expected_volume) < 0.1
     payload = json.loads(feature.WoodCAMPanelPartJson)
     assert len(payload["inner_profile_loops"]) == 1
-    assert len(payload["circular_holes"]) == 1
+    assert len(payload["circular_holes"]) == 2
     assert payload["profile_points"][0] == [0.0, 0.0]
 
 # The complete export is one host transaction.

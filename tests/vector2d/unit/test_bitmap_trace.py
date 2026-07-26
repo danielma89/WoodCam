@@ -34,6 +34,40 @@ class BitmapTraceTests(unittest.TestCase):
             self.assertEqual(light.getpixel((20, 20)), 255)
             self.assertEqual(light.getpixel((0, 0)), 0)
 
+    def test_crop_is_applied_before_threshold_and_never_changes_source_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.fixture(directory)
+            with Image.open(path) as original:
+                original_size = original.size
+            cropped = threshold_mask(
+                path,
+                BitmapTraceOptions(
+                    threshold=128,
+                    crop_x_px=65,
+                    crop_y_px=15,
+                    crop_width_px=45,
+                    crop_height_px=45,
+                ),
+            )
+            self.assertEqual(cropped.size, (45, 45))
+            self.assertEqual(cropped.getpixel((20, 20)), 0)
+            with Image.open(path) as unchanged:
+                self.assertEqual(unchanged.size, original_size)
+
+    def test_crop_outside_source_is_rejected_explicitly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.fixture(directory)
+            with self.assertRaisesRegex(ValueError, "fora da imagem"):
+                threshold_mask(
+                    path,
+                    BitmapTraceOptions(
+                        crop_x_px=100,
+                        crop_y_px=0,
+                        crop_width_px=30,
+                        crop_height_px=10,
+                    ),
+                )
+
     @unittest.skipUnless(shutil.which("potrace"), "potrace indisponível")
     def test_potrace_returns_closed_curves_at_requested_width(self):
         with tempfile.TemporaryDirectory() as directory:

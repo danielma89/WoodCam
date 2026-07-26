@@ -48,7 +48,7 @@ class EditorTool:
         self.adapter.clear_preview()
         self.overlays.clear_transient()
 
-    def snapped(self, event, excluded_ids=()):
+    def snapped(self, event, excluded_ids=(), reference_point=None):
         disabled = has_modifier(event.modifiers, SHIFT_MODIFIER)
         point = self.controller.vec(event.scene_pos.x(), event.scene_pos.y())
         snapped, candidate = self.controller.snap(
@@ -56,6 +56,7 @@ class EditorTool:
             self.view.pixels_per_mm(),
             excluded_ids=excluded_ids,
             disabled=disabled,
+            reference_point=reference_point,
         )
         self.overlays.show_snap(candidate)
         self.manager.set_snap_status(candidate.label if candidate else "")
@@ -78,4 +79,3 @@ class EditorTool:
 
 
 __all__ = ["EditorTool", "has_modifier", "screen_distance", "xy"]
-

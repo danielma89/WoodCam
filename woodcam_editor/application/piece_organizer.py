@@ -17,6 +17,18 @@ from woodcam_editor.domain.document import entity_is_cam_eligible
 
 Point = Tuple[float, float]
 Bounds = Tuple[float, float, float, float]
+DRILL_DIAMETER_MAX_MM = 12.0
+
+
+def circle_is_drill(entity: Any, max_diameter_mm: float = DRILL_DIAMETER_MAX_MM) -> bool:
+    """Classify a circular contour conservatively for CAM layers."""
+    radius = getattr(entity, "radius", None)
+    if radius is None:
+        return False
+    try:
+        return float(radius) * 2.0 <= float(max_diameter_mm) + 1e-9
+    except (TypeError, ValueError):
+        return False
 
 
 def polygon_area(points: Sequence[Point]) -> float:
@@ -194,20 +206,77 @@ def classify_document_pieces(
             continue
         raw[str(entity_id)] = (entity, points, polygon_bounds(points), area)
 
+    # Most large imports are already separated into physical panel instances.
+    # Keep containment strictly inside that instance (or import batch) before
+    # doing the exact polygon test.  The old loop still visited every other
+    # contour merely to reject it by metadata, making "Reconhecer peças e
+    # furos" quadratic on a cabinet with hundreds of dogbones and drills.
+    # Unscoped hand-drawn geometry remains visible to every scope so the
+    # existing mixed manual/import workflow keeps its behaviour.
+    scopes: Dict[str, Optional[Tuple[str, ...]]] = {}
+    scoped_entity_ids: Dict[Tuple[str, ...], List[str]] = {}
+    unscoped_entity_ids: List[str] = []
+    for entity_id, (entity, _points, _bounds, _area) in raw.items():
+        metadata = dict(getattr(entity, "metadata", {}) or {})
+        batch = str(metadata.get("import_batch_id", "") or "")
+        # PanelNest already supplies an instance ID.  Direct Assembly-tree
+        # imports now carry the same physical-piece information under a
+        # neutral key, so a cabinet of separate boards is not treated as one
+        # giant containment search.
+        instance = str(
+            metadata.get("panelnest_instance_id", "")
+            or metadata.get("source_tree_instance_id", "")
+            or ""
+        )
+        if instance:
+            scope = ("physical-instance", batch, instance)
+        elif batch:
+            scope = ("import-batch", batch)
+        else:
+            scope = None
+        scopes[entity_id] = scope
+        if scope is None:
+            unscoped_entity_ids.append(entity_id)
+        else:
+            scoped_entity_ids.setdefault(scope, []).append(entity_id)
+
     parents: Dict[str, Optional[str]] = {}
     for entity_id, (_entity, points, bounds, area) in raw.items():
         probe = points[0]
         entity_batch = str(
             (getattr(_entity, "metadata", {}) or {}).get("import_batch_id", "")
         )
+        entity_instance = str(
+            (getattr(_entity, "metadata", {}) or {}).get("panelnest_instance_id", "")
+            or (getattr(_entity, "metadata", {}) or {}).get("source_tree_instance_id", "")
+            or ""
+        )
         containers = []
-        for candidate_id, (_other, candidate_points, candidate_bounds, candidate_area) in raw.items():
+        scope = scopes[entity_id]
+        candidate_ids = (
+            tuple(raw)
+            if scope is None
+            else tuple(scoped_entity_ids.get(scope, ())) + tuple(unscoped_entity_ids)
+        )
+        for candidate_id in candidate_ids:
+            _other, candidate_points, candidate_bounds, candidate_area = raw[candidate_id]
             if candidate_id == entity_id or abs(candidate_area) <= abs(area):
                 continue
             candidate_batch = str(
                 (getattr(_other, "metadata", {}) or {}).get("import_batch_id", "")
             )
+            candidate_instance = str(
+                (getattr(_other, "metadata", {}) or {}).get("panelnest_instance_id", "")
+                or (getattr(_other, "metadata", {}) or {}).get("source_tree_instance_id", "")
+                or ""
+            )
             if entity_batch and candidate_batch and entity_batch != candidate_batch:
+                continue
+            # PanelNest imports label every outer profile, inner recut and
+            # circular hole with its physical panel instance.  Comparing
+            # containment across all other panels is meaningless and becomes
+            # quadratic on a full cabinet.
+            if entity_instance and candidate_instance and entity_instance != candidate_instance:
                 continue
             if not _bounds_contains(candidate_bounds, bounds, tolerance):
                 continue
@@ -1337,11 +1406,13 @@ def organize_pieces(
 
 __all__ = [
     "Bounds",
+    "DRILL_DIAMETER_MAX_MM",
     "ClassificationResult",
     "ClassifiedLoop",
     "ClassifiedPiece",
     "OrganizationResult",
     "PiecePlacement",
+    "circle_is_drill",
     "classify_document_pieces",
     "entity_polyline",
     "organize_pieces",

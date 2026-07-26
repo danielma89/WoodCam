@@ -1,5 +1,7 @@
 import unittest
+from unittest import mock
 
+import woodcam_editor.application.piece_organizer as piece_organizer
 from woodcam_editor.application.piece_organizer import (
     classify_document_pieces,
     organize_pieces,
@@ -61,6 +63,43 @@ class PieceOrganizerTest(unittest.TestCase):
 
         self.assertEqual(len(result.pieces), 2)
         self.assertTrue(all(not piece.inner_ids for piece in result.pieces))
+
+    def test_panelnest_instances_do_not_scan_every_other_panel(self):
+        entities = []
+        for index in range(120):
+            metadata = {
+                "import_batch_id": "cabinet",
+                "panelnest_instance_id": "panel-%03d" % index,
+            }
+            x_value = float(index * 200)
+            entities.extend(
+                (
+                    _Path(
+                        "outer-%03d" % index,
+                        [(x_value, 0), (x_value + 100, 0), (x_value + 100, 50), (x_value, 50)],
+                        metadata=metadata,
+                    ),
+                    _Path(
+                        "hole-%03d" % index,
+                        [(x_value + 30, 10), (x_value + 70, 10), (x_value + 70, 40), (x_value + 30, 40)],
+                        metadata=metadata,
+                    ),
+                )
+            )
+
+        original = piece_organizer._bounds_contains
+        with mock.patch.object(
+            piece_organizer,
+            "_bounds_contains",
+            wraps=original,
+        ) as contains:
+            result = classify_document_pieces(_Document(entities))
+
+        self.assertEqual(len(result.pieces), 120)
+        self.assertTrue(all(len(piece.inner_ids) == 1 for piece in result.pieces))
+        # Two loops per physical instance: candidate filtering must stay
+        # proportional to the instance, not 240 × 240 comparisons.
+        self.assertLess(contains.call_count, 1000)
 
     def test_overflow_continues_on_side_by_side_sheets(self):
         paths = [

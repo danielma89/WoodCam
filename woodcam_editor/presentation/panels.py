@@ -47,27 +47,92 @@ class LayerPanel(QtWidgets.QGroupBox):
                 self.controller.document.layers_by_id.values(),
                 key=lambda layer: (layer.order, layer.name.lower(), layer.id),
             )
+            used_layer_ids = {
+                str(getattr(entity, "layer_id", ""))
+                for entity in self.controller.document.entities_by_id.values()
+            }
+            layers = [
+                layer
+                for layer in layers
+                if str(layer.id) in used_layer_ids
+                or not str((getattr(layer, "metadata", {}) or {}).get("source_kind", ""))
+            ]
+            # ``Caixa SketchBody`` is provenance for the FreeCAD snapshot,
+            # not an additional manufacturing operation. Once canonical CAM
+            # role layers exist, keep this bookkeeping row out of the compact
+            # production panel while leaving the source layer/data intact.
+            has_role_layer = any(
+                str(getattr(layer, "purpose", "") or "") in {"cut", "pocket", "drill"}
+                or str(getattr(layer, "name", "") or "") in {"Corte externo", "Corte interno", "Furos"}
+                for layer in layers
+            )
+            if has_role_layer:
+                layers = [
+                    layer
+                    for layer in layers
+                    if not (
+                        str(getattr(layer, "purpose", "") or "") == "design"
+                        and (
+                            "sketch" in str(getattr(layer, "name", "") or "").lower()
+                            or str((getattr(layer, "metadata", {}) or {}).get("source_kind", "") or "")
+                            == "freecad_import"
+                        )
+                    )
+                ]
+            # Older imports created one manufacturing layer per source board
+            # (``<source>:cut_external``).  Keep those documents compatible,
+            # but present a single semantic row for each CAM role.  The row's
+            # visibility/lock controls are applied to every underlying layer.
+            grouped = {}
             for layer in layers:
+                purpose = str(getattr(layer, "purpose", "design") or "design")
+                name = str(getattr(layer, "name", "") or "")
+                if purpose in {"cut", "pocket", "drill"} or name in {
+                    "Corte externo", "Corte interno", "Furos"
+                }:
+                    group_key = ("cam-role", purpose, name)
+                else:
+                    group_key = ("layer", str(layer.id))
+                grouped.setdefault(group_key, []).append(layer)
+            groups = sorted(
+                grouped.values(),
+                key=lambda values: (
+                    min(int(getattr(layer, "order", 0) or 0) for layer in values),
+                    str(getattr(values[0], "name", "") or "").lower(),
+                ),
+            )
+            role = qt_enum(QtCore.Qt, "UserRole", "ItemDataRole")
+            for layer_group in groups:
+                layer = layer_group[0]
+                layer_ids = tuple(str(value.id) for value in layer_group)
                 item = QtWidgets.QTreeWidgetItem(self.tree)
-                item.setData(0, qt_enum(QtCore.Qt, "UserRole", "ItemDataRole"), layer.id)
+                item.setData(0, role, layer_ids)
                 item.setText(1, layer.name)
+                if len(layer_group) > 1:
+                    item.setToolTip(
+                        1,
+                        "Camada CAM consolidada (%d origens importadas)" % len(layer_group),
+                    )
                 active = QtWidgets.QRadioButton(self.tree)
-                active.setChecked(layer.id == self.controller.document.active_layer_id)
+                active.setChecked(
+                    self.controller.document.active_layer_id in layer_ids
+                )
                 active.setToolTip("Usar para novos vetores")
                 active.toggled.connect(
-                    lambda checked, value=layer.id: self._set_active(value) if checked else None
+                    lambda checked, values=layer_ids: self._set_active(values[0])
+                    if checked else None
                 )
                 self.tree.setItemWidget(item, 0, active)
                 visible = QtWidgets.QCheckBox(self.tree)
-                visible.setChecked(layer.visible)
+                visible.setChecked(all(bool(value.visible) for value in layer_group))
                 visible.toggled.connect(
-                    lambda checked, value=layer.id: self._set_visible(value, checked)
+                    lambda checked, values=layer_ids: self._set_visible(values, checked)
                 )
                 self.tree.setItemWidget(item, 2, visible)
                 locked = QtWidgets.QCheckBox(self.tree)
-                locked.setChecked(layer.locked)
+                locked.setChecked(all(bool(value.locked) for value in layer_group))
                 locked.toggled.connect(
-                    lambda checked, value=layer.id: self._set_locked(value, checked)
+                    lambda checked, values=layer_ids: self._set_locked(values, checked)
                 )
                 self.tree.setItemWidget(item, 3, locked)
             self.tree.resizeColumnToContents(0)
@@ -80,7 +145,10 @@ class LayerPanel(QtWidgets.QGroupBox):
     def _selected_layer_id(self):
         item = self.tree.currentItem()
         role = qt_enum(QtCore.Qt, "UserRole", "ItemDataRole")
-        return item.data(0, role) if item is not None else self.controller.document.active_layer_id
+        value = item.data(0, role) if item is not None else self.controller.document.active_layer_id
+        if isinstance(value, (tuple, list)):
+            return value[0] if value else None
+        return value
 
     def _set_active(self, layer_id):
         if self._refreshing:
@@ -90,16 +158,20 @@ class LayerPanel(QtWidgets.QGroupBox):
     def _set_visible(self, layer_id, visible):
         if self._refreshing:
             return
-        self.controller.update_layer(layer_id, visible=bool(visible))
+        layer_ids = layer_id if isinstance(layer_id, (tuple, list)) else (layer_id,)
+        for value in layer_ids:
+            self.controller.update_layer(value, visible=bool(visible))
 
     def _set_locked(self, layer_id, locked):
         if self._refreshing:
             return
-        if locked and layer_id == self.controller.document.active_layer_id:
+        layer_ids = layer_id if isinstance(layer_id, (tuple, list)) else (layer_id,)
+        if locked and self.controller.document.active_layer_id in layer_ids:
             self.message.emit("Ative outra camada antes de bloquear esta.")
             self.refresh()
             return
-        self.controller.update_layer(layer_id, locked=bool(locked))
+        for value in layer_ids:
+            self.controller.update_layer(value, locked=bool(locked))
 
     def _add_layer(self):
         self.controller.add_layer()
@@ -469,6 +541,45 @@ class TransformPanel(QtWidgets.QGroupBox):
         distribute_row.addWidget(self.distribute_v_button)
         root.addLayout(distribute_row)
 
+        # O Aspire chama esta operação de Array Copy.  Ela gera vetores novos
+        # (nunca instâncias gráficas soltas) e portanto entra no Undo normal.
+        root.addWidget(QtWidgets.QLabel("Copiar em matriz", self))
+        array_grid = QtWidgets.QGridLayout()
+        array_grid.setContentsMargins(0, 0, 0, 0)
+        array_grid.addWidget(QtWidgets.QLabel("Colunas", self), 0, 0)
+        self.array_columns = QtWidgets.QSpinBox(self)
+        self.array_columns.setRange(1, 200)
+        self.array_columns.setValue(2)
+        self.array_columns.setToolTip("Quantidade total de colunas, incluindo o original")
+        array_grid.addWidget(self.array_columns, 0, 1)
+        array_grid.addWidget(QtWidgets.QLabel("Linhas", self), 0, 2)
+        self.array_rows = QtWidgets.QSpinBox(self)
+        self.array_rows.setRange(1, 200)
+        self.array_rows.setValue(1)
+        self.array_rows.setToolTip("Quantidade total de linhas, incluindo o original")
+        array_grid.addWidget(self.array_rows, 0, 3)
+        array_grid.addWidget(QtWidgets.QLabel("ΔX", self), 1, 0)
+        self.array_dx = QtWidgets.QDoubleSpinBox(self)
+        self.array_dx.setRange(-1000000.0, 1000000.0)
+        self.array_dx.setDecimals(3)
+        self.array_dx.setValue(100.0)
+        self.array_dx.setSuffix(" mm")
+        array_grid.addWidget(self.array_dx, 1, 1)
+        array_grid.addWidget(QtWidgets.QLabel("ΔY", self), 1, 2)
+        self.array_dy = QtWidgets.QDoubleSpinBox(self)
+        self.array_dy.setRange(-1000000.0, 1000000.0)
+        self.array_dy.setDecimals(3)
+        self.array_dy.setValue(0.0)
+        self.array_dy.setSuffix(" mm")
+        array_grid.addWidget(self.array_dy, 1, 3)
+        root.addLayout(array_grid)
+        self.array_button = QtWidgets.QPushButton("Copiar matriz", self)
+        self.array_button.setToolTip(
+            "Cria cópias exatas da seleção; furos e recortes de uma peça agrupada acompanham a chapa."
+        )
+        self.array_button.clicked.connect(self._copy_array)
+        root.addWidget(self.array_button)
+
         controller.selection.subscribe(lambda _ids: self.refresh())
         controller.subscribe_document(lambda _change=None: self.refresh())
         self.refresh()
@@ -482,14 +593,34 @@ class TransformPanel(QtWidgets.QGroupBox):
             self.message.emit("Transformação não aplicada: %s" % error)
         self.refresh()
 
+    def _copy_array(self):
+        columns = self.array_columns.value()
+        rows = self.array_rows.value()
+        if columns * rows < 2:
+            self.message.emit("Informe ao menos 2 posições na matriz.")
+            return
+        self._run(
+            self.controller.array_copy_selection,
+            columns,
+            rows,
+            self.array_dx.value(),
+            self.array_dy.value(),
+        )
+
     def refresh(self):
         count = len(self.controller.selection)
         for button in (self.rotate_button, self.mirror_h_button, self.mirror_v_button):
             button.setEnabled(count >= 1)
+        work_area_available = self.controller.document.work_area is not None
         for button in self.align_buttons:
-            button.setEnabled(count >= 2)
+            button.setEnabled(count >= 2 or (count == 1 and work_area_available))
+            if count == 1 and work_area_available:
+                button.setToolTip("Alinhar o vetor selecionado à área de Trabalho")
+            else:
+                button.setToolTip("Alinhar os vetores selecionados entre si")
         self.distribute_h_button.setEnabled(count >= 3)
         self.distribute_v_button.setEnabled(count >= 3)
+        self.array_button.setEnabled(count >= 1)
 
 
 class ModifierParametersPanel(QtWidgets.QGroupBox):
@@ -536,6 +667,24 @@ class ModifierParametersPanel(QtWidgets.QGroupBox):
             "Escolhe qual trecho do contorno fechado será mantido na emenda."
         )
         form.addRow("Rota da emenda", self.splice_route)
+        # This tolerance belongs to the endpoint-join tools.  Keep it beside
+        # the active repair parameters instead of consuming the permanent
+        # Editor toolbar with a control that is unrelated to most operations.
+        self.join_tolerance_row = QtWidgets.QWidget(self)
+        join_layout = QtWidgets.QHBoxLayout(self.join_tolerance_row)
+        join_layout.setContentsMargins(0, 0, 0, 0)
+        self.join_tolerance = QtWidgets.QDoubleSpinBox(self.join_tolerance_row)
+        self.join_tolerance.setRange(0.001, 1000.0)
+        self.join_tolerance.setDecimals(3)
+        self.join_tolerance.setValue(0.2)
+        self.join_tolerance.setSuffix(" mm")
+        self.join_tolerance.setToolTip(
+            "Tolerância para unir pontas; não é o raio de captura do mouse."
+        )
+        join_layout.addWidget(QtWidgets.QLabel("Tolerância unir", self.join_tolerance_row))
+        join_layout.addWidget(self.join_tolerance, 1)
+        form.addRow(self.join_tolerance_row)
+        self.join_tolerance_row.hide()
         self.info_label = QtWidgets.QLabel(
             "Passe o mouse na geometria; magenta é somente prévia. Clique aplica.", self
         )
@@ -553,6 +702,7 @@ class ModifierParametersPanel(QtWidgets.QGroupBox):
         self.contour_role.currentIndexChanged.connect(self._emit)
         self.tbone_side.currentIndexChanged.connect(self._emit)
         self.splice_route.currentIndexChanged.connect(self._emit)
+        self.join_tolerance.valueChanged.connect(self._emit)
 
     def parameters(self):
         return {
@@ -561,6 +711,7 @@ class ModifierParametersPanel(QtWidgets.QGroupBox):
             "contour_role": str(self.contour_role.currentData()),
             "tbone_side": str(self.tbone_side.currentData()),
             "splice_route": str(self.splice_route.currentData()),
+            "join_tolerance": float(self.join_tolerance.value()),
         }
 
     def _emit(self, *_args):
@@ -576,12 +727,16 @@ class ModifierParametersPanel(QtWidgets.QGroupBox):
             "dogbone": "Dogbone: aponte o canto; o papel interno/externo é detectado pela peça.",
             "tbone": "T-bone: aponte o canto; escolha o lado ou mantenha Automático.",
             "join_endpoints": "Unir 2 pontas: clique uma ponta e depois a ponta exata do outro caminho.",
+            "join_endpoints_smooth": "Unir 2 pontas suave: preserva as pontas e cria uma curva tangente entre elas.",
             "connect": "Projetar ponta: clique a ponta fonte; depois uma reta, arco ou círculo alvo.",
             "splice": "Emendar: clique o caminho aberto; depois escolha o contorno alvo.",
             "auto_dogbone": "Dogbone automático: revise a prévia total e confirme.",
             "auto_tbone": "T-bone automático: revise a prévia total e confirme.",
         }
         self.info_label.setText(messages.get(value, "Magenta é prévia; clique aplica; Esc cancela."))
+        self.join_tolerance_row.setVisible(
+            value in ("join_endpoints", "join_endpoints_smooth")
+        )
         automatic = value in ("auto_dogbone", "auto_tbone")
         self.apply_automatic_button.setVisible(automatic)
         if not automatic:

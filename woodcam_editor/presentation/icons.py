@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from .compat import QtCore, QtGui, qt_enum
 
 
@@ -72,12 +74,38 @@ def tool_icon(name, size=24):
         painter.drawArc(QtCore.QRectF(3 * s, 4 * s, 18 * s, 17 * s), 20 * 16, 235 * 16)
         _node(painter, 20.4 * s, 8.2 * s, 3.0 * s)
         _node(painter, 5.5 * s, 18.2 * s, 3.0 * s)
+    elif name == "bezier":
+        path = QtGui.QPainterPath(point(3, 18))
+        path.cubicTo(point(7, 2), point(17, 22), point(21, 6))
+        painter.drawPath(path)
+        helper = QtGui.QPen(QtGui.QColor("#94a3b8"), max(1.0, size / 22.0))
+        helper.setStyle(qt_enum(QtCore.Qt, "DashLine", "PenStyle"))
+        painter.save()
+        painter.setPen(helper)
+        painter.drawLine(point(3, 18), point(7, 2))
+        painter.drawLine(point(21, 6), point(17, 22))
+        painter.restore()
+        for value in (point(3, 18), point(7, 2), point(17, 22), point(21, 6)):
+            _node(painter, value.x(), value.y(), 2.8 * s)
     elif name == "polygon":
         points = (
             point(12, 3), point(21, 10), point(17, 20),
             point(7, 20), point(3, 10), point(12, 3),
         )
         painter.drawPolyline(QtGui.QPolygonF(points))
+    elif name == "star":
+        points = []
+        for index in range(11):
+            radius = 9.0 if index % 2 == 0 else 4.0
+            angle = -math.pi / 2.0 + index * math.pi / 5.0
+            points.append(point(12 + radius * math.cos(angle), 12 + radius * math.sin(angle)))
+        painter.drawPolyline(QtGui.QPolygonF(points))
+    elif name == "text":
+        text_font = QtGui.QFont()
+        text_font.setBold(True)
+        text_font.setPixelSize(max(11, int(16 * s)))
+        painter.setFont(text_font)
+        painter.drawText(QtCore.QRectF(3 * s, 3 * s, 18 * s, 18 * s), "T")
     elif name in ("undo", "redo"):
         painter.drawArc(QtCore.QRectF(5 * s, 5 * s, 14 * s, 14 * s), 35 * 16, 250 * 16)
         if name == "undo":

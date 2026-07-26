@@ -31,6 +31,13 @@ organizar na área de Trabalho
 usar em Corte/Furo/Preenchimento ou enviar ao PanelNest
 ```
 
+O menu `CAM` do Editor também oferece `Ver percurso de Corte aqui`. Ele projeta
+na própria área 2D os mesmos movimentos XY que serão emitidos no G-code
+(vermelho = corte, laranja = entrada/descida, cinza tracejado = rápido), sem
+criar entidades, alterar vetores, mudar a seleção ou recalcular a operação.
+Uma mutação geométrica ou de camada remove a sobreposição imediatamente, para
+que um percurso antigo nunca pareça válido sobre um desenho novo.
+
 ## 2. Contrato de interação implementado
 
 - um clique seleciona o vetor inteiro;
@@ -104,10 +111,15 @@ continuam usando a persistência já existente do WoodCAM.
 Ferramentas disponíveis:
 
 - linha e polilinha aberta/fechada;
+- texto por fonte instalada, convertido explicitamente em contornos fechados
+  e agrupados para que letras/vazados possam mover e usinar como uma unidade;
+  o grupo preserva as configurações para permitir edição posterior de texto,
+  fonte, altura e estilo em um único Undo;
 - retângulo/quadrado;
 - círculo e elipse;
 - arco por três pontos;
 - triângulo e polígono de 3 a 64 lados;
+- estrela paramétrica de 3 a 64 pontas, com profundidade interna ajustável;
 - balão com comprimento, delta X/Y, ângulo, raio/diâmetro ou largura/altura;
 - painel numérico de X, Y, largura e altura independentes; proporção opcional
   conduzida pela última dimensão editada; raio/diâmetro de círculo e raios X/Y
@@ -142,6 +154,12 @@ local. Ele informa:
 - entidades fora da área de Trabalho;
 - peças desatualizadas/incompletas.
 
+Importações diretas de Assembly e PanelNest carregam um escopo de instância
+física por chapa. Diagnóstico e validação não comparam vetores de instâncias
+diferentes como se pertencessem à mesma peça: cópias idênticas, contatos e
+interseções entre chapas distintas deixam de gerar bloqueios falsos, enquanto
+o mesmo conjunto de verificações continua integral dentro de cada chapa.
+
 `Limpar sobrelinhas/duplicados…` transforma as sugestões conservadoras numa
 operação preview-first sobre todo o desenho desbloqueado: remove cópias exatas
 e caminhos abertos cujos spans já estão integralmente cobertos por um mesmo
@@ -159,6 +177,14 @@ bloqueados como fonte CAM enquanto ainda se tocam.
 Reparos e modificadores:
 
 - fechar pontas dentro da tolerância;
+- unir em lote vetores abertos selecionados dentro da tolerância, preservando
+  lacunas maiores e mostrando uma prévia antes de um único Undo;
+- `Subtrair vetores (criar furo/recorte interno)` diferencia com clareza a
+  união lógica de uma chapa com um furo distante do simples fechamento de
+  vetores: o contorno interno permanece exato e separado geometricamente, mas
+  é agrupado com o externo para seleção, movimentação, organização e CAM;
+  `Soldar vetores` continua reservado a perfis fechados que realmente se
+  sobrepõem;
 - unir duas pontas explicitamente escolhidas em caminhos diferentes; pontas
   coincidentes são fundidas e lacunas maiores recebem uma reta sem deformação;
 - projetar uma ponta numa reta, arco ou círculo alvo, com aviso de ramificação;
@@ -170,6 +196,12 @@ Reparos e modificadores:
 - filete normal;
 - dogbone e T-bone manual;
 - dogbone e T-bone automático.
+
+O snap inteligente acompanha a criação a partir do último ponto confirmado:
+horizontal, vertical, ângulo configurável, perpendicular em vetores finitos e
+arcos, e tangência em círculos/arcos. São somente alvos transitórios na prévia
+do cursor — não são restrições ocultas nem alteram o documento até o clique
+que confirma a ferramenta.
 
 O modo automático usa peças/árvore de contenção para distinguir externo e
 interno. Só aceita cantos internos lineares de 90 graus; funciona em orientação
@@ -227,6 +259,12 @@ bordas e spacing, movem externo e internos como unidade e mostram o destino em
 magenta sobre a posição azul atual. `Aplicar organização` confirma todo o plano
 em um comando; Cancelar/Esc não altera nada.
 
+Quando a organização precisar de mais de uma chapa, cada área virtual recebe
+um rótulo visual `Chapa 01`, `Chapa 02` etc. (ou `— prévia` em magenta antes da
+confirmação). Esses rótulos são apenas apresentação: não são vetores, não
+entram em seleção, CAM ou G-code e continuam sendo reconstruídos somente a
+partir dos limites de chapa persistidos no documento.
+
 Quantidades adicionais não são duplicadas no canvas. Elas são replicadas na
 ponte PanelNest, evitando transformar o documento de desenho em um layout de
 produção.
@@ -244,11 +282,12 @@ referência. Se a geometria usada por uma operação aplicada muda, ela recebe
 `stale` e aparece como desatualizada; o G-code fica bloqueado até reaplicar.
 
 A instalação real do PanelNest não oferece uma API pública capaz de receber
-arbitrários recortes internos. A ponte implementada cria no FCStd o grupo
-`WoodCAM2DPanelNestExchange`, com uma `Part::Feature` por ocorrência, `Shape`
-física já subtraída pelos internos e manifesto JSON completo. O PanelNest pode
-reconhecer essas ocorrências sem perder furos/recortes. A integração é opcional,
-lazy e transacional.
+arbitrários recortes internos. A ponte implementada cria em `WoodCAM → Peças`
+uma `Part::Feature` por ocorrência, `Shape` física já subtraída pelos internos
+e manifesto JSON completo. Documentos antigos que possuam
+`WoodCAM2DPanelNestExchange` são migrados sem recriar as Shapes. O PanelNest
+pode reconhecer essas ocorrências sem perder furos/recortes. A integração é
+opcional, lazy e transacional.
 
 O intercâmbio preserva a pose do Editor: cada shape local recebe `Placement`
 em X/Y, rotação já incorporada ao perfil e Z=0. O manifesto usa
@@ -341,7 +380,10 @@ manifesto, ocorrências, internos e reabertura.
 - offset fechado está limitado ao caso linear/miter validado;
 - splice aceita reta, arco, círculo e elipse circular; elipse geral é rejeitada;
 - dogbone/T-bone automático aceita somente cantos internos lineares de 90°;
-- Bézier cúbica é modelada/importada, mas não possui botão de desenho dedicado;
+- Bézier cúbica é modelada/importada e pode ser criada pela ferramenta própria
+  de quatro pontos (início, controle 1, controle 2 e fim). No modo Nós, os
+  dois controles aparecem em azul com guias tracejadas e podem ser arrastados
+  com prévia/Snap e um único Undo, preservando a curva exata;
 - vetorização colorida por paleta/união de cores e recorte de uma subárea da
   imagem ainda não têm a paridade completa do Aspire; a entrega atual cobre
   máscara preto/branco com ajustes e curvas Potrace;
@@ -927,3 +969,160 @@ do Aspire: perfil, cavidade, matriz de furos, desbaste em níveis e superfície
 lisa. Trabalho e Material não foram modificados; Fresas, Editor 2D e
 Simulação/Salvar mantêm seus ícones próprios por não terem equivalentes diretos
 na folha.
+
+### XY absoluto do CAM 3D e árvore única — 26 de julho de 2026
+
+O datum da área de Trabalho passou a ter um contrato único para 2D e 3D: ele
+define o ponto inicial/retorno da máquina, mas não reposiciona o modelo nem o
+percurso de corte. A superfície 3D e seus movimentos permanecem no XY absoluto
+do documento. Foi removida a cópia vetorial deslocada que confundia área,
+fonte e trajetória na prévia.
+
+O adaptador FreeCAD distinguia incorretamente a tesselação de `Part::Feature`
+da topologia de `Mesh::Feature`. `TopoShape.tessellate()` já inclui o
+`Placement`; aplicá-lo novamente duplicava o deslocamento XY — uma peça em
+X=240 produzia percurso em X=480. Shapes agora usam diretamente os pontos
+tesselados, enquanto malhas continuam recebendo seu `Placement` uma única vez.
+O smoke real cobre tanto malha com coordenadas absolutas quanto Shape local
+deslocada por `Placement`, além do rápido inicial partindo do datum configurado.
+
+O cálculo desse rápido já estava correto, porém a etapa final da prévia 3D
+reconstruía cada ponto somente como `(X, Y)` e descartava `Z`. Como o overlay
+Coin3D exige pontos `(X, Y, Z)`, ele ignorava silenciosamente toda a trajetória:
+o Editor 2D exibia a ligação magenta e a vista 3D não mostrava nada. A projeção
+agora preserva todas as coordenadas e destaca somente a ligação inicial
+datum → primeira peça com uma linha magenta tracejada. O smoke de XY passou a
+inspecionar também o buffer efetivamente entregue ao scene graph, evitando que
+um cálculo correto esconda novamente uma falha de renderização.
+
+O fluxo completo `Editor 2D → PanelNest → Corte` revelou ainda uma segunda
+transformação independente: a peça materializada pela ponte já preservava o
+XY final do Editor, mas, ao ser lida novamente como uma seleção genérica do
+FreeCAD, recebia outra ancoragem no datum e o corte era trazido para o zero.
+Objetos `panel_part`, a pasta de intercâmbio e `layout_cam_compound` agora são
+reconhecidos como fontes em coordenadas finais. A pasta resolve somente seus
+filhos CAM, e prévia, aplicação e G-code recebem deslocamento XY nulo. O smoke
+da interface reproduz esse caminho com a peça em X/Y deslocados e compara o
+envelope integral dos movimentos de corte.
+
+A árvore do FCStd também foi consolidada em uma única raiz:
+
+```text
+WoodCAM
+├── Peças
+├── Operações
+└── Área de trabalho
+```
+
+Os grupos antigos de desenho e intercâmbio PanelNest são migrados preservando
+filhos, Shapes, IDs e manifesto. O objeto `VectorDocument` continua sendo a
+fonte de verdade, porém fica oculto na árvore como infraestrutura interna. A
+migração muda somente a organização visual; não altera Sketch, Shape nem o
+arquivo de origem importado.
+
+Validação desta entrega: **228 testes puros do Editor** (dois ignorados pelo
+runtime opcional sem OpenCV), **51 testes Qt**, **87 testes gerais**, compilação
+dos módulos alterados e smokes FreeCADCmd específicos de XY 3D, árvore,
+PanelNest e CAM 3D aprovados.
+
+### Datum sem translação, janela destacável e simulação leve — 26 de julho de 2026
+
+A exceção que ainda reancorava Sketches, faces e Parts comuns foi removida. O
+contrato agora não depende da origem da seleção: todos os adapters entregam
+coordenadas de documento; `_xy_origin_offset` permanece nulo; e o datum da área
+de Trabalho entra apenas no primeiro movimento e no retorno opcional. O smoke
+da interface cobre separadamente Editor 2D, peça materializada pelo PanelNest,
+seleção FreeCAD comum e Preenchimento/Rebaixo deslocado, conferindo o envelope
+XY integral da usinagem.
+
+Aplicar Trabalho não consulta mais o leitor de superfícies 3D. `Aplicar` grava
+diretamente um único limite e um único datum na pasta canônica `Área de
+trabalho`; `Pré-visualizar` usa o grupo temporário claramente chamado `Prévia
+da configuração`. A simulação passou para `WoodCAM → Operações → Simulação`, e
+documentos antigos com o grupo solto são reparentados sem alterar seus objetos.
+
+O Editor 2D ganhou um botão no canto direito da barra de abas que move a mesma
+instância para uma janela nativa não modal. Ao fechar, o widget é recolocado na
+aba; não há cópia de `VectorDocument`, controller, seleção nem histórico. A
+régua vertical aproxima os números da borda esquerda na mesma proporção visual
+da régua superior.
+
+Preenchimento/Rebaixo agora usa a linha do tempo compacta e o overlay Coin
+integral já empregado pelo Corte. A trajetória é enviada uma vez ao scene
+graph e somente a fresa é interpolada; a lista persistida/G-code não é
+amostrada nem simplificada.
+
+Validação após estas correções: **228 testes puros** (dois ignorados por OpenCV
+opcional), **51 testes Qt**, **87 testes gerais** e **12 smokes FreeCADCmd**
+aprovados, incluindo os casos XY 3D, árvore, Sketch/Part comum, PanelNest,
+rebaixo e janela destacável.
+
+### Régua compacta, furos tessellados e percursos 2D — 26 de julho de 2026
+
+A régua vertical passou a ter os mesmos 22 px de espessura da régua horizontal.
+Número e traço permanecem associados dentro dessa faixa; o canto das duas
+réguas também é 22 × 22 px, eliminando o antigo corredor vazio de 38 px.
+
+A ponte Editor → PanelNest agora recupera como furo um círculo pequeno que uma
+importação tenha convertido em polilinha. A promoção exige caminho fechado,
+pelo menos doze vértices, diâmetro de até 12 mm, caixa quase quadrada e raio
+quase constante depois do `placement`. Formas pequenas não circulares continuam
+como recortes internos. O smoke real do PanelNest cobre simultaneamente um
+`CircleEntity` e um círculo tessellado, ambos vinculados à mesma peça.
+
+O antigo comando exclusivo `Ver corte 2D` virou uma única entrada
+`Percursos 2D`. Corte, Furos e Rebaixo reutilizam as configurações e listas de
+movimentos de produção já existentes; o Editor recebe somente um overlay
+descartável. O menu `CAM` também permite abrir diretamente a configuração de
+cada operação, sem acrescentar novos botões à faixa inferior.
+
+Validação desta correção: **229 testes puros** (dois ignorados por OpenCV
+opcional), **53 testes Qt**, **87 testes gerais** e **12 smokes FreeCADCmd**
+aprovados.
+
+### Roteamento de Furo e reconhecimento parcial seguro — 26 de julho de 2026
+
+O comando de configuração do percurso deixou de procurar a aba pelo texto
+visível. Corte, Furo e Rebaixo agora são encaminhados pelo identificador estável
+de operação; com isso, `Furos` no menu encontra corretamente a aba `Furo` e a
+operação pode ser configurada, aplicada e persistida.
+
+O reconhecimento de `Piece2D` também deixou de tratar um caminho aberto
+independente como falha global. Contornos fechados válidos são reconhecidos e
+podem seguir ao PanelNest, enquanto o caminho aberto permanece intacto no
+`VectorDocument`, visível no diagnóstico e fora de qualquer peça. Interseções,
+auto-interseções, ramificações e demais bloqueios geométricos reais continuam
+impedindo o envio. Quando o reconhecimento falha, a ponte preserva a causa
+detalhada em vez de substituí-la pela mensagem genérica de ausência de peça.
+
+Regressão coberta pelo smoke da interface com a diferença singular/plural da
+aba de Furo e com um documento que contém simultaneamente uma peça fechada
+válida e um caminho aberto independente. Validação: **229 testes puros** (dois
+ignorados por OpenCV opcional), **53 testes Qt**, **87 testes gerais** e **12
+smokes FreeCADCmd** aprovados.
+
+### Intercâmbio PanelNest sempre atual e integral — 26 de julho de 2026
+
+O desaparecimento de painéis e furos no caminho `Editor 2D → PanelNest` tinha
+duas causas independentes. `Piece2D` é uma fotografia das relações topológicas:
+se um painel, cópia ou furo fosse importado/desenhado depois do último
+reconhecimento, o envio reutilizava a fotografia antiga. Além disso, qualquer
+seleção residual no canvas restringia silenciosamente o intercâmbio somente às
+peças relacionadas à seleção, embora o comando se chamasse `Enviar PanelNest`
+e não `Enviar seleção`.
+
+Antes de cada envio, o WoodCAM agora reclassifica os vetores atuais por um
+comando atômico e então materializa o layout inteiro. A seleção continua sendo
+apenas estado de interface: ela nunca elimina peças do intercâmbio. Furos e
+recortes internos permanecem descendentes da peça externa, quantidades geram
+as ocorrências esperadas e o XY/rotação do Editor continua preservado sem
+executar nesting. O status final expõe quantas peças, ocorrências, perfurações e
+recortes foram efetivamente produzidos.
+
+O smoke real da interface cria uma peça e um círculo interno depois de já
+existir uma classificação, mantém somente esses dois vetores selecionados e
+confere no manifesto do FreeCAD que todas as peças do documento foram enviadas,
+que o círculo tardio chegou como furo e que nenhum objeto ficou fora da pasta
+de intercâmbio. Validação: **229 testes puros** (dois ignorados por OpenCV
+opcional), **53 testes Qt**, **87 testes gerais** e **12 smokes FreeCADCmd**
+aprovados.
