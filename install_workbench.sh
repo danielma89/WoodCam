@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-WORKBENCH_NAME="WoodCAM2D"
+WORKBENCH_NAME="PanelNest"
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_MOD_DIR="$HOME/.local/share/FreeCAD/Mod"
 TARGET_DIRS=("${FREECAD_MOD_DIR:-$DEFAULT_MOD_DIR}")
@@ -15,9 +15,9 @@ for arg in "$@"; do
             cat <<'EOF'
 Uso: ./install_workbench.sh [--with-ai|--without-ai]
 
-Instala somente o WoodCAM por padrão e pergunta se a IA opcional de relevo
-deve ser instalada. --with-ai aceita a instalação automaticamente; --without-ai
-instala apenas a bancada.
+Instala a bancada única PanelNest, já com Editor 2D, WoodCAM e CAM. O instalador
+pergunta se a IA opcional de relevo deve ser instalada. --with-ai aceita a
+instalação automaticamente; --without-ai instala a bancada sem essa IA.
 EOF
             exit 0
             ;;
@@ -29,15 +29,27 @@ EOF
 done
 
 for versioned_mod_dir in "$HOME"/.local/share/FreeCAD/v*/Mod; do
-    if [[ -d "$versioned_mod_dir" ]]; then
-        TARGET_DIRS+=("$versioned_mod_dir")
-    fi
+    version_name="$(basename "$(dirname "$versioned_mod_dir")")"
+    [[ "$version_name" =~ ^v[0-9]+-[0-9]+$ ]] || continue
+    [[ -d "$versioned_mod_dir" ]] && TARGET_DIRS+=("$versioned_mod_dir")
 done
 
 for mod_dir in "${TARGET_DIRS[@]}"; do
     mkdir -p "$mod_dir"
-    ln -sfn "$SOURCE_DIR" "$mod_dir/$WORKBENCH_NAME"
-    echo "WoodCAM 2D instalado em: $mod_dir/$WORKBENCH_NAME"
+    target="$mod_dir/$WORKBENCH_NAME"
+    if [[ -e "$target" && ! -L "$target" ]]; then
+        echo "Conflito: já existe uma pasta real em $target" >&2
+        echo "Renomeie essa instalação antiga antes de continuar." >&2
+        exit 1
+    fi
+    ln -sfn "$SOURCE_DIR" "$target"
+
+    legacy_target="$mod_dir/WoodCAM2D"
+    if [[ -L "$legacy_target" && "$(readlink -f "$legacy_target")" == "$SOURCE_DIR" ]]; then
+        rm "$legacy_target"
+        echo "Atalho antigo WoodCAM2D removido: agora há uma única bancada."
+    fi
+    echo "PanelNest/WoodCAM instalado em: $target"
 done
 
 if command -v freecadcmd >/dev/null 2>&1; then
@@ -45,9 +57,11 @@ if command -v freecadcmd >/dev/null 2>&1; then
 import FreeCAD
 
 param = FreeCAD.ParamGet('User parameter:BaseApp/Preferences/Workbenches')
-name = 'WoodCAM2DWorkbench'
+name = 'PanelNestWorkbench'
+legacy_name = 'WoodCAM2DWorkbench'
 ordered = [item for item in param.GetString('Ordered', '').split(',') if item]
-disabled = [item for item in param.GetString('Disabled', '').split(',') if item and item != name]
+ordered = [item for item in ordered if item != legacy_name]
+disabled = [item for item in param.GetString('Disabled', '').split(',') if item and item not in (name, legacy_name)]
 
 if name not in ordered:
     ordered.append(name)
@@ -55,13 +69,13 @@ if name not in ordered:
 param.SetString('Ordered', ','.join(ordered))
 param.SetString('Disabled', ','.join(disabled))
 FreeCAD.saveParameter()
-print('WoodCAM 2D registrado nas preferencias de workbenches.')
+print('PanelNest/WoodCAM registrado como bancada unica nas preferencias.')
 "
 else
     echo "Aviso: freecadcmd nao encontrado; a bancada foi instalada, mas nao foi adicionada a lista ordenada."
 fi
 
-echo "Reinicie o FreeCAD e selecione a bancada 'WoodCAM 2D'."
+echo "Reinicie o FreeCAD e selecione a bancada 'PanelNest'. O WoodCAM fica no menu CAM."
 
 if [[ "$AI_MODE" == "ask" && -t 0 ]]; then
     echo ""

@@ -5,8 +5,8 @@
 
 **Data da decisão:** 12 de julho de 2026  
 **Código-fonte ativo:** `/home/danielma/Projetos/CNC Marcenaria`  
-**Instalação ativa do FreeCAD:** symlink `~/.local/share/FreeCAD/Mod/WoodCAM2D`
-apontando para o código-fonte acima  
+**Instalação ativa do FreeCAD:** symlink `~/.local/share/FreeCAD/Mod/PanelNest`
+apontando para o código-fonte unificado acima
 **Estado:** implementação de produção concluída no pacote `woodcam_editor/`;
 validação automatizada aprovada e pronta para rodada manual no FreeCAD GUI  
 **Documento para a próxima IA:** leia tudo antes de editar qualquer arquivo.
@@ -1822,11 +1822,9 @@ IDs alterados.
 - manter fallback PySide6/PySide2/PySide enquanto as versões suportadas do
   FreeCAD não forem formalmente reduzidas;
 - centralizar diferenças de enums/sinais Qt num módulo de compatibilidade;
-- não assumir que o PanelNest está instalado;
-- WoodCAM sozinho continua mostrando sua bancada;
-- com PanelNest, WoodCAM continua como botão/integrado conforme comportamento
-  existente;
-- código e assets permanecem dentro da pasta copiável `WoodCAM2D`;
+- PanelNest e WoodCAM são uma única distribuição e uma única bancada;
+- o WoodCAM continua como botão integrado no menu CAM do PanelNest;
+- código e assets permanecem dentro da pasta copiável `PanelNest`;
 - nenhuma configuração pessoal deve ser embutida no pacote.
 
 ### 22.3 Dados do usuário
@@ -1918,7 +1916,7 @@ O Editor 2D será considerado pronto para produção quando:
 - [x] edição marca derivados CAM como stale;
 - [x] testes puros, Qt e FreeCAD cobrem fluxos críticos;
 - [x] funções antigas do WoodCAM continuam verdes;
-- [x] instalação continua sendo apenas copiar pastas para `Mod`;
+- [x] instalação continua sendo apenas copiar uma pasta para `Mod`;
 - [x] dados vetoriais, preferências e ferramentas persistem ao reiniciar.
 
 ---

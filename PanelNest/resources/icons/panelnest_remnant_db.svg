@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Chapa de fundo -->
+  <path d="M8 20h32l8-8H16z" fill="#eef6fb" stroke="#262d33" stroke-width="2.5" stroke-linejoin="round"/>
+  <path d="M8 20v16h32V20" fill="#cce4f1" stroke="#262d33" stroke-width="2.5" stroke-linejoin="round"/>
+  <!-- Símbolo de banco de dados (cilindro) -->
+  <ellipse cx="46" cy="42" rx="11" ry="4.5" fill="#a8d5a2" stroke="#2d5a27" stroke-width="2"/>
+  <rect x="35" y="42" width="22" height="10" fill="#c2e6bc" stroke="none"/>
+  <ellipse cx="46" cy="52" rx="11" ry="4.5" fill="#a8d5a2" stroke="#2d5a27" stroke-width="2"/>
+  <line x1="35" y1="42" x2="35" y2="52" stroke="#2d5a27" stroke-width="2"/>
+  <line x1="57" y1="42" x2="57" y2="52" stroke="#2d5a27" stroke-width="2"/>
+  <ellipse cx="46" cy="46" rx="11" ry="4.5" fill="none" stroke="#2d5a27" stroke-width="1.5" stroke-dasharray="3,2"/>
+</svg>

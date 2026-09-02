@@ -1,15 +1,22 @@
-<?xml version="1.0" encoding="UTF-8"?>
+<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
 <package format="1" xmlns="https://wiki.freecad.org/Package_Metadata">
-  <name>WoodCAM2D</name>
-  <description>Workbench simples para gerar G-code 2.5D de marcenaria no FreeCAD.</description>
-  <version>0.1.0</version>
-  <date>2026-06-08</date>
-  <icon>Resources/icons/woodcam2d.svg</icon>
-  <license>MIT</license>
+  <name>PanelNest</name>
+  <description>Bancada única de marcenaria para FreeCAD: projeto, nesting de chapas, Editor 2D, CAM e G-code CNC.</description>
+  <version>1.0.0</version>
+  <date>2026-09-01</date>
+  <maintainer email="danielma89@users.noreply.github.com">danielma89</maintainer>
+  <license file="LICENSE">MIT</license>
+  <url type="repository" branch="main">https://github.com/danielma89/WoodCam</url>
+  <url type="bugtracker">https://github.com/danielma89/WoodCam/issues</url>
+  <url type="readme">https://github.com/danielma89/WoodCam/blob/main/README.md</url>
+  <icon>PanelNest/resources/icons/panelnest_workbench.svg</icon>
+  <pythonmin>3.8</pythonmin>
   <content>
     <workbench>
-      <classname>WoodCAM2DWorkbench</classname>
-      <subdirectory>.</subdirectory>
+      <name>PanelNest</name>
+      <subdirectory>./</subdirectory>
+      <icon>PanelNest/resources/icons/panelnest_workbench.svg</icon>
+      <classname>PanelNestWorkbench</classname>
     </workbench>
   </content>
 </package>

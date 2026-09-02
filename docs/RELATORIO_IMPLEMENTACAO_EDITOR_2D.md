@@ -2,8 +2,8 @@
 
 **Data:** 12 de julho de 2026  
 **Código ativo:** `/home/danielma/Projetos/CNC Marcenaria`  
-**Instalação ativa:** `~/.local/share/FreeCAD/Mod/WoodCAM2D` aponta para o
-código acima  
+**Instalação ativa:** `~/.local/share/FreeCAD/Mod/PanelNest` aponta para o
+código unificado acima
 **FreeCAD validado:** 1.1.1, Python 3.14, PySide6
 
 Este documento registra o resultado entregue. O plano mestre continua sendo o
@@ -3451,3 +3451,30 @@ contornos de peça, conforme o contrato exibido no README.
 
 Próximo passo permitido: reiniciar o FreeCAD e repetir `Ctrl+A → Usar Editor 2D
 como fonte → Corte` no arquivo real.
+
+### Distribuição unificada PanelNest/WoodCAM — 1º de setembro de 2026
+
+A auditoria do clone público encontrou uma dependência de instalação que os
+testes anteriores não revelavam: o repositório WoodCAM não continha o núcleo
+PanelNest e o FreeCAD da máquina carregava esse núcleo por um segundo symlink.
+Assim, um clone novo podia aprovar os testes locais e ainda não oferecer a
+bancada completa em outro computador.
+
+O núcleo PanelNest de produção, seus comandos, ícones, testes e relatórios
+foram incorporados ao mesmo repositório. `InitGui.py` agora registra somente
+`PanelNestWorkbench`; o comando `PanelNest → CAM → WoodCAM 2D` encontra `ui.py`
+na raiz do próprio clone. O instalador cria apenas `Mod/PanelNest`, remove
+somente o symlink legado `WoodCAM2D` quando ele aponta para esse mesmo checkout
+e ignora diretórios de backup que apenas começam com `v`. `package.xml`, o ZIP
+portátil e as instruções de instalação descrevem a mesma distribuição única.
+
+Foi acrescentado `run_unified_workbench_smoke.py`. O teste copiou o repositório
+para um diretório temporário, usou um HOME vazio e instalou somente um symlink
+`PanelNest`. No FreeCAD GUI offscreen, a bancada foi ativada e o teste confirmou
+que `panelnest/__init__.py` e `ui.py` vieram do mesmo clone temporário, que o
+comando WoodCAM foi registrado e que não apareceu `WoodCAM2DWorkbench`.
+
+Validação após a unificação: **165 testes PanelNest**, **410 testes puros do
+Editor** (dois opcionais ignorados), **83 testes Qt offscreen**, **161 testes
+gerais**, **15 smokes FreeCADCmd**, smoke isolado da bancada unificada,
+compilação integral e verificação de whitespace aprovados no FreeCAD 1.1.3.

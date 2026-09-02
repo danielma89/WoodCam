@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+.DS_Store
+.pytest_cache/
+*.FCStd1
+*.FCBak
+*.FCStd
+.vscode/
+.claude/

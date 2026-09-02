@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Documento (base L) -->
+  <path d="M12 18v34h38" fill="none" stroke="#2b3137" stroke-width="4.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M12 18h17" fill="none" stroke="#2b3137" stroke-width="4.4" stroke-linecap="round"/>
+  <!-- Seta horizontal entrando da direita para dentro do documento -->
+  <path d="M56 32H26" fill="none" stroke="#27ae60" stroke-width="5.4" stroke-linecap="round"/>
+  <path d="M36 22l-14 10 14 10" fill="none" stroke="#27ae60" stroke-width="5.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Brilho -->
+  <path d="M56 32H26" fill="none" stroke="#a8e6c1" stroke-width="2.2" stroke-linecap="round" opacity="0.9"/>
+  <path d="M36 22l-14 10 14 10" fill="none" stroke="#a8e6c1" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" opacity="0.9"/>
+  <!-- Linha CSV -->
+  <path d="M16 48h28" fill="none" stroke="#78b8e4" stroke-width="2.6" stroke-linecap="round" opacity="0.9"/>
+</svg>

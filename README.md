@@ -1,6 +1,8 @@
-# WoodCAM 2D - CNC Marcenaria para FreeCAD
+# PanelNest / WoodCAM - Marcenaria CNC para FreeCAD
 
-Workbench para FreeCAD focado em CNC router de marcenaria. Gera G-code GRBL/gSender para contornos fechados selecionados, com stepdown, compensação automática da fresa, entrada em rampa, prévia e simulação.
+Bancada única para FreeCAD, reunindo projeto de móveis, organização e nesting de
+chapas, Editor 2D, CAM, simulação e geração de G-code. O WoodCAM faz parte do
+PanelNest e não precisa ser baixado nem instalado separadamente.
 
 ## Continuidade do Editor 2D
 
@@ -387,7 +389,7 @@ Ainda nao implementado:
   controle 2 e fim), preservando a curva exata; importações também a preservam
   quando o formato de origem suportar.
 
-## Instalacao local
+## Instalação local
 
 O WoodCAM é distribuído sem pesos de IA, sem telemetria e sem downloads
 silenciosos. O instalador pergunta explicitamente se você quer instalar a IA
@@ -419,43 +421,34 @@ chmod +x install_workbench.sh
 ./install_workbench.sh
 ```
 
-O script cria um symlink em:
+O script instala o clone inteiro como uma única bancada em:
 
 ```text
-~/.local/share/FreeCAD/Mod/WoodCAM2D
+~/.local/share/FreeCAD/Mod/PanelNest
 ```
 
-Depois reinicie o FreeCAD. Com o PanelNest instalado, escolha a bancada
-`PanelNest` e use `PanelNest → CAM → WoodCAM 2D`. Se tiver instalado apenas o
-WoodCAM2D, selecione a bancada `WoodCAM 2D` diretamente.
-
-No Windows, mantenha os dois módulos lado a lado:
-
-```text
-%APPDATA%\FreeCAD\Mod\PanelNest
-%APPDATA%\FreeCAD\Mod\WoodCAM2D
-```
-
-O WoodCAM é exibido dentro da bancada PanelNest, mas sua pasta auxiliar ainda
-precisa estar instalada. O pacote gerado por
-`PanelNest/scripts/build_portable_package.py` já contém as duas pastas.
+Depois reinicie o FreeCAD, escolha a bancada `PanelNest` e use
+`PanelNest → CAM → WoodCAM 2D`. Nesting, Editor 2D e CAM vêm no mesmo clone.
+O instalador remove apenas o link legado `WoodCAM2D` que apontava para este
+mesmo checkout; ele não apaga instalações reais ou de terceiros.
 
 ## Pacote para outro FreeCAD
 
-Não é necessário criar ZIP. Copie a pasta deste projeto com o nome
-`WoodCAM2D` diretamente para a pasta `Mod` do outro FreeCAD. Se também usar o
-PanelNest, os módulos são separados e devem ficar lado a lado — nunca um dentro
-da pasta do outro:
+Não é necessário criar ZIP. Copie a pasta inteira deste projeto com o nome
+`PanelNest` diretamente para a pasta `Mod` do outro FreeCAD:
 
 ```text
 Mod/
-├── PanelNest/
-└── WoodCAM2D/
+└── PanelNest/
+    ├── PanelNest/       # núcleo de projeto e nesting incluído
+    ├── woodcam_editor/  # Editor 2D incluído
+    └── ui.py            # CAM incluído
 ```
 
-Com somente `WoodCAM2D`, aparece a bancada WoodCAM 2D. Com as duas pastas,
-aparece apenas a bancada PanelNest e o WoodCAM fica disponível como botão/menu
-dentro dela. Reinicie o FreeCAD depois da cópia.
+Aparece apenas a bancada PanelNest, e o WoodCAM fica disponível como botão/menu
+dentro dela. Reinicie o FreeCAD depois da cópia. Para gerar um ZIP portátil com
+essa mesma estrutura única, execute
+`python PanelNest/scripts/build_portable_package.py`.
 
 ## Uso do Editor 2D
 
