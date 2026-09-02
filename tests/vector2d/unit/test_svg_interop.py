@@ -3,7 +3,12 @@ import tempfile
 import unittest
 
 from woodcam_editor.domain.document import Layer, VectorDocument
-from woodcam_editor.domain.entities import CircleEntity, EllipseEntity, PathEntity
+from woodcam_editor.domain.entities import (
+    CircleEntity,
+    EllipseEntity,
+    GroupEntity,
+    PathEntity,
+)
 from woodcam_editor.domain.primitives import Vec2
 from woodcam_editor.domain.spans import ArcSpan
 from woodcam_editor.exporters.svg import export_svg
@@ -17,6 +22,55 @@ FIXTURE = os.path.abspath(
 
 
 class SvgInteropTests(unittest.TestCase):
+    def test_selected_compound_expands_all_children_once(self):
+        document = VectorDocument.create_default()
+        contour_layer = Layer(
+            id="layer-contour-hidden",
+            name="Corte externo",
+            color="#dc2626",
+            purpose="cut",
+            visible=False,
+            order=10,
+        )
+        pocket_layer = Layer(
+            id="layer-pocket",
+            name="Rebaixo",
+            color="#16a34a",
+            purpose="pocket",
+            order=11,
+        )
+        document.add_layers((contour_layer, pocket_layer))
+        contour = PathEntity.from_points(
+            contour_layer.id,
+            (Vec2(0, 0), Vec2(80, 0), Vec2(80, 40), Vec2(0, 40)),
+            closed=True,
+        )
+        pocket = CircleEntity(pocket_layer.id, Vec2(20, 20), 6)
+        compound = GroupEntity(
+            layer_id=document.active_layer_id,
+            child_ids=(contour.id, pocket.id),
+        )
+        document.add_entities((contour, pocket, compound))
+
+        handle = tempfile.NamedTemporaryFile(suffix=".svg", delete=False)
+        handle.close()
+        try:
+            export_svg(
+                document,
+                handle.name,
+                entity_ids=(compound.id, pocket.id),
+                visible_only=False,
+            )
+            imported = import_svg(handle.name, layer_id="temporary")
+        finally:
+            os.unlink(handle.name)
+
+        self.assertEqual(len(imported.entities), 2)
+        self.assertEqual(
+            sorted(type(entity).__name__ for entity in imported.entities),
+            ["CircleEntity", "PathEntity"],
+        )
+
     def test_imports_shapes_paths_transforms_units_and_y_up(self):
         result = import_svg(FIXTURE, layer_id="layer")
 

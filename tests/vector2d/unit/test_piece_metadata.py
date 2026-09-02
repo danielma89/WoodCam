@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from woodcam_editor.application import EditorController
+from woodcam_editor.application import EditorController, nesting_rotation_angles
 from woodcam_editor.domain import (
     PathEntity,
     Piece2D,
@@ -81,6 +81,48 @@ class PieceMetadataTests(unittest.TestCase):
             self.assertEqual(piece.rotations_allowed, allowed)
             self.assertEqual(piece.metadata["rotation_mode"], mode)
 
+    def test_nesting_uses_free_angles_only_when_rotation_was_not_explicit(self):
+        implicit = self.document.pieces_by_id[self.piece.id]
+        self.assertEqual(
+            nesting_rotation_angles(implicit),
+            tuple(float(angle) for angle in range(0, 360, 15)),
+        )
+
+        self.controller.update_piece_metadata(
+            self.piece.id,
+            name="Peça 1",
+            quantity=1,
+            material="",
+            thickness=0.0,
+            grain_direction=None,
+            rotation_mode="zero_ninety",
+        )
+        explicit = self.document.pieces_by_id[self.piece.id]
+        self.assertEqual(
+            nesting_rotation_angles(explicit),
+            (0.0, 90.0),
+        )
+
+        aligned = nesting_rotation_angles(
+            implicit,
+            outer_points=((0.0, 0.0), (80.0, 60.0), (74.0, 68.0), (-6.0, 8.0)),
+        )
+        self.assertTrue(
+            any(abs(angle - 53.1301023542) <= 1.0e-7 for angle in aligned)
+        )
+        self.assertTrue(
+            any(abs(angle - 323.1301023542) <= 1.0e-7 for angle in aligned)
+        )
+
+        with_grain = Piece2D(
+            "Com veio",
+            self.outer.id,
+            grain_direction=0.0,
+            rotations_allowed=(0.0, 180.0),
+            id="piece-grain",
+        )
+        self.assertEqual(nesting_rotation_angles(with_grain), (0.0, 180.0))
+
     def test_select_piece_keeps_every_inner_with_outer(self):
         selected = self.controller.select_piece(self.piece.id)
         self.assertEqual(selected, (self.outer.id, self.inner.id))
@@ -90,4 +132,3 @@ class PieceMetadataTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

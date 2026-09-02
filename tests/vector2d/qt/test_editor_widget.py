@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -26,6 +27,9 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         from woodcam_editor.application import EditorMode
         from woodcam_editor.domain import (
             PathEntity,
+            AddEntitiesCommand,
+            CompositeCommand,
+            GroupEntity,
             Piece2D,
             ReplacePiecesCommand,
             SetDocumentMetadataCommand,
@@ -38,6 +42,9 @@ class EditorWidgetInteractionTests(unittest.TestCase):
 
         cls.EditorMode = EditorMode
         cls.PathEntity = PathEntity
+        cls.AddEntitiesCommand = AddEntitiesCommand
+        cls.CompositeCommand = CompositeCommand
+        cls.GroupEntity = GroupEntity
         cls.Piece2D = Piece2D
         cls.ReplacePiecesCommand = ReplacePiecesCommand
         cls.SetDocumentMetadataCommand = SetDocumentMetadataCommand
@@ -63,6 +70,23 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         self.widget.fit_work_area()
         self.app.processEvents()
 
+    def test_exact_panel_applies_percentage_scale_as_one_undo(self):
+        original = self.document.get_entity(self.path_id)
+        self.widget.controller.selection.replace((self.path_id,))
+        self.app.processEvents()
+
+        self.widget.properties_panel.scale_percent_field.setValue(50.0)
+        self.widget.properties_panel.apply_scale_button.click()
+        self.app.processEvents()
+
+        scaled = self.document.get_entity(self.path_id)
+        self.assertAlmostEqual(scaled.bounds().width, original.bounds().width * 0.5)
+        self.assertTrue(
+            scaled.bounds().center.almost_equals(original.bounds().center, 1e-9)
+        )
+        self.widget.controller.undo()
+        self.assertEqual(self.document.get_entity(self.path_id), original)
+
     def tearDown(self):
         self.widget.close()
         self.app.processEvents()
@@ -78,6 +102,69 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         self.assertEqual(self.widget.controller.mode, self.EditorMode.SELECT)
         self.assertFalse(self.widget.overlays.node_items)
 
+    def test_visual_cadence_follows_high_refresh_display(self):
+        cadence = self.widget.view._frame_interval_for_refresh_rate
+        self.assertEqual(cadence(60.0), 16)
+        self.assertEqual(cadence(144.0), 7)
+        self.assertEqual(cadence(165.0), 6)
+        self.assertEqual(cadence(240.0), 4)
+        self.assertEqual(cadence(0.0), 16)
+
+    def test_external_cam_point_capture_is_modal_and_never_mutates_vectors(self):
+        captured = []
+        cancelled = []
+        revision_before = self.document.revision
+        self.widget.controller.selection.select_only(self.path_id)
+
+        self.widget.begin_point_capture(
+            captured.append,
+            cancel_callback=lambda: cancelled.append(True),
+            status="Posicione a tab",
+        )
+        self.assertTrue(self.widget.tool_manager.point_capture_active)
+        self.assertIn("Posicione", self.widget.mode_label.text())
+
+        point = self.viewport_point(150.0, 100.0)
+        QtTest.QTest.mouseClick(
+            self.widget.view.viewport(),
+            QtCore.Qt.LeftButton,
+            QtCore.Qt.NoModifier,
+            point,
+        )
+        self.app.processEvents()
+        self.assertEqual(len(captured), 1)
+        self.assertLess(abs(captured[0].scene_pos.x() - 150.0), 0.5)
+        self.assertEqual(self.widget.controller.selection.ids, (self.path_id,))
+        self.assertEqual(self.document.revision, revision_before)
+
+        self.widget.show_tab_markers(({"x": 150.0, "y": 100.0},))
+        self.assertEqual(len(self.widget.overlays.tab_marker_items), 1)
+        self.assertEqual(self.document.revision, revision_before)
+
+        QtTest.QTest.keyClick(self.widget.view, QtCore.Qt.Key_Escape)
+        self.app.processEvents()
+        self.assertFalse(self.widget.tool_manager.point_capture_active)
+        self.assertEqual(cancelled, [True])
+        self.assertEqual(self.widget.controller.mode, self.EditorMode.SELECT)
+        self.assertEqual(self.document.revision, revision_before)
+
+        self.widget.controller.selection.select_only(self.path_id)
+        self.widget.begin_point_capture(
+            captured.append,
+            cancel_callback=lambda: cancelled.append(True),
+        )
+        QtTest.QTest.mouseClick(
+            self.widget.view.viewport(),
+            QtCore.Qt.RightButton,
+            QtCore.Qt.NoModifier,
+            point,
+        )
+        self.app.processEvents()
+        self.assertFalse(self.widget.tool_manager.point_capture_active)
+        self.assertEqual(cancelled, [True, True])
+        self.assertEqual(self.widget.controller.selection.ids, (self.path_id,))
+        self.assertEqual(self.document.revision, revision_before)
+
     def test_click_near_endpoint_does_not_enter_node_mode(self):
         point = self.viewport_point(50.0, 100.0) + QtCore.QPoint(3, 0)
         QtTest.QTest.mouseClick(self.widget.view.viewport(), QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, point)
@@ -86,17 +173,185 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         self.assertEqual(self.widget.controller.mode, self.EditorMode.SELECT)
         self.assertFalse(self.widget.overlays.node_items)
 
-    def test_double_click_enters_node_mode(self):
+    def test_empty_rectangle_interior_is_background_not_a_selection_hit(self):
+        rectangle = self.PathEntity.from_points(
+            self.document.active_layer_id,
+            (
+                self.Vec2(20.0, 20.0), self.Vec2(100.0, 20.0),
+                self.Vec2(100.0, 70.0), self.Vec2(20.0, 70.0),
+            ),
+            closed=True,
+        )
+        self.widget.controller.execute(self.AddEntitiesCommand((rectangle,)))
+        self.widget.controller.selection.select_only(rectangle.id)
+        self.widget.activate_tool(self.EditorMode.SELECT)
+        interior = self.viewport_point(60.0, 45.0)
+        QtTest.QTest.mouseClick(
+            self.widget.view.viewport(), QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, interior
+        )
+        self.app.processEvents()
+        self.assertEqual(self.widget.controller.selection.ids, ())
+
+    def test_imported_pocket_hatch_is_filled_and_selectable_inside_piece_group(self):
+        outer = replace(
+            self.PathEntity.from_points(
+                self.document.active_layer_id,
+                (
+                    self.Vec2(20.0, 20.0), self.Vec2(140.0, 20.0),
+                    self.Vec2(140.0, 80.0), self.Vec2(20.0, 80.0),
+                ),
+                closed=True,
+                id="imported-outer",
+            ),
+            metadata={"source_shape_component_id": "component-001"},
+        )
+        pocket = replace(
+            self.PathEntity.from_points(
+                self.document.active_layer_id,
+                (
+                    self.Vec2(20.0, 35.0), self.Vec2(75.0, 35.0),
+                    self.Vec2(75.0, 65.0), self.Vec2(20.0, 65.0),
+                ),
+                closed=True,
+                id="imported-pocket",
+            ),
+            metadata={
+                "source_shape_component_id": "component-001",
+                "import_role": "pocket_region",
+                "pocket_depth_mm": 5.0,
+            },
+        )
+        group = self.GroupEntity(
+            self.document.active_layer_id,
+            (outer.id, pocket.id),
+            id="imported-piece-group",
+        )
+        self.widget.controller.execute(
+            self.AddEntitiesCommand((outer, pocket, group))
+        )
+        self.app.processEvents()
+
+        pocket_item = self.widget.adapter.items_by_id[pocket.id]
+        no_brush = getattr(QtCore.Qt, "NoBrush", QtCore.Qt.BrushStyle.NoBrush)
+        self.assertNotEqual(pocket_item.brush().style(), no_brush)
+        interior = self.viewport_point(50.0, 50.0)
+        self.assertEqual(
+            self.widget.adapter.hit_test_body(self.widget.view, interior),
+            pocket.id,
+        )
+
+        QtTest.QTest.mouseClick(
+            self.widget.view.viewport(),
+            QtCore.Qt.LeftButton,
+            QtCore.Qt.NoModifier,
+            interior,
+        )
+        self.app.processEvents()
+        self.assertEqual(self.widget.controller.selection.ids, (pocket.id,))
+
+    def test_marquee_in_empty_space_does_not_select_surrounding_contour(self):
+        outer = self.PathEntity.from_points(
+            self.document.active_layer_id,
+            (
+                self.Vec2(20.0, 20.0), self.Vec2(280.0, 20.0),
+                self.Vec2(280.0, 180.0), self.Vec2(20.0, 180.0),
+            ),
+            closed=True,
+        )
+        inner = self.PathEntity.from_points(
+            self.document.active_layer_id,
+            (
+                self.Vec2(75.0, 60.0), self.Vec2(175.0, 60.0),
+                self.Vec2(175.0, 140.0), self.Vec2(75.0, 140.0),
+            ),
+            closed=True,
+        )
+        self.widget.controller.execute(self.AddEntitiesCommand((outer, inner)))
+        viewport = self.widget.view.viewport()
+        for start, end in (
+            (self.viewport_point(200.0, 145.0), self.viewport_point(230.0, 165.0)),
+            (self.viewport_point(230.0, 165.0), self.viewport_point(200.0, 145.0)),
+        ):
+            QtTest.QTest.mousePress(viewport, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, start)
+            QtTest.QTest.mouseMove(viewport, end, 20)
+            QtTest.QTest.mouseRelease(viewport, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, end)
+            self.app.processEvents()
+            self.assertEqual(self.widget.controller.selection.ids, ())
+
+    def test_transform_pivot_is_an_explicit_move_target(self):
         point = self.viewport_point(150.0, 100.0)
+        viewport = self.widget.view.viewport()
+        QtTest.QTest.mouseClick(viewport, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, point)
+        QtTest.QTest.mouseClick(viewport, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, point)
+        self.app.processEvents()
+        pivot = self.widget.view.mapFromScene(self.widget.overlays.selection_pivot_item.scenePos())
+        before = self.widget.controller.get_entity(self.path_id)
+        QtTest.QTest.mousePress(viewport, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, pivot)
+        QtTest.QTest.mouseMove(viewport, pivot + QtCore.QPoint(30, 0), 20)
+        QtTest.QTest.mouseRelease(viewport, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, pivot + QtCore.QPoint(30, 0))
+        self.app.processEvents()
+        after = self.widget.controller.get_entity(self.path_id)
+        self.assertGreater(after.start.x, before.start.x)
+
+    def test_second_click_enters_transform_and_double_click_never_enters_nodes(self):
+        point = self.viewport_point(150.0, 100.0)
+        QtTest.QTest.mouseClick(self.widget.view.viewport(), QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, point)
+        self.app.processEvents()
+        self.assertEqual(self.widget.controller.mode, self.EditorMode.SELECT)
+        self.assertFalse(self.widget.overlays.selection_handle_items)
+        QtTest.QTest.mouseClick(self.widget.view.viewport(), QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, point)
+        self.app.processEvents()
+        self.assertEqual(self.widget.controller.mode, self.EditorMode.TRANSFORM)
+        self.assertTrue(self.widget.overlays.selection_handle_items)
+        QtTest.QTest.keyClick(self.widget.view, QtCore.Qt.Key_S)
+        self.app.processEvents()
         QtTest.QTest.mouseDClick(self.widget.view.viewport(), QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, point)
         self.app.processEvents()
+        self.assertNotEqual(self.widget.controller.mode, self.EditorMode.NODE_EDIT)
+        self.assertFalse(self.widget.overlays.node_items)
+
+    def test_n_enters_node_mode_and_escape_returns_to_selected_object(self):
+        point = self.viewport_point(150.0, 100.0)
+        QtTest.QTest.mouseClick(self.widget.view.viewport(), QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, point)
+        QtTest.QTest.keyClick(self.widget.view, QtCore.Qt.Key_N)
+        self.app.processEvents()
         self.assertEqual(self.widget.controller.mode, self.EditorMode.NODE_EDIT)
-        self.assertEqual(self.widget.controller.node_entity_id, self.path_id)
         self.assertEqual(len(self.widget.overlays.node_items), 2)
+        QtTest.QTest.keyClick(self.widget.view, QtCore.Qt.Key_Escape)
+        self.app.processEvents()
+        self.assertEqual(self.widget.controller.mode, self.EditorMode.SELECT)
+        self.assertEqual(self.widget.controller.selection.ids, (self.path_id,))
+
+    def test_alt_drag_restricts_to_the_dominant_axis(self):
+        viewport = self.widget.view.viewport()
+        start = self.viewport_point(150.0, 100.0)
+        end = self.viewport_point(190.0, 115.0)
+        before = self.widget.controller.get_entity(self.path_id)
+        QtTest.QTest.mousePress(viewport, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, start)
+        QtTest.QTest.mouseMove(viewport, end, 20)
+        QtTest.QTest.mouseRelease(viewport, QtCore.Qt.LeftButton, QtCore.Qt.AltModifier, end)
+        self.app.processEvents()
+        after = self.widget.controller.get_entity(self.path_id)
+        self.assertGreater(after.start.x - before.start.x, 1.0)
+        self.assertAlmostEqual(after.start.y, before.start.y, places=9)
+
+    def test_ctrl_drag_copies_selection_and_leaves_original_in_place(self):
+        viewport = self.widget.view.viewport()
+        start = self.viewport_point(150.0, 100.0)
+        end = self.viewport_point(190.0, 100.0)
+        original = self.widget.controller.get_entity(self.path_id)
+        QtTest.QTest.mousePress(viewport, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, start)
+        QtTest.QTest.mouseMove(viewport, end, 20)
+        QtTest.QTest.mouseRelease(viewport, QtCore.Qt.LeftButton, QtCore.Qt.ControlModifier, end)
+        self.app.processEvents()
+        self.assertEqual(self.widget.controller.get_entity(self.path_id), original)
+        self.assertEqual(len(self.document.entities_by_id), 2)
+        self.assertNotEqual(self.widget.controller.selection.primary_id, self.path_id)
 
     def test_plain_node_click_never_moves_or_teleports(self):
         body = self.viewport_point(150.0, 100.0)
-        QtTest.QTest.mouseDClick(self.widget.view.viewport(), QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, body)
+        QtTest.QTest.mouseClick(self.widget.view.viewport(), QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, body)
+        QtTest.QTest.keyClick(self.widget.view, QtCore.Qt.Key_N)
         self.app.processEvents()
         entity = self.widget.controller.get_entity(self.path_id)
         handle = self.widget.overlays.node_items[0]
@@ -119,6 +374,54 @@ class EditorWidgetInteractionTests(unittest.TestCase):
             point = self.viewport_point(150.0, 100.0) + QtCore.QPoint(0, 5)
             self.assertEqual(self.widget.adapter.hit_test_body(self.widget.view, point), self.path_id)
 
+    def test_modifier_node_hit_uses_nearby_scene_entities(self):
+        near = self.PathEntity.from_points(
+            self.document.active_layer_id,
+            (
+                self.Vec2(20.0, 20.0), self.Vec2(40.0, 20.0),
+                self.Vec2(40.0, 40.0), self.Vec2(20.0, 40.0),
+            ),
+            closed=True,
+            id="near-corner",
+        )
+        far_paths = tuple(
+            self.PathEntity.from_points(
+                self.document.active_layer_id,
+                (
+                    self.Vec2(1000.0 + index * 30.0, 1000.0),
+                    self.Vec2(1020.0 + index * 30.0, 1000.0),
+                    self.Vec2(1020.0 + index * 30.0, 1020.0),
+                    self.Vec2(1000.0 + index * 30.0, 1020.0),
+                ),
+                closed=True,
+                id="far-%03d" % index,
+            )
+            for index in range(120)
+        )
+        self.widget.controller.execute(
+            self.AddEntitiesCommand((near,) + far_paths)
+        )
+        self.app.processEvents()
+
+        visited = set()
+        original_nodes = self.PathEntity.nodes
+
+        def tracked_nodes(entity):
+            visited.add(entity.id)
+            return original_nodes(entity)
+
+        with patch.object(self.PathEntity, "nodes", tracked_nodes):
+            hit = self.widget.adapter.hit_test_path_node(
+                self.widget.view,
+                self.viewport_point(20.0, 20.0),
+                closed_only=True,
+            )
+
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit.entity_id, near.id)
+        self.assertIn(near.id, visited)
+        self.assertFalse({path.id for path in far_paths}.intersection(visited))
+
     def test_zoom_does_not_change_domain_geometry(self):
         before = self.widget.controller.get_entity(self.path_id)
         initial_scale = self.widget.view.pixels_per_mm()
@@ -126,6 +429,42 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         self.app.processEvents()
         self.assertNotEqual(self.widget.view.pixels_per_mm(), initial_scale)
         self.assertEqual(self.widget.controller.get_entity(self.path_id), before)
+
+    def test_pan_can_move_work_area_fully_offscreen_and_fit_restores_it(self):
+        view = self.widget.view
+        viewport = view.viewport()
+        work_rect = self.widget.adapter.work_area_item.rect()
+        before_revision = self.document.revision
+        before_entity = self.widget.controller.get_entity(self.path_id)
+
+        # Three ordinary middle-button drags must be allowed to carry the
+        # entire fitted sheet beyond the right edge of the visible canvas.
+        for _drag in range(3):
+            start = viewport.rect().center()
+            end = QtCore.QPoint(viewport.width() - 5, start.y())
+            QtTest.QTest.mousePress(viewport, QtCore.Qt.MiddleButton, pos=start)
+            QtTest.QTest.mouseMove(viewport, end, 30)
+            QtTest.QTest.mouseRelease(viewport, QtCore.Qt.MiddleButton, pos=end)
+            self.app.processEvents()
+
+        screen_x = (
+            view.mapFromScene(work_rect.topLeft()).x(),
+            view.mapFromScene(work_rect.topRight()).x(),
+            view.mapFromScene(work_rect.bottomLeft()).x(),
+            view.mapFromScene(work_rect.bottomRight()).x(),
+        )
+        self.assertGreater(min(screen_x), viewport.width())
+        self.assertEqual(self.document.revision, before_revision)
+        self.assertEqual(self.widget.controller.get_entity(self.path_id), before_entity)
+
+        self.widget.fit_work_area()
+        self.app.processEvents()
+        restored_x = (
+            view.mapFromScene(work_rect.topLeft()).x(),
+            view.mapFromScene(work_rect.topRight()).x(),
+        )
+        self.assertGreaterEqual(min(restored_x), 0)
+        self.assertLessEqual(max(restored_x), viewport.width())
 
     def test_work_area_origin_moves_dashed_rect_without_reframing_entities(self):
         probe = QtCore.QPointF(50.0, 100.0)
@@ -143,6 +482,26 @@ class EditorWidgetInteractionTests(unittest.TestCase):
             (40.0, 25.0, 300.0, 200.0),
         )
         self.assertEqual(self.widget.view.mapFromScene(probe), screen_before)
+
+    def test_creating_a_vector_never_recenters_the_camera(self):
+        view = self.widget.view
+        probe = QtCore.QPointF(85.0, 65.0)
+        view.centerOn(probe)
+        self.app.processEvents()
+        screen_before = view.mapFromScene(probe)
+        transform_before = view.transform()
+
+        created_id = self.widget.controller.add_line(
+            self.Vec2(520.0, 470.0),
+            self.Vec2(580.0, 510.0),
+        )
+        self.app.processEvents()
+
+        self.assertTrue(created_id)
+        self.assertEqual(view.transform(), transform_before)
+        screen_after = view.mapFromScene(probe)
+        self.assertLessEqual(abs(screen_after.x() - screen_before.x()), 1)
+        self.assertLessEqual(abs(screen_after.y() - screen_before.y()), 1)
 
     def test_compact_vertical_drawing_toolbar_has_clear_icons_and_spacing(self):
         self.widget.resize(680, 620)
@@ -266,7 +625,9 @@ class EditorWidgetInteractionTests(unittest.TestCase):
 
     def test_compact_labels_and_menu_actions_explain_their_effect(self):
         self.assertEqual(self.widget.snap_checkbox.text(), "Imã (Snap)")
-        self.assertIn("não oculta a grade", self.widget.snap_checkbox.toolTip())
+        self.assertIn("controle separado", self.widget.snap_checkbox.toolTip())
+        self.assertEqual(self.widget.grid_checkbox.text(), "Grade")
+        self.assertIn("fundo branco", self.widget.grid_checkbox.toolTip())
         cam = self.widget._menu_actions["CAM"]["Usar Editor 2D como fonte"]
         self.assertIn("vetores persistidos", cam.toolTip())
         recognize = self.widget._menu_actions["Peças"][
@@ -280,9 +641,236 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         nesting_spy = QtTest.QSignalSpy(self.widget.organizePiecesRequested)
         balanced.trigger()
         self.assertEqual(nesting_spy.count(), 1)
+        self.assertFalse(self.widget.measure_button.icon().isNull())
+        self.assertFalse(self.widget.recognize_pieces_button.icon().isNull())
+        self.assertFalse(self.widget.organize_pieces_button.icon().isNull())
+        self.widget.measure_button.click()
+        self.assertEqual(self.widget.controller.mode, self.EditorMode.MEASURE)
+        recognize_spy = QtTest.QSignalSpy(self.widget.createPiecesRequested)
+        self.widget.recognize_pieces_button.click()
+        self.assertEqual(recognize_spy.count(), 1)
+        toolbar_nesting_spy = QtTest.QSignalSpy(self.widget.organizePiecesRequested)
+        self.widget.organize_pieces_button.click()
+        self.assertEqual(toolbar_nesting_spy.count(), 1)
         trace_spy = QtTest.QSignalSpy(self.widget.traceBitmapRequested)
         self.widget._menu_actions["Arquivo"]["Vetorizar imagem…"].trigger()
         self.assertEqual(trace_spy.count(), 1)
+
+    def test_language_menu_translates_presentation_and_keeps_actions(self):
+        from woodcam_editor.presentation.i18n import (
+            language,
+            set_language,
+            translate_text,
+            translate_widget_tree,
+        )
+
+        self.assertEqual(language(), "pt")
+        revision_before = self.document.revision
+        try:
+            self.widget._menu_actions["Idioma"]["English"].trigger()
+            self.app.processEvents()
+            self.assertEqual(self.widget.file_menu_button.text(), "File")
+            self.assertEqual(self.widget.edit_menu_button.text(), "Edit")
+            self.assertEqual(self.widget.language_menu_button.text(), "Language")
+            self.assertEqual(
+                self.widget._menu_actions["Arquivo"]["Exportar"].text(),
+                "Export",
+            )
+            self.assertEqual(self.widget.snap_checkbox.text(), "Snap")
+            self.assertEqual(self.widget.grid_checkbox.text(), "Grid")
+            self.widget.tool_manager.set_status(
+                "Selecionar — 1 clique seleciona; arraste move o corpo"
+            )
+            self.assertEqual(
+                self.widget.mode_label.text(),
+                "Select — one click selects; drag moves the object",
+            )
+            self.assertEqual(self.widget.layer_panel.title(), "Layers")
+            self.assertEqual(
+                [
+                    self.widget.layer_panel.tree.headerItem().text(column)
+                    for column in range(4)
+                ],
+                ["Active", "Layer", "Visible", "Locked"],
+            )
+            piece_labels = {
+                label.text()
+                for label in self.widget.pieces_panel.findChildren(QtWidgets.QLabel)
+            }
+            self.assertIn("Grain direction", piece_labels)
+            self.assertIn("Rotation", piece_labels)
+            self.assertEqual(self.widget.pieces_panel.apply_button.text(), "Apply to part")
+            self.assertEqual(
+                self.widget.pieces_panel.rotation_mode.itemText(0),
+                "0° only",
+            )
+            self.assertTrue(
+                bool(
+                    self.widget.pieces_panel.rotation_mode.property(
+                        "woodcam_i18n_owned"
+                    )
+                )
+            )
+            # The English refresh timer may inspect this tree repeatedly, but
+            # an already translated combo must not be rewritten.  Rewriting
+            # its current item emits currentTextChanged and can trigger costly
+            # downstream CAM refreshes in a large FCStd.
+            combo_refresh_spy = QtTest.QSignalSpy(
+                self.widget.pieces_panel.rotation_mode.currentTextChanged
+            )
+            translate_widget_tree(self.widget)
+            self.assertEqual(combo_refresh_spy.count(), 0)
+            self.assertEqual(
+                self.widget.pieces_panel.summary_label.text(),
+                "No classified part.",
+            )
+            self.assertEqual(
+                self.widget.properties_panel.title(),
+                "Exact position and dimensions",
+            )
+            exact_labels = {
+                label.text()
+                for label in self.widget.properties_panel.findChildren(QtWidgets.QLabel)
+            }
+            self.assertIn("Minimum X (mm)", exact_labels)
+            self.assertIn("Minimum Y (mm)", exact_labels)
+            self.assertIn("Width (mm)", exact_labels)
+            self.assertIn("Height (mm)", exact_labels)
+            self.assertIn("Uniform scale (%)", exact_labels)
+            self.assertEqual(
+                self.widget.properties_panel.apply_scale_button.text(),
+                "Apply scale",
+            )
+
+            # QListWidget/QTreeWidget text lives in the item model, not in a
+            # QLabel. It must be translated and restored without changing
+            # UserRole identifiers or any editor command state.
+            model_list = QtWidgets.QListWidget(self.widget)
+            model_item = QtWidgets.QListWidgetItem(
+                "Nenhum percurso aplicado ainda", model_list
+            )
+            model_item.setData(QtCore.Qt.UserRole, "stable-operation-id")
+            translate_widget_tree(model_list)
+            self.assertEqual(model_item.text(), "No applied toolpath yet")
+            self.assertEqual(
+                model_item.data(QtCore.Qt.UserRole),
+                "stable-operation-id",
+            )
+            self.assertEqual(translate_text("6 passagens"), "6 passes")
+            self.assertEqual(translate_text("1 selecionado"), "1 selected")
+            self.assertEqual(translate_text("12 selecionados"), "12 selected")
+            self.assertEqual(translate_text("Passagens"), "Passes")
+            self.assertEqual(translate_text("Percursos 2D"), "2D Toolpaths")
+            self.assertEqual(
+                translate_text("Ver percurso de Corte no 2D"),
+                "Show Cut toolpath in 2D",
+            )
+            self.assertEqual(
+                translate_text("Preparando a primeira solução…"),
+                "Preparing the first solution…",
+            )
+            self.assertEqual(
+                translate_text(
+                    "Tentativa %d/%d — %s\n%s • melhor: %s"
+                ) % (1, 4, translate_text("Resposta rápida"), "15.1 s", "none"),
+                "Attempt 1/4 — Quick result\n15.1 s • best: none",
+            )
+            self.assertEqual(
+                translate_text(
+                    "Organização não executada: O nesting foi bloqueado pela "
+                    "validação vetorial final: As peças piece-a#1 e piece-b#1 "
+                    "ficaram com folga de 0.008 mm; a folga mínima é 4.000 mm."
+                ),
+                "Nesting was not run: final vector validation blocked the "
+                "layout: parts piece-a#1 and piece-b#1 ended with 0.008 mm "
+                "clearance; the minimum clearance is 4.000 mm.",
+            )
+            translated_summary = translate_text(
+                "Prévia do nesting inteligente: magenta = destino, azul = posição atual. "
+                "%d peça(s) em %d chapa(s); %d não couberam. Eficiência %.1f%%; "
+                "%s venceu entre %d layouts%s%s."
+            ) % (
+                13,
+                2,
+                0,
+                42.5,
+                translate_text("contorno real"),
+                8,
+                "",
+                translate_text("; busca concluída"),
+            )
+            self.assertIn("Smart nesting preview", translated_summary)
+            self.assertIn("real contour", translated_summary)
+            self.assertNotIn("peça", translated_summary)
+            self.assertEqual(
+                translate_text(
+                    "Organização não executada: Busca interrompida antes de "
+                    "produzir a primeira solução."
+                ),
+                "Nesting was not run: Search stopped before producing the "
+                "first solution.",
+            )
+            layer_row = self.widget.layer_panel.tree.topLevelItem(0)
+            self.assertEqual(layer_row.text(1), "Drawing")
+            self.widget.layer_panel._sync_layer_controls()
+            self.assertEqual(layer_row.text(1), "Drawing")
+            translated_block = translate_text(
+                "Linha comum bloqueada: os contornos originais são válidos, "
+                "mas os percursos externos compensados se cruzam. A folga "
+                "entre algumas peças é menor que o diâmetro efetivo de 4.00 "
+                "mm. Execute Organizar peças novamente com Linha comum ativa; "
+                "o organizador ajustará essa folga automaticamente. Detalhes: "
+                "Os contornos outer-0011 e outer-0023 possuem cruzamento real "
+                "próximo de X 288.35 / Y 413.65."
+            )
+            self.assertIn("Common-line cutting blocked", translated_block)
+            self.assertIn(
+                "Contours outer-0011 and outer-0023 have a real crossing",
+                translated_block,
+            )
+            self.assertNotIn("contornos originais", translated_block)
+            self.assertEqual(
+                translate_text("Altura intacta no MDF (mm)"),
+                "Untouched MDF height (mm)",
+            )
+            self.assertEqual(
+                translate_text("Restos soltos: parafusos"),
+                "Loose waste: screws",
+            )
+            self.assertEqual(
+                translate_text("Pausa antes de cada peça"),
+                "Pause before each part",
+            )
+            from cam_advisor import analyze_cam_settings
+
+            advice = analyze_cam_settings(
+                {
+                    "operation_mode": "finish3d",
+                    "tool_type": "end_mill",
+                    "tool_diameter": 6.0,
+                    "stepdown": 3.0,
+                    "safe_height": 8.0,
+                    "retract_height": 15.0,
+                    "finish3d_stepover_percent": 25.0,
+                }
+            ).to_plain_text(translator=translate_text)
+            self.assertIn("[SUGGESTION]", advice)
+            self.assertIn("Suggested value to review: 10", advice)
+            self.assertNotIn("fresa esférica", advice.lower())
+            self.assertEqual(
+                translate_text("Fresa maior que 2 região(ões) selecionada(s)"),
+                "Tool larger than 2 selected region(s)",
+            )
+            # Switching language is presentation-only; it cannot create an
+            # editor command or alter the document revision.
+            self.assertEqual(self.document.revision, revision_before)
+        finally:
+            set_language("pt")
+            self.app.processEvents()
+            if "model_item" in locals():
+                translate_widget_tree(model_list)
+                self.assertEqual(model_item.text(), "Nenhum percurso aplicado ainda")
+        self.assertEqual(self.widget.file_menu_button.text(), "Arquivo")
 
     def test_cam_plan_preview_is_a_non_mutating_editor_overlay(self):
         """The Aspire-style plan view must not become vector geometry."""
@@ -348,7 +936,7 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         self.assertEqual(len(self.widget.adapter.sheet_label_items), 2)
         self.assertEqual(
             [item.text() for item in self.widget.adapter.sheet_label_items],
-            ["Chapa 01", "Chapa 02"],
+            ["Chapa 01  ·  X0 Y0", "Chapa 02  ·  X0 Y0"],
         )
         self.widget.adapter.show_preview_sheet_bounds(
             ((0.0, 0.0, 300.0, 200.0), (350.0, 0.0, 650.0, 200.0))
@@ -356,10 +944,160 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         self.assertEqual(len(self.widget.adapter.preview_sheet_label_items), 2)
         self.assertEqual(
             [item.text() for item in self.widget.adapter.preview_sheet_label_items],
-            ["Chapa 01 — prévia", "Chapa 02 — prévia"],
+            [
+                "Chapa 01 — prévia  ·  X0 Y0",
+                "Chapa 02 — prévia  ·  X0 Y0",
+            ],
         )
         self.widget.adapter.clear_preview_sheet_bounds()
         self.assertFalse(self.widget.adapter.preview_sheet_label_items)
+
+    def test_remnant_cut_preview_becomes_a_selectable_document_vector(self):
+        before = dict(self.document.entities_by_id)
+        cut = {
+            "sheet_index": 0,
+            "start": [0.0, 170.0],
+            "end": [300.0, 170.0],
+            "remnant_bounds": [0.0, 170.0, 300.0, 200.0],
+            "area": 9000.0,
+        }
+
+        self.widget.adapter.show_preview_remnant_cuts([cut])
+        self.assertEqual(len(self.widget.adapter.preview_remnant_cut_items), 1)
+        self.assertEqual(len(self.widget.adapter.preview_remnant_label_items), 1)
+        self.widget.adapter.clear_preview_remnant_cuts()
+        self.assertFalse(self.widget.adapter.preview_remnant_cut_items)
+
+        remnant = self.PathEntity.from_points(
+            self.document.active_layer_id,
+            (self.Vec2(0.0, 170.0), self.Vec2(300.0, 170.0)),
+            metadata={
+                "woodcam_role": "remnant_cut",
+                "sheet_index": 0,
+                "cut_start": cut["start"],
+                "cut_end": cut["end"],
+                "remnant_bounds": cut["remnant_bounds"],
+                "remnant_area_mm2": cut["area"],
+            },
+        )
+        cut["entity_id"] = remnant.id
+        self.widget.controller.execute(
+            self.CompositeCommand(
+                (
+                    self.AddEntitiesCommand((remnant,)),
+                    self.SetDocumentMetadataCommand(
+                        "organization_remnant_cuts",
+                        [cut],
+                    ),
+                ),
+                label="Criar linha de separação",
+            )
+        )
+        self.app.processEvents()
+
+        self.assertEqual(len(self.document.entities_by_id), len(before) + 1)
+        self.assertIn(remnant.id, self.widget.adapter.items_by_id)
+        # Metadata retains the upright area label, while the actual dashed
+        # line is the ordinary selectable EntityGraphicsItem (no duplicate).
+        self.assertEqual(len(self.widget.adapter.remnant_cut_items), 0)
+        self.assertEqual(len(self.widget.adapter.remnant_label_items), 1)
+        self.assertIn(
+            "Retalho 300 × 30 mm",
+            self.widget.adapter.remnant_label_items[0].text(),
+        )
+        self.widget.controller.selection.select_only(remnant.id)
+        self.widget.adapter.update_selection()
+        self.assertEqual(self.widget.selected_entity_ids, (remnant.id,))
+        self.widget.controller.undo()
+        self.app.processEvents()
+        self.assertNotIn(remnant.id, self.document.entities_by_id)
+        self.assertFalse(self.widget.adapter.remnant_cut_items)
+
+    def test_sheet_panel_uses_a_local_origin_for_status_snap_and_exact_position(self):
+        self.widget.controller.execute(
+            self.SetDocumentMetadataCommand(
+                "organization_sheet_bounds",
+                [[0.0, 0.0, 300.0, 200.0], [350.0, 0.0, 650.0, 200.0]],
+            )
+        )
+        second_id = self.widget.controller.add_line(
+            self.Vec2(370.0, 50.0), self.Vec2(400.0, 50.0)
+        )
+        self.app.processEvents()
+
+        self.assertEqual(self.widget.sheet_panel.list.count(), 2)
+        self.assertEqual(self.widget.sheet_panel.current_index(), 1)
+        self.assertEqual(self.widget._active_sheet_origin, QtCore.QPointF(350.0, 0.0))
+        self.assertAlmostEqual(self.widget.properties_panel.x_field.value(), 20.0)
+        self.widget.view.cursorMoved.emit(QtCore.QPointF(351.0, 2.0))
+        self.app.processEvents()
+        self.assertIn("X 1.000", self.widget.position_label.text())
+        self.assertIn("Y 2.000", self.widget.position_label.text())
+
+        settings = self.widget.controller.snap_engine.settings
+        self.assertEqual(settings.grid_origin_x_mm, 350.0)
+        self.assertEqual(settings.grid_origin_y_mm, 0.0)
+        self.assertEqual(
+            self.widget.horizontal_ruler._coordinate_origin,
+            QtCore.QPointF(350.0, 0.0),
+        )
+
+        self.widget.properties_panel.x_field.setValue(30.0)
+        self.widget.properties_panel.apply_button.click()
+        self.app.processEvents()
+        self.assertAlmostEqual(self.document.get_entity(second_id).bounds().min_x, 380.0)
+        self.widget.undo()
+        self.assertAlmostEqual(self.document.get_entity(second_id).bounds().min_x, 370.0)
+
+    def test_hovering_an_empty_sheet_activates_its_local_zero_before_drawing(self):
+        self.widget.controller.execute(
+            self.SetDocumentMetadataCommand(
+                "organization_sheet_bounds",
+                [[0.0, 0.0, 300.0, 200.0], [350.0, 0.0, 650.0, 200.0]],
+            )
+        )
+        self.widget.controller.selection.clear()
+        self.widget.sheet_panel.list.setCurrentRow(0)
+        self.app.processEvents()
+
+        self.widget.view.cursorMoved.emit(QtCore.QPointF(351.0, 2.0))
+        self.app.processEvents()
+
+        self.assertEqual(self.widget.sheet_panel.current_index(), 1)
+        self.assertEqual(
+            self.widget._active_sheet_origin,
+            QtCore.QPointF(350.0, 0.0),
+        )
+        self.assertIn("X 1.000", self.widget.position_label.text())
+        self.assertIn("Y 2.000", self.widget.position_label.text())
+
+    def test_side_sections_collapse_without_touching_document_or_selection(self):
+        self.widget.controller.selection.select_only(self.path_id)
+        revision = self.document.revision
+        selected = self.widget.controller.selection.ids
+        panels = (
+            self.widget.sheet_panel,
+            self.widget.layer_panel,
+            self.widget.pieces_panel,
+            self.widget.properties_panel,
+            self.widget.transform_panel,
+        )
+        for panel in panels:
+            expanded_maximum = panel.maximumHeight()
+            self.assertEqual(panel._collapse_button.text(), "▼")
+            self.assertGreaterEqual(panel._collapse_button.width(), 27)
+            panel._collapse_button.click()
+            self.app.processEvents()
+            self.assertTrue(panel.collapsed)
+            self.assertEqual(panel._collapse_button.text(), "▶")
+            self.assertLessEqual(panel.maximumHeight(), panel._header_height())
+            panel._collapse_button.click()
+            self.app.processEvents()
+            self.assertFalse(panel.collapsed)
+            self.assertEqual(panel._collapse_button.text(), "▼")
+            self.assertEqual(panel.maximumHeight(), expanded_maximum)
+        self.assertEqual(self.document.revision, revision)
+        self.assertEqual(self.widget.controller.selection.ids, selected)
 
     def test_right_click_cancels_tool_and_workflow_then_clears_selection(self):
         viewport = self.widget.view.viewport()
@@ -405,7 +1143,9 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         self.assertEqual(self.widget.controller.mode, self.EditorMode.SELECT)
         self.assertEqual(self.widget.controller.selection.ids, ())
 
-    def test_grid_spacing_drives_visual_grid_and_snap_independently_of_snap_toggle(self):
+    def test_grid_has_its_own_visibility_and_snap_control(self):
+        from woodcam_editor.presentation.compat import qt_enum
+
         self.widget.grid_spacing.setValue(7.5)
         self.app.processEvents()
         self.assertAlmostEqual(self.widget.view.grid_spacing_mm, 7.5)
@@ -417,7 +1157,155 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         self.app.processEvents()
         self.assertTrue(self.widget.view.grid_visible)
         self.assertAlmostEqual(self.widget.view.grid_spacing_mm, 7.5)
+        self.assertTrue(self.widget.controller.snap_engine.settings.grid)
+        self.assertFalse(self.widget.controller.snap_engine.settings.endpoint)
+
+        self.widget.grid_checkbox.setChecked(False)
+        self.app.processEvents()
+        self.assertFalse(self.widget.view.grid_visible)
         self.assertFalse(self.widget.controller.snap_engine.settings.grid)
+        self.assertFalse(self.widget.grid_spacing.isEnabled())
+        self.assertEqual(
+            self.widget.adapter.work_area_item.brush().style(),
+            qt_enum(QtCore.Qt, "NoBrush", "BrushStyle"),
+        )
+
+        # Geometry snap and grid snap are independent in both directions.
+        self.widget.snap_checkbox.setChecked(True)
+        self.app.processEvents()
+        self.assertTrue(self.widget.controller.snap_engine.settings.endpoint)
+        self.assertFalse(self.widget.controller.snap_engine.settings.grid)
+
+    def test_rulers_show_mouse_coordinate_markers_and_clear_on_leave(self):
+        viewport_position = self.widget.view.viewport().rect().center()
+        scene_position = self.widget.view.mapToScene(viewport_position)
+        self.widget.view.cursorMoved.emit(scene_position)
+        self.app.processEvents()
+
+        for ruler in (self.widget.horizontal_ruler, self.widget.vertical_ruler):
+            marker_position = ruler.cursor_scene_position
+            self.assertIsNotNone(marker_position)
+            self.assertAlmostEqual(marker_position.x(), scene_position.x(), places=6)
+            self.assertAlmostEqual(marker_position.y(), scene_position.y(), places=6)
+
+            coordinate = ruler._marker_coordinate(scene_position)
+            self.assertIsNotNone(coordinate)
+            dirty_rect = ruler._marker_rect(coordinate)
+            self.assertFalse(dirty_rect.isNull())
+            # Repaint executes the triangle-arrow branch without touching the
+            # vector document or requiring a screenshot assertion.
+            ruler.repaint(dirty_rect)
+
+        self.widget.view.cursorLeft.emit()
+        self.app.processEvents()
+        self.assertIsNone(self.widget.horizontal_ruler.cursor_scene_position)
+        self.assertIsNone(self.widget.vertical_ruler.cursor_scene_position)
+
+    def test_empty_canvas_coalesces_only_visual_cursor_feedback(self):
+        """High-rate mouse packets must not repaint both rulers per packet."""
+
+        view = self.widget.view
+        view._cursor_display_timer.stop()
+        view._pending_cursor_display = None
+        received = []
+        view.cursorMoved.connect(received.append)
+        for index in range(200):
+            view._queue_cursor_display(QtCore.QPointF(index, index * 2))
+        self.assertTrue(view._cursor_display_timer.isActive())
+        self.assertEqual(received, [QtCore.QPointF(0.0, 0.0)])
+        view._cursor_display_timer.stop()
+        view._flush_cursor_display()
+        self.assertEqual(len(received), 2)
+        self.assertEqual(received[-1], QtCore.QPointF(199.0, 398.0))
+
+    def test_pan_and_rectangle_preview_use_frames_but_commit_exact_click(self):
+        view = self.widget.view
+        viewport = view.viewport()
+        center = viewport.rect().center()
+        before_center = view.mapToScene(center)
+        extent_calls = []
+        original_extent = view._ensure_free_pan_extent
+
+        def counted_extent():
+            extent_calls.append(True)
+            return original_extent()
+
+        view._ensure_free_pan_extent = counted_extent
+        try:
+            QtTest.QTest.mousePress(
+                viewport, QtCore.Qt.MiddleButton, QtCore.Qt.NoModifier, center
+            )
+            for index in range(200):
+                QtTest.QTest.mouseMove(
+                    viewport,
+                    center + QtCore.QPoint(index % 80, (index * 3) % 50),
+                    -1,
+                )
+            QtTest.QTest.mouseRelease(
+                viewport, QtCore.Qt.MiddleButton, QtCore.Qt.NoModifier,
+                center + QtCore.QPoint(39, 47),
+            )
+            self.app.processEvents()
+        finally:
+            view._ensure_free_pan_extent = original_extent
+        self.assertLess(len(extent_calls), 10)
+        self.assertNotEqual(view.mapToScene(center), before_center)
+
+        self.widget.activate_tool(self.EditorMode.DRAW_RECTANGLE)
+        before_ids = set(self.document.entities_by_id)
+        first_screen = QtCore.QPoint(
+            max(10, viewport.width() // 4), max(10, viewport.height() // 4)
+        )
+        final_screen = QtCore.QPoint(
+            max(20, viewport.width() * 3 // 4),
+            max(20, viewport.height() * 3 // 4),
+        )
+        first_scene = view.mapToScene(first_screen)
+        final_scene = view.mapToScene(final_screen)
+        QtTest.QTest.mouseClick(
+            viewport,
+            QtCore.Qt.LeftButton,
+            QtCore.Qt.ShiftModifier,
+            first_screen,
+        )
+        preview_frames = []
+        view.pointerMoved.connect(preview_frames.append)
+        for index in range(200):
+            QtTest.QTest.mouseMove(
+                viewport,
+                QtCore.QPoint(
+                    first_screen.x()
+                    + (final_screen.x() - first_screen.x()) * index // 199,
+                    first_screen.y()
+                    + (final_screen.y() - first_screen.y()) * index // 199,
+                ),
+                -1,
+            )
+        self.assertLess(len(preview_frames), 50)
+        QtTest.QTest.mouseClick(
+            viewport,
+            QtCore.Qt.LeftButton,
+            QtCore.Qt.ShiftModifier,
+            final_screen,
+        )
+        self.app.processEvents()
+        added_ids = set(self.document.entities_by_id) - before_ids
+        self.assertEqual(len(added_ids), 1)
+        bounds = self.document.get_entity(next(iter(added_ids))).bounds()
+        self.assertAlmostEqual(
+            bounds.min_x, min(first_scene.x(), final_scene.x()), places=6
+        )
+        self.assertAlmostEqual(
+            bounds.max_x, max(first_scene.x(), final_scene.x()), places=6
+        )
+        self.assertAlmostEqual(
+            bounds.min_y, min(first_scene.y(), final_scene.y()), places=6
+        )
+        self.assertAlmostEqual(
+            bounds.max_y, max(first_scene.y(), final_scene.y()), places=6
+        )
+        self.widget.undo()
+        self.assertEqual(set(self.document.entities_by_id), before_ids)
 
     def test_body_and_node_drags_are_single_undoable_commands(self):
         viewport = self.widget.view.viewport()
@@ -562,6 +1450,47 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         self.widget.undo()
         self.assertTrue(self.document.layers_by_id[original_layer_id].visible)
 
+    def test_layer_visibility_does_not_rebuild_paths_or_scene_bounds(self):
+        item = self.widget.adapter.items_by_id[self.path_id]
+        item_type = type(item)
+        original_update = item_type.update_entity
+        updated_ids = []
+
+        def observe_update(graphics_item, entity):
+            updated_ids.append(str(entity.id))
+            return original_update(graphics_item, entity)
+
+        with patch.object(item_type, "update_entity", new=observe_update), patch.object(
+            self.widget.adapter,
+            "_update_scene_rect",
+            wraps=self.widget.adapter._update_scene_rect,
+        ) as update_bounds:
+            self.widget.controller.update_layer(
+                self.document.active_layer_id,
+                visible=False,
+            )
+
+        self.assertEqual(updated_ids, [])
+        self.assertEqual(update_bounds.call_count, 0)
+        self.assertFalse(item.isVisible())
+
+    def test_layer_checkbox_reuses_existing_tree_controls(self):
+        from woodcam_editor.presentation.compat import qt_enum
+
+        panel = self.widget.layer_panel
+        row = panel.tree.topLevelItem(0)
+        checkbox = panel.tree.itemWidget(row, 2)
+        role = qt_enum(QtCore.Qt, "UserRole", "ItemDataRole")
+        layer_ids = row.data(0, role)
+
+        panel._set_visible(layer_ids, False)
+
+        self.assertIs(panel.tree.itemWidget(row, 2), checkbox)
+        self.assertFalse(checkbox.isChecked())
+        self.assertTrue(
+            all(not self.document.layers_by_id[value].visible for value in layer_ids)
+        )
+
     def test_external_reload_refreshes_every_side_panel_through_controller(self):
         from woodcam_editor.adapters.freecad_commands import copy_document_state
         from woodcam_editor.domain import Piece2D, ReplacePiecesCommand
@@ -608,6 +1537,20 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         self.assertIn("Interseção de vetores", edit_actions)
         self.assertIn("Inverter direção dos vetores", edit_actions)
         self.assertIn("Editar texto vetorial…", edit_actions)
+        self.assertTrue(all(not action.icon().isNull() for action in edit_actions.values()))
+        self.assertTrue(all(not action.icon().isNull() for action in repair_actions.values()))
+        edit_flyout = self.widget.findChild(
+            QtWidgets.QToolButton,
+            "drawingGroupEditar",
+        )
+        repair_flyout = self.widget.findChild(
+            QtWidgets.QToolButton,
+            "drawingGroupReparar",
+        )
+        self.assertIsNotNone(edit_flyout)
+        self.assertIsNotNone(repair_flyout)
+        self.assertIn(edit_actions["Copiar"], edit_flyout.menu().actions())
+        self.assertIn(repair_actions["Trim interativo"], repair_flyout.menu().actions())
         self.assertTrue(
             self.widget.findChild(QtWidgets.QToolButton, "drawingActionTextovetorial")
         )
@@ -690,6 +1633,33 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         )
         self.app.processEvents()
         self.assertEqual(self.widget.controller.selection.ids, (self.path_id,))
+
+    def test_ctrl_c_ctrl_v_pastes_whole_group_once_and_undoes_once(self):
+        from woodcam_editor.domain import CircleEntity, GroupEntitiesCommand
+
+        hole = CircleEntity(
+            self.document.active_layer_id, self.Vec2(150.0, 100.0), 8.0
+        )
+        self.widget.controller.execute(self.AddEntitiesCommand((hole,)))
+        self.widget.controller.execute(
+            GroupEntitiesCommand((self.path_id, hole.id), group_id="clipboard-piece")
+        )
+        self.widget.controller.selection.select_only("clipboard-piece")
+        self.widget.view.setFocus()
+
+        QtTest.QTest.keyClick(self.widget.view, QtCore.Qt.Key_C, QtCore.Qt.ControlModifier)
+        QtTest.QTest.keyClick(self.widget.view, QtCore.Qt.Key_V, QtCore.Qt.ControlModifier)
+        self.app.processEvents()
+
+        copied_id = self.widget.controller.selection.primary_id
+        copied_group = self.document.get_entity(copied_id)
+        self.assertIsInstance(copied_group, self.GroupEntity)
+        self.assertEqual(len(copied_group.child_ids), 2)
+        self.assertEqual(len(self.document.entities_by_id), 6)
+        self.assertIn("peça inteira", self.widget.mode_label.text().lower())
+
+        self.widget.undo()
+        self.assertEqual(set(self.document.entities_by_id), {self.path_id, hole.id, "clipboard-piece"})
 
     def test_canvas_keeps_focus_for_delete_shortcut(self):
         self.widget.activate_tool(self.EditorMode.SELECT)

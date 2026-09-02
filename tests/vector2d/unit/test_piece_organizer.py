@@ -42,6 +42,80 @@ class PieceOrganizerTest(unittest.TestCase):
         self.assertEqual(result.open_entity_ids, ["open"])
         self.assertEqual(result.pieces, [])
 
+    def test_remnant_cut_is_not_a_piece_or_an_open_vector_blocker(self):
+        remnant = _Path(
+            "remnant",
+            [(0, 100), (200, 100)],
+            closed=False,
+            metadata={"woodcam_role": "remnant_cut"},
+        )
+
+        result = classify_document_pieces(_Document([remnant]))
+
+        self.assertEqual(result.open_entity_ids, [])
+        self.assertEqual(result.pieces, [])
+
+    def test_open_markings_inside_one_piece_are_owned_and_do_not_block_nesting(self):
+        outer = _Path("outer", [(0, 0), (200, 0), (200, 50), (0, 50)])
+        marks = (
+            _Path("mark-a", [(50, 15), (50, 35)], closed=False),
+            _Path("mark-b", [(100, 15), (100, 35)], closed=False),
+            _Path("mark-c", [(150, 15), (150, 35)], closed=False),
+        )
+        outside = _Path("outside", [(250, 10), (250, 30)], closed=False)
+
+        result = classify_document_pieces(_Document((outer, *marks, outside)))
+
+        self.assertEqual(len(result.pieces), 1)
+        self.assertEqual(
+            set(result.pieces[0].marking_ids),
+            {"mark-a", "mark-b", "mark-c"},
+        )
+        self.assertEqual(
+            set(result.marking_entity_ids),
+            {"mark-a", "mark-b", "mark-c"},
+        )
+        self.assertEqual(result.open_entity_ids, ["outside"])
+        organized = organize_pieces(result.pieces, (0, 0, 500, 500), spacing=5)
+        self.assertEqual(
+            set(organized.placements[0].entity_ids),
+            {"outer", "mark-a", "mark-b", "mark-c"},
+        )
+
+    def test_open_path_inside_a_cutout_is_not_claimed_as_piece_marking(self):
+        outer = _Path("outer", [(0, 0), (100, 0), (100, 100), (0, 100)])
+        cutout = _Path("cutout", [(30, 30), (70, 30), (70, 70), (30, 70)])
+        open_path = _Path("open-in-cutout", [(40, 50), (60, 50)], closed=False)
+
+        result = classify_document_pieces(_Document((outer, cutout, open_path)))
+
+        self.assertEqual(result.pieces[0].marking_ids, ())
+        self.assertEqual(result.marking_entity_ids, [])
+        self.assertEqual(result.open_entity_ids, ["open-in-cutout"])
+
+    def test_open_path_crossing_a_concave_boundary_remains_ambiguous(self):
+        outer = _Path(
+            "concave",
+            [(0, 0), (100, 0), (100, 30), (30, 30), (30, 100), (0, 100)],
+        )
+        crossing = _Path("crossing", [(15, 80), (80, 15)], closed=False)
+
+        result = classify_document_pieces(_Document((outer, crossing)))
+
+        self.assertEqual(result.pieces[0].marking_ids, ())
+        self.assertEqual(result.open_entity_ids, ["crossing"])
+
+    def test_open_path_on_overlapping_pieces_is_not_attached_arbitrarily(self):
+        first = _Path("first", [(0, 0), (100, 0), (100, 50), (0, 50)])
+        second = _Path("second", [(50, 0), (150, 0), (150, 50), (50, 50)])
+        ambiguous = _Path("ambiguous", [(60, 25), (90, 25)], closed=False)
+
+        result = classify_document_pieces(_Document((first, second, ambiguous)))
+
+        self.assertEqual(len(result.pieces), 2)
+        self.assertTrue(all(not piece.marking_ids for piece in result.pieces))
+        self.assertEqual(result.open_entity_ids, ["ambiguous"])
+
     def test_reports_piece_that_does_not_fit(self):
         outer = _Path("large", [(0, 0), (300, 0), (300, 200), (0, 200)])
         classified = classify_document_pieces(_Document([outer]))

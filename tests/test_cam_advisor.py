@@ -56,6 +56,21 @@ class CAMAdvisorTests(unittest.TestCase):
         self.assertEqual(codes, {"finish-tool", "finish-stepover-high"})
         self.assertEqual(report.recommendation_count, 2)
 
+    def test_report_formatter_accepts_presentation_translator(self):
+        report = analyze_cam_settings(
+            settings(
+                operation_mode="finish3d",
+                tool_type="end_mill",
+                finish3d_stepover_percent=25.0,
+            )
+        )
+        translated = report.to_plain_text(
+            translator=lambda value: "EN<%s>" % value
+        )
+        self.assertIn("[EN<SUGESTÃO>]", translated)
+        self.assertIn("EN<Acabamento 3D sem fresa esférica>", translated)
+        self.assertIn("EN<Valor sugerido para revisar: 10>", translated)
+
     def test_geometry_warns_when_tool_is_larger_than_selected_region(self):
         report = analyze_cam_settings(
             settings(operation_mode="pocket", pocket_stepover_percent=40.0),

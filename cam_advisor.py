@@ -8,7 +8,7 @@ tool and finish observations before the normal preview/apply workflow.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 
 _LEVEL_ORDER = {"warning": 0, "recommendation": 1, "info": 2}
@@ -41,9 +41,13 @@ class CAMAdviceReport:
     def is_clear(self) -> bool:
         return not self.items
 
-    def to_plain_text(self) -> str:
+    def to_plain_text(
+        self,
+        translator: Optional[Callable[[str], str]] = None,
+    ) -> str:
+        translate = translator or (lambda value: value)
         if not self.items:
-            return (
+            return translate(
                 "Nenhum alerta conservador foi encontrado. Isso não substitui "
                 "a pré-visualização, a simulação nem a conferência na máquina."
             )
@@ -54,14 +58,20 @@ class CAMAdviceReport:
         }
         lines = []
         for item in self.items:
-            lines.append("[%s] %s" % (labels[item.level], item.title))
-            lines.append(item.explanation)
+            lines.append(
+                "[%s] %s"
+                % (translate(labels[item.level]), translate(item.title))
+            )
+            lines.append(translate(item.explanation))
             if item.suggested_value is not None:
-                lines.append("Valor sugerido para revisar: %g" % item.suggested_value)
+                lines.append(
+                    translate("Valor sugerido para revisar: %g")
+                    % item.suggested_value
+                )
             lines.append("")
-        lines.append(
+        lines.append(translate(
             "O assistente apenas analisa: nenhum parâmetro, geometria ou G-code foi alterado."
-        )
+        ))
         return "\n".join(lines).strip()
 
 

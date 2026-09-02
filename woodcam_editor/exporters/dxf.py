@@ -37,18 +37,39 @@ def _layer_color(document: Any, entity: Any) -> Optional[int]:
 
 def _selected_entities(document: Any, entity_ids: Optional[Sequence[str]], visible_only: bool):
     entities = getattr(document, "entities_by_id", {}) or {}
-    values = [entities[item] for item in entity_ids] if entity_ids is not None else list(entities.values())
     layers = getattr(document, "layers_by_id", {}) or {}
-    return [
-        entity
-        for entity in values
-        if hasattr(entity, "layer_id")
-        and (
-            not visible_only
-            or layers.get(entity.layer_id) is None
-            or bool(getattr(layers[entity.layer_id], "visible", True))
-        )
-    ]
+    requested_ids = (
+        tuple(str(item) for item in entity_ids)
+        if entity_ids is not None
+        else tuple(str(item) for item in entities)
+    )
+    result = []
+    visited = set()
+
+    def append_leaf(entity_id: str) -> None:
+        if entity_id in visited:
+            return
+        visited.add(entity_id)
+        entity = entities.get(entity_id)
+        if entity is None:
+            return
+        child_ids = tuple(getattr(entity, "child_ids", ()) or ())
+        if child_ids:
+            for child_id in child_ids:
+                append_leaf(str(child_id))
+            return
+        if not hasattr(entity, "layer_id"):
+            return
+        layer = layers.get(entity.layer_id)
+        if visible_only and layer is not None and not bool(
+            getattr(layer, "visible", True)
+        ):
+            return
+        result.append(entity)
+
+    for requested_id in requested_ids:
+        append_leaf(requested_id)
+    return result
 
 
 def _entity_header(lines: list[str], entity_type: str, layer: str, subclass: str) -> None:

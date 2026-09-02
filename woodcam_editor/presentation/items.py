@@ -136,12 +136,23 @@ class EntityGraphicsItem(QtWidgets.QGraphicsPathItem):
         # A muted rose keeps vectors distinct from the slate/gray CAM path
         # without using the orange reserved for CAM previews and warnings.
         self._base_color = QtGui.QColor("#b4536a")
+        self._is_pocket_region = False
+        self._is_pocket_island = False
+        self._is_remnant_cut = False
         self.setAcceptedMouseButtons(QtCore.Qt.NoButton if hasattr(QtCore.Qt, "NoButton") else QtCore.Qt.MouseButton.NoButton)
         self.setZValue(10.0)
         self.update_entity(entity)
 
     def update_entity(self, entity):
         self.entity_id = str(entity.id)
+        role = str(
+            (getattr(entity, "metadata", {}) or {}).get("import_role", "") or ""
+        )
+        self._is_pocket_region = role == "pocket_region"
+        self._is_pocket_island = role == "pocket_island"
+        self._is_remnant_cut = str(
+            (getattr(entity, "metadata", {}) or {}).get("woodcam_role", "") or ""
+        ).strip().lower() == "remnant_cut"
         self.setPath(entity_painter_path(entity))
         self.setPos(0.0, 0.0)
         self._apply_style()
@@ -155,11 +166,31 @@ class EntityGraphicsItem(QtWidgets.QGraphicsPathItem):
     def _apply_style(self):
         # Aspire keeps selected vectors dark and uses bounds/handles as the
         # selection cue. Orange is reserved for CAM previews.
-        color = QtGui.QColor("#111827") if self._selected else self._base_color
+        if self._is_remnant_cut:
+            color = QtGui.QColor("#c2410c") if self._selected else QtGui.QColor("#ea580c")
+        elif self._is_pocket_region:
+            color = QtGui.QColor("#134e4a") if self._selected else QtGui.QColor("#0f766e")
+        elif self._is_pocket_island:
+            color = QtGui.QColor("#134e4a") if self._selected else QtGui.QColor("#0d9488")
+        else:
+            color = QtGui.QColor("#111827") if self._selected else self._base_color
         pen = QtGui.QPen(color, 1.8 if self._selected else 1.35)
         pen.setCosmetic(True)
+        if self._is_remnant_cut:
+            dash = getattr(QtCore.Qt, "DashLine", None)
+            if dash is None:
+                dash = QtCore.Qt.PenStyle.DashLine
+            pen.setStyle(dash)
         self.setPen(pen)
-        self.setBrush(QtGui.QBrush(QtCore.Qt.NoBrush if hasattr(QtCore.Qt, "NoBrush") else QtCore.Qt.BrushStyle.NoBrush))
+        if self._is_pocket_region:
+            fill = QtGui.QColor("#0f766e")
+            fill.setAlpha(92 if self._selected else 62)
+            hatch = getattr(QtCore.Qt, "BDiagPattern", None)
+            if hatch is None:
+                hatch = QtCore.Qt.BrushStyle.BDiagPattern
+            self.setBrush(QtGui.QBrush(fill, hatch))
+        else:
+            self.setBrush(QtGui.QBrush(QtCore.Qt.NoBrush if hasattr(QtCore.Qt, "NoBrush") else QtCore.Qt.BrushStyle.NoBrush))
 
 
 __all__ = ["EntityGraphicsItem", "entity_painter_path"]

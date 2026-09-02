@@ -54,6 +54,20 @@ class EditorTransformationTests(unittest.TestCase):
         self.controller.undo()
         self.assertEqual(self.document.get_entity(entity.id), entity)
 
+    def test_percentage_scale_is_uniform_centered_and_one_undo(self):
+        entity = rectangle(self.document, 10.0, 20.0, 40.0, 20.0)
+        self.add(entity)
+        original_center = entity.bounds().center
+
+        self.assertTrue(self.controller.scale_selection_percent(150.0))
+
+        scaled = self.document.get_entity(entity.id)
+        self.assertAlmostEqual(scaled.bounds().width, 60.0)
+        self.assertAlmostEqual(scaled.bounds().height, 30.0)
+        self.assertTrue(scaled.bounds().center.almost_equals(original_center, 1e-9))
+        self.controller.undo()
+        self.assertEqual(self.document.get_entity(entity.id), entity)
+
     def test_mirror_horizontal_and_vertical_are_undoable(self):
         triangle = PathEntity.from_points(
             self.document.active_layer_id,

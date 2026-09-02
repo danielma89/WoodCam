@@ -9,6 +9,8 @@ from .items import entity_painter_path
 
 
 def _xy(point):
+    if isinstance(point, dict):
+        return float(point["x"]), float(point["y"])
     x = point.x() if callable(getattr(point, "x", None)) else point.x
     y = point.y() if callable(getattr(point, "y", None)) else point.y
     return float(x), float(y)
@@ -52,19 +54,29 @@ class MeasureBubbleItem(QtWidgets.QGraphicsItem):
         self._text = ""
         self._font = QtGui.QFont()
         self._font.setPointSize(9)
+        self._bounds = QtCore.QRectF(12.0, -34.0, 16.0, 22.0)
         self.setFlag(IGNORE_TRANSFORM, True)
         self.setZValue(140.0)
         self.hide()
 
     def set_text(self, text):
+        text = str(text)
+        if text == self._text:
+            return
         self.prepareGeometryChange()
-        self._text = str(text)
+        self._text = text
+        metrics = QtGui.QFontMetricsF(self._font)
+        bounds = metrics.boundingRect(self._text)
+        self._bounds = QtCore.QRectF(
+            12.0,
+            -bounds.height() - 22.0,
+            bounds.width() + 16.0,
+            bounds.height() + 10.0,
+        )
         self.update()
 
     def boundingRect(self):
-        metrics = QtGui.QFontMetricsF(self._font)
-        bounds = metrics.boundingRect(self._text)
-        return QtCore.QRectF(12.0, -bounds.height() - 22.0, bounds.width() + 16.0, bounds.height() + 10.0)
+        return QtCore.QRectF(self._bounds)
 
     def paint(self, painter, option, widget=None):
         rect = self.boundingRect()
@@ -171,6 +183,7 @@ class OverlayLayer:
         )
         self.scene.addItem(self.toolpath_direction_item)
         self.toolpath_direction_item.hide()
+        self._toolpath_components = {}
 
         self.preview_item = QtWidgets.QGraphicsPathItem()
         preview_pen = QtGui.QPen(QtGui.QColor("#d946ef"), 1.8)
@@ -219,6 +232,11 @@ class OverlayLayer:
         self.measure_item = MeasureBubbleItem()
         self.scene.addItem(self.measure_item)
 
+        # Manual CAM tabs are operation settings projected over the editor.
+        # They are deliberately separate from vector items and never
+        # participate in hit-testing or document persistence.
+        self.tab_marker_items = []
+
     def clear_transient(self):
         self.preview_item.hide()
         self.preview_item.setPath(QtGui.QPainterPath())
@@ -244,9 +262,13 @@ class OverlayLayer:
         min_x, min_y = bound("min_x", 0), bound("min_y", 1)
         max_x, max_y = bound("max_x", 2), bound("max_y", 3)
         rect = QtCore.QRectF(min_x, min_y, max_x - min_x, max_y - min_y).normalized()
-        if rect.width() <= 1e-9 or rect.height() <= 1e-9:
-            self.clear_selection_transform()
-            return
+        # A line (or another degenerate entity) still needs a visible
+        # transform affordance.  This is presentation-only padding; domain
+        # geometry stays exact and commands continue to use its real bounds.
+        if rect.width() <= 1e-9:
+            rect.adjust(-0.5, 0.0, 0.5, 0.0)
+        if rect.height() <= 1e-9:
+            rect.adjust(0.0, -0.5, 0.0, 0.5)
         self.selection_frame_item.setRect(rect)
         self.selection_frame_item.show()
         self.selection_pivot_item.setPos(rect.center())
@@ -306,6 +328,16 @@ class OverlayLayer:
                 best = (distance, index)
         return best[1] if best is not None else None
 
+    def hit_test_selection_pivot(self, view, screen_pos, radius_px=10.0):
+        """Whether the explicit transform centre owns this screen click."""
+        if not self.selection_pivot_item.isVisible():
+            return False
+        point = view.mapFromScene(self.selection_pivot_item.scenePos())
+        return math.hypot(
+            float(point.x() - screen_pos.x()),
+            float(point.y() - screen_pos.y()),
+        ) <= float(radius_px)
+
     def clear_measurement_preview(self):
         """Clear the previous measurement while preserving the snap marker."""
         self.preview_item.hide()
@@ -314,6 +346,7 @@ class OverlayLayer:
 
     def clear_toolpath_preview(self):
         """Hide the plan-view CAM overlay without touching vectors or CAM."""
+        self._toolpath_components = {}
         for item in self.toolpath_items.values():
             item.hide()
             item.setPath(QtGui.QPainterPath())
@@ -321,6 +354,36 @@ class OverlayLayer:
         self.toolpath_entry_item.setPath(QtGui.QPainterPath())
         self.toolpath_direction_item.hide()
         self.toolpath_direction_item.setPath(QtGui.QPainterPath())
+
+    def clear_tab_markers(self):
+        for item in self.tab_marker_items:
+            self.scene.removeItem(item)
+        self.tab_marker_items = []
+
+    def show_tab_markers(self, positions):
+        """Show screen-sized CAM tab targets without creating vector state."""
+        self.clear_tab_markers()
+        no_button = (
+            QtCore.Qt.NoButton
+            if hasattr(QtCore.Qt, "NoButton")
+            else QtCore.Qt.MouseButton.NoButton
+        )
+        for position in tuple(positions or ()):
+            try:
+                x_value, y_value = _xy(position)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            marker = QtWidgets.QGraphicsEllipseItem(-6.0, -6.0, 12.0, 12.0)
+            marker.setFlag(IGNORE_TRANSFORM, True)
+            marker.setPos(x_value, y_value)
+            pen = QtGui.QPen(QtGui.QColor("#dc2626"), 2.0)
+            pen.setCosmetic(True)
+            marker.setPen(pen)
+            marker.setBrush(QtGui.QBrush(QtGui.QColor(254, 240, 138, 150)))
+            marker.setZValue(136.0)
+            marker.setAcceptedMouseButtons(no_button)
+            self.scene.addItem(marker)
+            self.tab_marker_items.append(marker)
 
     @staticmethod
     def _toolpath_path(segments):
@@ -344,6 +407,13 @@ class OverlayLayer:
         only XY, so vertical plunges correctly have no visible length here.
         """
         components = dict(components or {})
+        # Keep an immutable-enough presentation snapshot for printing.  This
+        # is never promoted to VectorDocument or used to regenerate CAM.
+        self._toolpath_components = {
+            str(key): tuple(value or ())
+            for key, value in components.items()
+            if isinstance(value, (tuple, list))
+        }
         any_segment = False
         for key, item in self.toolpath_items.items():
             path = self._toolpath_path(components.get(key, ()))

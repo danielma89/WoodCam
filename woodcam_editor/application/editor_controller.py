@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from enum import Enum
 import inspect
 import math
@@ -18,6 +19,7 @@ class CommandExecutionCancelled(RuntimeError):
 
 class EditorMode(str, Enum):
     SELECT = "select"
+    TRANSFORM = "transform"
     MEASURE = "measure"
     NODE_EDIT = "node_edit"
     DRAW_LINE = "draw_line"
@@ -75,6 +77,8 @@ class EditorController:
     domain's ``InMemoryCommandHistory``.
     """
 
+    PASTE_CASCADE_MM = 10.0
+
     def __init__(
         self,
         document: Any,
@@ -103,6 +107,13 @@ class EditorController:
             except Exception:
                 history = None
         self.history = history
+        self._clipboard_document = None
+        self._clipboard_root_ids: Tuple[str, ...] = ()
+        self._paste_generation = 0
+        self._group_parent_cache_key = None
+        self._group_parent_cache: Dict[str, str] = {}
+        self._selection_bounds_cache_key = None
+        self._selection_bounds_cache = None
 
     def subscribe_document(self, listener: Callable[[Any], None]) -> Callable[[], None]:
         self._listeners.append(listener)
@@ -250,6 +261,120 @@ class EditorController:
         self.selection.replace(command.created_root_ids)
         return True
 
+    def copy_selection(self) -> int:
+        """Snapshot selected whole objects into the editor-local clipboard."""
+
+        roots = list(self.canonical_group_selection(self.selection.ids))
+        selected_leaves = set(self.expand_group_children(roots))
+        # A Piece2D selected by its external contour must carry every owned
+        # hole and pocket even in documents that predate persistent groups.
+        for piece in self.document.pieces_by_id.values():
+            if piece.outer_path_id not in selected_leaves:
+                continue
+            for entity_id in (
+                piece.outer_path_id,
+                *piece.inner_path_ids,
+                *piece.pocket_path_ids,
+                *piece.marking_path_ids,
+            ):
+                grouped = self.grouped_selection_id_for_hit(entity_id)
+                copy_root = grouped if grouped is not None else entity_id
+                if copy_root not in roots:
+                    roots.append(copy_root)
+        roots = tuple(roots)
+        editable = self._editable_entity_ids(self.expand_group_children(roots))
+        if not roots or not editable:
+            return 0
+        # Snapshot only the selected object graph. Cloning a complete cabinet
+        # made Ctrl+C duplicate thousands of unrelated vectors and metadata,
+        # even though paste consumes only these roots and their Piece2D links.
+        from woodcam_editor.domain import GroupEntity, VectorDocument
+
+        included_ids = set()
+
+        def include(entity_id):
+            entity_id = str(entity_id)
+            if entity_id in included_ids:
+                return
+            entity = self.get_entity(entity_id)
+            if entity is None:
+                return
+            included_ids.add(entity_id)
+            if isinstance(entity, GroupEntity):
+                for child_id in entity.child_ids:
+                    include(child_id)
+
+        for root_id in roots:
+            include(root_id)
+        included_pieces = {
+            piece_id: deepcopy(piece)
+            for piece_id, piece in self.document.pieces_by_id.items()
+            if all(
+                reference in included_ids
+                for reference in (
+                    piece.outer_path_id,
+                    *piece.inner_path_ids,
+                    *piece.pocket_path_ids,
+                    *piece.marking_path_ids,
+                )
+            )
+        }
+        included_entities = {
+            entity_id: deepcopy(self.document.entities_by_id[entity_id])
+            for entity_id in included_ids
+        }
+        included_layer_ids = {
+            entity.layer_id for entity in included_entities.values()
+        }
+        included_layers = {
+            layer_id: deepcopy(self.document.layers_by_id[layer_id])
+            for layer_id in included_layer_ids
+        }
+        active_layer_id = (
+            self.document.active_layer_id
+            if self.document.active_layer_id in included_layers
+            else min(included_layers)
+        )
+        self._clipboard_document = VectorDocument(
+            schema_version=self.document.schema_version,
+            document_uuid=self.document.document_uuid,
+            revision=self.document.revision,
+            units=self.document.units,
+            coordinate_system=self.document.coordinate_system,
+            work_area=deepcopy(self.document.work_area),
+            layers_by_id=included_layers,
+            entities_by_id=included_entities,
+            pieces_by_id=included_pieces,
+            active_layer_id=active_layer_id,
+            metadata={},
+        )
+        self._clipboard_root_ids = tuple(roots)
+        self._paste_generation = 0
+        return len(roots)
+
+    def paste_copied(self) -> int:
+        """Paste the clipboard snapshot as one command and select its roots."""
+
+        if self._clipboard_document is None or not self._clipboard_root_ids:
+            return 0
+        from woodcam_editor.domain import ArrayCopyCommand
+
+        generation = self._paste_generation + 1
+        offset = self.PASTE_CASCADE_MM * generation
+        command = ArrayCopyCommand(
+            self._clipboard_root_ids,
+            2,
+            1,
+            offset,
+            0.0,
+            source_document=self._clipboard_document,
+        )
+        self.execute(command)
+        self._paste_generation = generation
+        self.selection.replace(command.created_root_ids)
+        self.set_mode(EditorMode.SELECT)
+        return len(command.created_root_ids)
+
     def transform_entities(self, entity_ids: Iterable[str], transform: Any) -> bool:
         ids = self._editable_entity_ids(self.expand_group_children(entity_ids))
         if not ids:
@@ -321,11 +446,30 @@ class EditorController:
             return None
         from woodcam_editor.domain import GroupEntity
 
-        parent_by_child = {}
-        for candidate in self.document.entities_by_id.values():
-            if isinstance(candidate, GroupEntity):
-                for child_id in candidate.child_ids:
-                    parent_by_child[str(child_id)] = candidate.id
+        hit_entity = self.get_entity(str(entity_id))
+        hit_role = str(
+            (getattr(hit_entity, "metadata", {}) or {}).get("import_role", "")
+            or ""
+        )
+        if hit_role == "pocket_region":
+            # The hatch is a first-class machining selection even when the
+            # imported board also owns a group for rigid movement.
+            return str(entity_id)
+
+        cache_key = (
+            id(self.document),
+            int(getattr(self.document, "revision", 0)),
+            len(self.document.entities_by_id),
+        )
+        if cache_key != self._group_parent_cache_key:
+            parent_by_child = {}
+            for candidate in self.document.entities_by_id.values():
+                if isinstance(candidate, GroupEntity):
+                    for child_id in candidate.child_ids:
+                        parent_by_child[str(child_id)] = candidate.id
+            self._group_parent_cache_key = cache_key
+            self._group_parent_cache = parent_by_child
+        parent_by_child = self._group_parent_cache
         current = str(entity_id)
         visited = set()
         while current in parent_by_child and current not in visited:
@@ -489,6 +633,13 @@ class EditorController:
         return True
 
     def selection_bounds(self) -> Any:
+        cache_key = (
+            id(self.document),
+            int(getattr(self.document, "revision", 0)),
+            tuple(self.selection.ids),
+        )
+        if cache_key == self._selection_bounds_cache_key:
+            return self._selection_bounds_cache
         result = None
         for entity_id in self.expand_group_children(self.selection.ids):
             entity = self.get_entity(entity_id)
@@ -497,6 +648,8 @@ class EditorController:
                 continue
             bounds = bounds_method()
             result = bounds if result is None else result.union(bounds)
+        self._selection_bounds_cache_key = cache_key
+        self._selection_bounds_cache = result
         return result
 
     def set_selection_bounds(self, min_x: float, min_y: float, width: float, height: float, preserve_ratio: bool = False) -> bool:
@@ -522,6 +675,34 @@ class EditorController:
             Affine2D.translation(float(min_x), float(min_y))
             @ Affine2D.scaling(scale_x, scale_y)
             @ Affine2D.translation(-bounds.min_x, -bounds.min_y)
+        )
+        return self.transform_entities(self.selection.ids, transform)
+
+    def scale_selection_percent(self, percent: float) -> bool:
+        """Scale the complete selection uniformly around its visual centre.
+
+        The percentage control is deliberately a controller use-case instead
+        of presentation-side geometry.  Groups and classified pieces therefore
+        keep using ``transform_entities`` and produce one atomic Undo exactly
+        like the existing resize handles.
+        """
+
+        bounds = self.selection_bounds()
+        if bounds is None:
+            return False
+        self._editable_entity_ids(self.selection.ids)
+        factor = float(percent) / 100.0
+        if not math.isfinite(factor) or factor <= 0.0:
+            raise ValueError("a escala deve ser maior que zero")
+        if abs(factor - 1.0) <= 1.0e-12:
+            return False
+        from woodcam_editor.domain import Affine2D
+
+        centre = bounds.center
+        transform = (
+            Affine2D.translation(centre.x, centre.y)
+            @ Affine2D.scaling(factor, factor)
+            @ Affine2D.translation(-centre.x, -centre.y)
         )
         return self.transform_entities(self.selection.ids, transform)
 
@@ -923,6 +1104,11 @@ class EditorController:
 
         self.execute(UpdateLayerCommand(layer_id, **changes))
 
+    def update_layers(self, layer_ids: Iterable[str], **changes: Any) -> None:
+        from .layers import UpdateLayersCommand
+
+        self.execute(UpdateLayersCommand(layer_ids, **changes))
+
     def move_selection_to_layer(self, layer_id: str) -> bool:
         if not self.selection.ids:
             return False
@@ -1136,16 +1322,22 @@ class EditorController:
         )
 
     def automatic_relief_scope(self) -> Tuple[Tuple[Any, ...], Dict[str, str]]:
-        """Resolve selected/classified paths and explicit inner/outer roles."""
+        """Resolve the complete classified job, or selected loose paths.
+
+        A stale selection must not silently turn the command labelled as a
+        *total automatic preview* into a partial operation.  When Piece2D
+        relationships exist they are the authoritative job scope.  Selection
+        remains the fallback for loose, not-yet-classified vector work.
+        """
         selected_ids = tuple(self.selection.ids)
-        if selected_ids:
-            candidate_ids = selected_ids
-        else:
-            candidate_ids_list = []
-            for piece in self.document.pieces_by_id.values():
-                candidate_ids_list.append(piece.outer_path_id)
-                candidate_ids_list.extend(piece.inner_path_ids)
+        candidate_ids_list = []
+        for piece in self.document.pieces_by_id.values():
+            candidate_ids_list.append(piece.outer_path_id)
+            candidate_ids_list.extend(piece.inner_path_ids)
+        if candidate_ids_list:
             candidate_ids = tuple(dict.fromkeys(candidate_ids_list))
+        else:
+            candidate_ids = self.expand_group_children(selected_ids)
         paths = tuple(
             self.get_entity(entity_id)
             for entity_id in candidate_ids
@@ -1208,7 +1400,12 @@ class EditorController:
             return ()
         entity_ids = tuple(
             entity_id
-            for entity_id in (piece.outer_path_id,) + tuple(piece.inner_path_ids)
+            for entity_id in (
+                piece.outer_path_id,
+                *piece.inner_path_ids,
+                *piece.pocket_path_ids,
+                *piece.marking_path_ids,
+            )
             if entity_id in self.document.entities_by_id
         )
         self.selection.replace(entity_ids)

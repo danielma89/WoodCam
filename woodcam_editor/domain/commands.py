@@ -18,6 +18,9 @@ from .primitives import Affine2D, GeometryError, InvariantError, Vec2, new_id
 from .spans import CubicBezierSpan, LineSpan
 
 
+_DEGENERATE_CLOSURE_TOLERANCE = 1.0e-6
+
+
 class CommandStateError(RuntimeError):
     """Raised when a command is applied/reverted in an invalid order."""
 
@@ -149,6 +152,7 @@ class ArrayCopyCommand(Command):
         rows: int,
         step_x: float,
         step_y: float,
+        source_document: Optional[VectorDocument] = None,
     ) -> None:
         super().__init__()
         self.entity_ids = tuple(dict.fromkeys(str(value) for value in entity_ids))
@@ -156,7 +160,14 @@ class ArrayCopyCommand(Command):
         self.rows = int(rows)
         self.step_x = float(step_x)
         self.step_y = float(step_y)
+        # A clipboard paste must keep working even if the source is moved or
+        # deleted after Ctrl+C.  The optional snapshot is transient command
+        # input; VectorDocument remains the sole persistent source of truth.
+        self.source_document = (
+            source_document.clone() if source_document is not None else None
+        )
         self.created_root_ids: Tuple[str, ...] = ()
+        self.created_piece_ids: Tuple[str, ...] = ()
         if not self.entity_ids:
             raise ValueError("ArrayCopyCommand requires at least one entity")
         if self.columns < 1 or self.rows < 1:
@@ -199,7 +210,8 @@ class ArrayCopyCommand(Command):
         raise GeometryError("tipo de vetor não suportado pela cópia em matriz")
 
     def _mutate(self, document: VectorDocument) -> DocumentChangeSet:
-        missing = set(self.entity_ids) - set(document.entities_by_id)
+        source_document = self.source_document or document
+        missing = set(self.entity_ids) - set(source_document.entities_by_id)
         if missing:
             raise KeyError("cannot copy unknown entities: %s" % ", ".join(sorted(missing)))
 
@@ -209,7 +221,7 @@ class ArrayCopyCommand(Command):
         selected = set(self.entity_ids)
         grouped_children = set()
         for entity_id in self.entity_ids:
-            entity = document.get_entity(entity_id)
+            entity = source_document.get_entity(entity_id)
             if isinstance(entity, GroupEntity):
                 grouped_children.update(entity.child_ids)
         roots = tuple(entity_id for entity_id in self.entity_ids if entity_id not in grouped_children)
@@ -218,6 +230,7 @@ class ArrayCopyCommand(Command):
 
         created = []
         created_roots = []
+        created_pieces = []
         for row in range(self.rows):
             for column in range(self.columns):
                 if row == 0 and column == 0:
@@ -231,7 +244,7 @@ class ArrayCopyCommand(Command):
                     entity_id = str(entity_id)
                     if entity_id in copies_by_source:
                         return copies_by_source[entity_id].id
-                    source = document.get_entity(entity_id)
+                    source = source_document.get_entity(entity_id)
                     if source is None:
                         raise KeyError("group contains unknown entity: %s" % entity_id)
                     if isinstance(source, GroupEntity):
@@ -252,9 +265,54 @@ class ArrayCopyCommand(Command):
 
                 created_roots.extend(clone(entity_id) for entity_id in roots)
 
+                # A recognized Piece2D is a relation over the copied vectors,
+                # not duplicate geometry.  Recreate that relation only when
+                # the whole physical piece (outer, holes and pockets) was
+                # included in this copy.
+                for piece in source_document.pieces_by_id.values():
+                    references = (
+                        piece.outer_path_id,
+                        *piece.inner_path_ids,
+                        *piece.pocket_path_ids,
+                        *piece.marking_path_ids,
+                    )
+                    if not references or not all(
+                        value in copies_by_source for value in references
+                    ):
+                        continue
+                    metadata = dict(piece.metadata or {})
+                    metadata["copy_source_piece_id"] = piece.id
+                    if piece.pocket_path_ids:
+                        metadata["pocket_path_ids"] = [
+                            copies_by_source[value].id for value in piece.pocket_path_ids
+                        ]
+                    if piece.marking_path_ids:
+                        metadata["marking_path_ids"] = [
+                            copies_by_source[value].id
+                            for value in piece.marking_path_ids
+                        ]
+                    created_pieces.append(
+                        replace(
+                            piece,
+                            id=new_id("piece"),
+                            outer_path_id=copies_by_source[piece.outer_path_id].id,
+                            inner_path_ids=tuple(
+                                copies_by_source[value].id for value in piece.inner_path_ids
+                            ),
+                            placement=transform @ piece.placement,
+                            metadata=metadata,
+                            stale=False,
+                        )
+                    )
+
         document.add_entities(tuple(created), bump_revision=False)
+        document.add_pieces(tuple(created_pieces), bump_revision=False)
         self.created_root_ids = tuple(created_roots)
-        return DocumentChangeSet(added=frozenset(entity.id for entity in created))
+        self.created_piece_ids = tuple(piece.id for piece in created_pieces)
+        return DocumentChangeSet(
+            added=frozenset(entity.id for entity in created),
+            pieces_changed=frozenset(self.created_piece_ids),
+        )
 
 
 class GroupEntitiesCommand(Command):
@@ -652,7 +710,12 @@ class ReplacePiecesCommand(Command):
     def _mutate(self, document: VectorDocument) -> DocumentChangeSet:
         old_ids = frozenset(document.pieces_by_id)
         for piece in self.pieces:
-            referenced = {piece.outer_path_id, *piece.inner_path_ids}
+            referenced = {
+                piece.outer_path_id,
+                *piece.inner_path_ids,
+                *piece.pocket_path_ids,
+                *piece.marking_path_ids,
+            }
             missing = referenced - set(document.entities_by_id)
             if missing:
                 raise InvariantError(
@@ -841,6 +904,29 @@ def join_path_entities(
     )
 
 
+def _close_path_at_midpoint(path: PathEntity) -> PathEntity:
+    """Close one open path without creating a microscopic bridge span."""
+
+    if path.closed:
+        raise GeometryError("path is already closed")
+    if len(path.spans) < 2:
+        raise GeometryError("a closed path requires at least two spans")
+    midpoint = path.start.lerp(path.end, 0.5)
+    spans = list(path.spans)
+    spans[0] = spans[0].with_start(midpoint)
+    spans[-1] = spans[-1].with_end(midpoint)
+    metadata = dict(path.metadata)
+    metadata["closed_with"] = "midpoint"
+    return PathEntity(
+        id=path.id,
+        layer_id=path.layer_id,
+        spans=tuple(spans),
+        closed=True,
+        node_ids=path.node_ids[:-1],
+        metadata=metadata,
+    )
+
+
 def join_path_entities_with_line(
     first: PathEntity,
     second: PathEntity,
@@ -1005,15 +1091,24 @@ class JoinOpenPathsWithinToleranceCommand(Command):
 
     label = "Unir vetores abertos"
 
-    def __init__(self, entity_ids: Iterable[str], tolerance: float = 0.2):
+    def __init__(
+        self,
+        entity_ids: Iterable[str],
+        tolerance: float = 0.2,
+        *,
+        auto_close: bool = True,
+    ):
         super().__init__()
         self.entity_ids = tuple(dict.fromkeys(str(entity_id) for entity_id in entity_ids))
         self.tolerance = float(tolerance)
+        self.auto_close = bool(auto_close)
         if len(self.entity_ids) < 2:
             raise ValueError("Selecione pelo menos dois caminhos abertos")
         if self.tolerance < 0.0:
             raise ValueError("join tolerance cannot be negative")
         self.joined_pairs: Tuple[Tuple[str, str, float], ...] = ()
+        self.closed_path_ids: Tuple[str, ...] = ()
+        self.result_path_ids: Tuple[str, ...] = ()
 
     @staticmethod
     def _best_candidate(document: VectorDocument, active_ids: Sequence[str], ranks):
@@ -1084,7 +1179,33 @@ class JoinOpenPathsWithinToleranceCommand(Command):
             raise GeometryError(
                 "Nenhuma ponta selecionada está dentro da tolerância de %.6g mm" % self.tolerance
             )
+        closed_path_ids = []
+        if self.auto_close:
+            for entity_id in active_ids:
+                if entity_id not in changed:
+                    continue
+                path = document.get_entity(entity_id)
+                if (
+                    isinstance(path, PathEntity)
+                    and not path.closed
+                    and len(path.spans) >= 2
+                    and path.start.distance_to(path.end) <= self.tolerance
+                ):
+                    closed_candidate = _close_path_at_midpoint(path)
+                    if abs(closed_candidate.signed_area()) <= 1.0e-12:
+                        continue
+                    document.replace_entities(
+                        (closed_candidate,),
+                        bump_revision=False,
+                    )
+                    closed_path_ids.append(entity_id)
         self.joined_pairs = tuple(joined)
+        self.closed_path_ids = tuple(closed_path_ids)
+        self.result_path_ids = tuple(
+            entity_id
+            for entity_id in active_ids
+            if entity_id in changed and document.get_entity(entity_id) is not None
+        )
         return DocumentChangeSet(changed=frozenset(changed), removed=frozenset(removed))
 
 
@@ -1103,7 +1224,10 @@ class ClosePathCommand(Command):
         path = document.get_entity(self.path_id)
         if not isinstance(path, PathEntity) or path.closed:
             raise GeometryError("ClosePathCommand requires an open path")
-        if self.mode == "line":
+        gap = path.end.distance_to(path.start)
+        if gap <= _DEGENERATE_CLOSURE_TOLERANCE:
+            closed = _close_path_at_midpoint(path)
+        elif self.mode == "line":
             closing = LineSpan(path.end, path.start)
             closed = PathEntity(
                 id=path.id,
@@ -1118,9 +1242,6 @@ class ClosePathCommand(Command):
             # bridge tangent to the existing first/last spans.  This is the
             # vector-editor "close with smooth curve" behaviour: no node is
             # teleported and no raster approximation enters the document.
-            gap = path.end.distance_to(path.start)
-            if gap <= 1.0e-12:
-                raise GeometryError("path endpoints already coincide")
             first_tangent = path.spans[0].tangent_at(0.0)
             last_tangent = path.spans[-1].tangent_at(1.0)
             handle = gap / 3.0
@@ -1141,18 +1262,7 @@ class ClosePathCommand(Command):
                 metadata=metadata,
             )
         else:
-            midpoint = path.start.lerp(path.end, 0.5)
-            spans = list(path.spans)
-            spans[0] = spans[0].with_start(midpoint)
-            spans[-1] = spans[-1].with_end(midpoint)
-            closed = PathEntity(
-                id=path.id,
-                layer_id=path.layer_id,
-                spans=tuple(spans),
-                closed=True,
-                node_ids=path.node_ids[:-1],
-                metadata=path.metadata,
-            )
+            closed = _close_path_at_midpoint(path)
         document.replace_entities((closed,), bump_revision=False)
         return DocumentChangeSet(changed=frozenset((path.id,)))
 

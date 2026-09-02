@@ -58,6 +58,18 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(revisions, sorted(revisions))
         self.assertEqual(len(set(revisions)), 3)
 
+    def test_remnant_cut_is_valid_specialized_open_geometry(self):
+        remnant = PathEntity.from_points(
+            self.document.active_layer_id,
+            (Vec2(0, 40), Vec2(100, 40)),
+            metadata={"woodcam_role": "remnant_cut"},
+        )
+        self.history.execute(AddEntitiesCommand((remnant,)))
+
+        report = validate_document(self.document, entity_ids=(remnant.id,))
+
+        self.assertFalse(report.errors)
+
     def test_move_node_changes_only_on_apply_and_is_one_undo(self):
         entity = path(self.document, (Vec2(0, 0), Vec2(10, 0), Vec2(20, 0)), id="path")
         self.history.execute(AddEntitiesCommand((entity,)))
@@ -271,6 +283,62 @@ class JoinTests(unittest.TestCase):
         history.undo()
         self.assertEqual(set(document.entities_by_id), {"first", "second", "third"})
 
+    def test_join_open_vectors_closes_fragmented_loop_without_erasing_real_detail(self):
+        document = VectorDocument.create_default()
+        fragments = (
+            path(document, (Vec2(0, 0), Vec2(10, 0)), id="first"),
+            path(document, (Vec2(10, 0), Vec2(10, 10)), id="second"),
+            path(
+                document,
+                (Vec2(10, 10), Vec2(0.198, 10), Vec2(0, 10)),
+                id="third",
+            ),
+            path(document, (Vec2(0, 10), Vec2(0, 0.0000003)), id="fourth"),
+        )
+        document.add_entities(fragments, bump_revision=False)
+        history = InMemoryCommandHistory(document)
+
+        command = JoinOpenPathsWithinToleranceCommand(
+            ("first", "second", "third", "fourth"),
+            tolerance=0.2,
+        )
+        history.execute(command)
+
+        self.assertEqual(command.result_path_ids, ("first",))
+        self.assertEqual(command.closed_path_ids, ("first",))
+        result = document.get_entity("first")
+        self.assertTrue(result.closed)
+        self.assertEqual(len(result.spans), 5)
+        self.assertAlmostEqual(min(span.length() for span in result.spans), 0.198)
+        self.assertFalse(
+            validate_document(document, join_tolerance=0.2).issues
+        )
+
+        history.undo()
+        self.assertEqual(set(document.entities_by_id), {item.id for item in fragments})
+
+    def test_close_with_line_does_not_create_a_microscopic_zero_span(self):
+        document = VectorDocument.create_default()
+        almost_closed = path(
+            document,
+            (
+                Vec2(0, 0),
+                Vec2(10, 0),
+                Vec2(10, 10),
+                Vec2(0, 0.0000003),
+            ),
+            id="almost-closed",
+        )
+        document.add_entities((almost_closed,), bump_revision=False)
+
+        ClosePathCommand("almost-closed", mode="line").apply(document)
+
+        result = document.get_entity("almost-closed")
+        self.assertTrue(result.closed)
+        self.assertEqual(len(result.spans), len(almost_closed.spans))
+        self.assertEqual(result.metadata["closed_with"], "midpoint")
+        self.assertFalse(validate_document(document).issues)
+
     def test_join_open_vectors_never_bridges_a_gap_outside_tolerance(self):
         document = VectorDocument.create_default()
         first = path(document, (Vec2(0, 0), Vec2(10, 0)), id="first")
@@ -369,6 +437,68 @@ class TopologyAndValidationTests(unittest.TestCase):
             exact_duplicate_entity_groups(document, entity_ids=()),
             (),
         )
+
+    def test_cam_validation_only_compares_explicitly_selected_copies(self):
+        document = VectorDocument.create_default()
+        original = path(
+            document,
+            (Vec2(0, 0), Vec2(20, 0), Vec2(20, 10), Vec2(0, 10)),
+            True,
+            "original",
+        )
+        copied = path(
+            document,
+            (Vec2(0, 0), Vec2(20, 0), Vec2(20, 10), Vec2(0, 10)),
+            True,
+            "copied",
+        )
+        document.add_entities((original, copied), bump_revision=False)
+
+        self.assertTrue(validate_document(document).by_code("DUPLICATE_ENTITY"))
+        self.assertFalse(
+            validate_document(document, entity_ids=(copied.id,)).by_code(
+                "DUPLICATE_ENTITY"
+            )
+        )
+        self.assertTrue(
+            validate_document(
+                document,
+                entity_ids=(original.id, copied.id),
+            ).by_code("DUPLICATE_ENTITY")
+        )
+
+    def test_edge_open_pocket_may_share_piece_boundary(self):
+        document = VectorDocument.create_default()
+        owner_metadata = {"source_shape_component_id": "component-001"}
+        outer = replace(
+            path(
+                document,
+                (Vec2(0, 0), Vec2(100, 0), Vec2(100, 50), Vec2(0, 50)),
+                True,
+                "outer",
+            ),
+            metadata=dict(owner_metadata),
+        )
+        pocket = replace(
+            path(
+                document,
+                (Vec2(0, 10), Vec2(40, 10), Vec2(40, 30), Vec2(0, 30)),
+                True,
+                "pocket",
+            ),
+            metadata={
+                **owner_metadata,
+                "import_role": "pocket_region",
+                "pocket_depth_mm": 5.0,
+            },
+        )
+        document.add_entities((outer, pocket), bump_revision=False)
+
+        report = validate_document(document)
+        self.assertFalse(report.by_code("DUPLICATE_ENTITY"))
+        self.assertFalse(report.by_code("BRANCH_NODE"))
+        self.assertFalse(report.by_code("CONTOUR_INTERSECTION"))
+        self.assertFalse(report.by_code("TOUCHING_CONTOURS"))
 
     def test_adjacent_closed_pieces_are_touching_not_branched_or_crossing(self):
         from woodcam_editor.domain import entities_have_boundary_only_contact

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import math
 
 from .compat import DASH_LINE, NO_BRUSH, QtCore, QtGui, QtWidgets, qt_enum
+from .i18n import translate_text
 from .items import EntityGraphicsItem, entity_painter_path
 
 
@@ -54,6 +55,10 @@ class SceneAdapter:
         # drawable vector or affect nesting/CAM selection.
         self.sheet_label_items = []
         self.preview_sheet_label_items = []
+        self.remnant_cut_items = []
+        self.remnant_label_items = []
+        self.preview_remnant_cut_items = []
+        self.preview_remnant_label_items = []
         self.work_area_item = QtWidgets.QGraphicsRectItem()
         pen = QtGui.QPen(QtGui.QColor("#0ea5e9"), 1.5)
         pen.setCosmetic(True)
@@ -62,15 +67,24 @@ class SceneAdapter:
         # A subtle sheet fill makes the usable material unmistakable without
         # hiding vectors.  Geometry remains above it; the surrounding canvas
         # stays neutral, like a CAD/CAM nesting sheet.
-        fill = QtGui.QColor("#bae6fd")
-        fill.setAlpha(62)
-        self.work_area_item.setBrush(QtGui.QBrush(fill))
+        self._work_area_fill = QtGui.QColor("#bae6fd")
+        self._work_area_fill.setAlpha(62)
+        self.work_area_item.setBrush(QtGui.QBrush(self._work_area_fill))
         self.work_area_item.setZValue(-10.0)
         self.scene.addItem(self.work_area_item)
         self.set_work_area(getattr(document, "work_area", None))
         self.refresh()
         if selection is not None:
             selection.subscribe(lambda _ids: self.update_selection())
+
+    def set_work_area_fill_visible(self, visible):
+        """Toggle only the material-page tint; geometry remains untouched."""
+
+        self.work_area_item.setBrush(
+            QtGui.QBrush(self._work_area_fill)
+            if visible
+            else QtGui.QBrush(NO_BRUSH)
+        )
 
     def set_document(self, document):
         self.document = document
@@ -115,18 +129,15 @@ class SceneAdapter:
             sync_ids = set(current)
         else:
             # A command names every entity whose persisted geometry changed.
-            # Layer edits additionally require refreshing only the entities
-            # on those layers, so visibility/lock state remains correct.
+            # Layer edits are handled separately below without rebuilding paths.
             removed_ids = tuple(getattr(change_set, "removed", ()) or ())
             sync_ids = set(getattr(change_set, "added", ()) or ())
             sync_ids.update(getattr(change_set, "changed", ()) or ())
-            changed_layers = set(getattr(change_set, "layers_changed", ()) or ())
-            if changed_layers:
-                sync_ids.update(
-                    entity_id
-                    for entity_id, entity in current.items()
-                    if str(getattr(entity, "layer_id", "")) in changed_layers
-                )
+        changed_layers = (
+            set()
+            if change_set is None
+            else set(getattr(change_set, "layers_changed", ()) or ())
+        )
         for entity_id in tuple(str(value) for value in removed_ids):
             item = self.items_by_id.pop(entity_id, None)
             if item is not None:
@@ -149,17 +160,43 @@ class SceneAdapter:
             is_group = type(entity).__name__ == "GroupEntity"
             item.setVisible(not is_group and bool(getattr(layer, "visible", True)))
             item.editor_locked = bool(getattr(layer, "locked", False))
+        if work_area_changed:
+            # Metadata and entity creation may arrive in the same composite
+            # command. Re-evaluate after new EntityGraphicsItems exist so a
+            # persisted remnant vector is not drawn twice as an overlay line.
+            self._sync_remnant_cuts()
+        # Layer visibility/locking changes no geometry. Update the existing
+        # QGraphicsItems in place; rebuilding every QPainterPath and scanning
+        # scene bounds turned a checkbox into a full-scene refresh.
+        if changed_layers:
+            for entity_id, entity in current.items():
+                if str(getattr(entity, "layer_id", "")) not in changed_layers:
+                    continue
+                item = self.items_by_id.get(entity_id)
+                if item is None:
+                    continue
+                layer = getattr(self.document, "layers_by_id", {}).get(
+                    getattr(entity, "layer_id", None)
+                )
+                is_group = type(entity).__name__ == "GroupEntity"
+                item.setVisible(
+                    not is_group and bool(getattr(layer, "visible", True))
+                )
+                item.editor_locked = bool(getattr(layer, "locked", False))
         self.update_selection()
         geometry_bounds_changed = change_set is None or any(
             bool(getattr(change_set, name, ()))
-            for name in ("added", "changed", "removed", "layers_changed")
+            for name in ("added", "changed", "removed")
         )
         requires_full_scene_bounds = change_set is None or any(
             bool(getattr(change_set, name, ()))
-            for name in ("added", "removed", "layers_changed")
+            for name in ("added", "removed")
         )
         if requires_full_scene_bounds:
-            self._update_scene_rect()
+            self._update_scene_rect(
+                preserve_camera=change_set is not None,
+                keep_existing=change_set is not None,
+            )
         elif geometry_bounds_changed:
             # Dragging one item used to scan every imported vector again on
             # mouse release.  Scene bounds only need to grow for an ordinary
@@ -216,6 +253,7 @@ class SceneAdapter:
         self.work_area_item.setRect(rect)
         self.work_area_item.setVisible(rect.width() > 0 and rect.height() > 0)
         self._sync_sheet_areas()
+        self._sync_remnant_cuts()
         # Deliberately keep sceneRect/camera unchanged.  Recomputing sceneRect
         # here makes QGraphicsView re-centre or clamp its scroll bars, which
         # leaves the dashed rectangle apparently fixed while entities jump.
@@ -307,7 +345,10 @@ class SceneAdapter:
                         "#0ea5e9",
                     )
                     self._append_sheet_label(
-                        rect, self.sheet_label_items, "#0369a1", "Chapa 01"
+                        rect,
+                        self.sheet_label_items,
+                        "#0369a1",
+                        translate_text("Chapa %02d  ·  X0 Y0") % 1,
                     )
                 continue
             self._append_sheet_rect(
@@ -315,7 +356,7 @@ class SceneAdapter:
                 self.sheet_area_items,
                 "#0ea5e9",
                 self.sheet_label_items,
-                "Chapa %02d" % index,
+                translate_text("Chapa %02d  ·  X0 Y0") % index,
             )
 
     def show_preview_sheet_bounds(self, bounds_values):
@@ -328,7 +369,7 @@ class SceneAdapter:
                         rect,
                         self.preview_sheet_label_items,
                         "#d946ef",
-                        "Chapa 01 — prévia",
+                        translate_text("Chapa %02d — prévia  ·  X0 Y0") % 1,
                     )
                 continue
             self._append_sheet_rect(
@@ -336,13 +377,119 @@ class SceneAdapter:
                 self.preview_sheet_area_items,
                 "#d946ef",
                 self.preview_sheet_label_items,
-                "Chapa %02d — prévia" % index,
+                translate_text("Chapa %02d — prévia  ·  X0 Y0") % index,
             )
         self._update_scene_rect()
 
     def clear_preview_sheet_bounds(self):
         self._clear_rect_items(self.preview_sheet_area_items)
         self._clear_rect_items(self.preview_sheet_label_items)
+
+    @staticmethod
+    def _remnant_cut_values(raw):
+        try:
+            start = tuple(map(float, raw["start"]))
+            end = tuple(map(float, raw["end"]))
+            bounds = tuple(map(float, raw["remnant_bounds"]))
+            area = float(raw.get("area", 0.0))
+            if len(start) != 2 or len(end) != 2 or len(bounds) != 4:
+                return None
+            if not all(
+                math.isfinite(value) for value in start + end + bounds + (area,)
+            ):
+                return None
+            if bounds[2] <= bounds[0] or bounds[3] <= bounds[1] or area < 0.0:
+                return None
+            return start, end, bounds, area
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _append_remnant_cut(self, raw, line_items, label_items, color, draw_line=True):
+        values = self._remnant_cut_values(raw)
+        if values is None:
+            return
+        start, end, bounds, area = values
+        if draw_line:
+            line = QtWidgets.QGraphicsLineItem(
+                start[0], start[1], end[0], end[1]
+            )
+            pen = QtGui.QPen(QtGui.QColor(color), 2.2)
+            pen.setCosmetic(True)
+            pen.setStyle(DASH_LINE)
+            line.setPen(pen)
+            line.setZValue(3.0)
+            line.setAcceptedMouseButtons(
+                QtCore.Qt.NoButton
+                if hasattr(QtCore.Qt, "NoButton")
+                else QtCore.Qt.MouseButton.NoButton
+            )
+            self.scene.addItem(line)
+            line_items.append(line)
+
+        if isinstance(raw, dict) and not bool(raw.get("show_label", True)):
+            return
+
+        rect = self._work_area_rect(bounds)
+        label = QtWidgets.QGraphicsSimpleTextItem(
+            translate_text("Retalho %.0f × %.0f mm · %.2f m²")
+            % (rect.width(), rect.height(), area / 1_000_000.0)
+        )
+        label.setBrush(QtGui.QBrush(QtGui.QColor(color)))
+        font = label.font()
+        font.setBold(True)
+        font.setPointSize(9)
+        label.setFont(font)
+        label.setFlag(
+            qt_enum(
+                QtWidgets.QGraphicsItem,
+                "ItemIgnoresTransformations",
+                "GraphicsItemFlag",
+            ),
+            True,
+        )
+        label.setPos(rect.left() + 7.0, rect.top() + 7.0)
+        label.setZValue(3.0)
+        label.setAcceptedMouseButtons(
+            QtCore.Qt.NoButton
+            if hasattr(QtCore.Qt, "NoButton")
+            else QtCore.Qt.MouseButton.NoButton
+        )
+        self.scene.addItem(label)
+        label_items.append(label)
+
+    def _sync_remnant_cuts(self):
+        self._clear_rect_items(self.remnant_cut_items)
+        self._clear_rect_items(self.remnant_label_items)
+        values = (getattr(self.document, "metadata", {}) or {}).get(
+            "organization_remnant_cuts", ()
+        ) or ()
+        for raw in values:
+            entity_id = (
+                str(raw.get("entity_id", "") or "")
+                if isinstance(raw, dict)
+                else ""
+            )
+            self._append_remnant_cut(
+                raw,
+                self.remnant_cut_items,
+                self.remnant_label_items,
+                "#ea580c",
+                draw_line=entity_id not in self.items_by_id,
+            )
+
+    def show_preview_remnant_cuts(self, values):
+        self.clear_preview_remnant_cuts()
+        for raw in tuple(values or ()):
+            self._append_remnant_cut(
+                raw,
+                self.preview_remnant_cut_items,
+                self.preview_remnant_label_items,
+                "#c026d3",
+            )
+
+    def clear_preview_remnant_cuts(self):
+        self._clear_rect_items(self.preview_remnant_cut_items)
+        self._clear_rect_items(self.preview_remnant_label_items)
 
     def _append_sheet_label(self, rect, label_items, color, label):
         """Add an upright, non-interactive label to an existing page rect."""
@@ -369,7 +516,37 @@ class SceneAdapter:
         self.scene.addItem(text)
         label_items.append(text)
 
-    def _update_scene_rect(self):
+    def _set_scene_rect_preserving_camera(self, rect, preserve_camera=False):
+        anchors = []
+        target = QtCore.QRectF(rect)
+        if preserve_camera:
+            for view in tuple(self.scene.views() or ()):
+                viewport = view.viewport()
+                visible = view.mapToScene(viewport.rect()).boundingRect()
+                # Activating a scrollbar while a primitive is confirmed can
+                # change Qt's alignment from centered to scrollable before
+                # ``centerOn`` has enough range to restore the old camera.
+                # Keep one viewport of navigation margin around what the
+                # operator was looking at; this is presentation state only.
+                target = target.united(
+                    visible.adjusted(
+                        -visible.width(),
+                        -visible.height(),
+                        visible.width(),
+                        visible.height(),
+                    )
+                )
+                anchors.append(
+                    (
+                        view,
+                        view.mapToScene(viewport.rect().center()),
+                    )
+                )
+        self.scene.setSceneRect(target)
+        for view, center in anchors:
+            view.centerOn(center)
+
+    def _update_scene_rect(self, preserve_camera=False, keep_existing=False):
         rect = self.work_area_item.rect() if self.work_area_item.isVisible() else QtCore.QRectF()
         for item in self.sheet_area_items + self.preview_sheet_area_items:
             bounds = item.rect()
@@ -380,7 +557,10 @@ class SceneAdapter:
         if rect.isNull() or rect.width() <= 0.0 or rect.height() <= 0.0:
             rect = QtCore.QRectF(-500.0, -500.0, 1000.0, 1000.0)
         margin = max(50.0, max(rect.width(), rect.height()) * 0.08)
-        self.scene.setSceneRect(rect.adjusted(-margin, -margin, margin, margin))
+        target = rect.adjusted(-margin, -margin, margin, margin)
+        if keep_existing and not self.scene.sceneRect().isNull():
+            target = target.united(self.scene.sceneRect())
+        self._set_scene_rect_preserving_camera(target, preserve_camera)
 
     def _expand_scene_rect_for(self, entity_ids):
         current = self.scene.sceneRect()
@@ -404,8 +584,9 @@ class SceneAdapter:
             return
         expanded = current.united(changed_bounds)
         margin = max(50.0, max(changed_bounds.width(), changed_bounds.height()) * 0.08)
-        self.scene.setSceneRect(
-            expanded.adjusted(-margin, -margin, margin, margin)
+        self._set_scene_rect_preserving_camera(
+            expanded.adjusted(-margin, -margin, margin, margin),
+            preserve_camera=True,
         )
 
     def hit_test_body(self, view, screen_pos, radius_px=7.0):
@@ -432,14 +613,33 @@ class SceneAdapter:
                 continue
             scene_path = item.mapToScene(item.path())
             screen_path = transform.map(scene_path)
+            is_pocket_region = bool(
+                getattr(item, "_is_pocket_region", False)
+            )
+            if is_pocket_region and screen_path.contains(screen_point):
+                # A pocket is an explicit machining area.  Its hatching is the
+                # intentional hit surface and wins over an external contour
+                # that may share part of the same boundary.
+                candidates.append((0, 0.0, -item.zValue(), entity_id))
+                continue
             stroker = QtGui.QPainterPathStroker()
             stroker.setWidth(radius_px * 2.0)
-            hit_path = stroker.createStroke(screen_path).united(screen_path)
+            # A closed painter path is filled for ``contains``.  Selection in
+            # Aspire is contour based: the inside of a rectangle/circle is
+            # background, not a hidden selection surface.
+            hit_path = stroker.createStroke(screen_path)
             if hit_path.contains(screen_point):
                 center = screen_path.boundingRect().center()
                 distance = abs(center.x() - screen_point.x()) + abs(center.y() - screen_point.y())
-                candidates.append((distance, -item.zValue(), entity_id))
-        return min(candidates)[2] if candidates else None
+                candidates.append(
+                    (
+                        0 if is_pocket_region else 1,
+                        distance,
+                        -item.zValue(),
+                        entity_id,
+                    )
+                )
+        return min(candidates)[3] if candidates else None
 
     def _entity_is_editable_visible(self, entity):
         layer = getattr(self.document, "layers_by_id", {}).get(getattr(entity, "layer_id", None))
@@ -524,8 +724,35 @@ class SceneAdapter:
         return min(candidates, key=lambda value: value.distance_px) if candidates else None
 
     def hit_test_path_node(self, view, screen_pos, radius_px=11.0, closed_only=False):
+        # Query Qt's spatial index first.  Modifier tools call this method for
+        # every mouse packet; walking every node in a complete nesting made a
+        # manual T-bone progressively slower as the drawing grew.
+        screen_point = QtCore.QPointF(screen_pos)
+        scene_point = view.mapToScene(screen_point.toPoint())
+        radius_mm = float(radius_px) / max(1.0e-12, view.pixels_per_mm())
+        query = QtCore.QRectF(
+            scene_point.x() - radius_mm,
+            scene_point.y() - radius_mm,
+            radius_mm * 2.0,
+            radius_mm * 2.0,
+        )
+        mode = getattr(QtCore.Qt, "IntersectsItemBoundingRect", None)
+        if mode is None:
+            mode = QtCore.Qt.ItemSelectionMode.IntersectsItemBoundingRect
+        nearby_ids = []
+        for item in self.scene.items(query, mode):
+            if not isinstance(item, EntityGraphicsItem):
+                continue
+            if not item.isVisible() or getattr(item, "editor_locked", False):
+                continue
+            if item.entity_id not in nearby_ids:
+                nearby_ids.append(item.entity_id)
+
         candidates = []
-        for entity in self.entities():
+        for entity_id in nearby_ids:
+            entity = self.document.get_entity(entity_id)
+            if entity is None:
+                continue
             if not self._entity_is_editable_visible(entity):
                 continue
             if not getattr(entity, "spans", None) or (closed_only and not entity.closed):
@@ -581,6 +808,43 @@ class SceneAdapter:
         if mode is None:
             mode = QtCore.Qt.ItemSelectionMode.IntersectsItemBoundingRect
         nearby_items = self.scene.items(scene_polygon.boundingRect(), mode)
+        def segment_touches_rect(first, second):
+            if rect.contains(first) or rect.contains(second):
+                return True
+            dx = float(second.x() - first.x())
+            dy = float(second.y() - first.y())
+            start_x = float(first.x())
+            start_y = float(first.y())
+            minimum_x, maximum_x = float(rect.left()), float(rect.right())
+            minimum_y, maximum_y = float(rect.top()), float(rect.bottom())
+            lower, upper = 0.0, 1.0
+            for coefficient, offset in (
+                (-dx, start_x - minimum_x), (dx, maximum_x - start_x),
+                (-dy, start_y - minimum_y), (dy, maximum_y - start_y),
+            ):
+                if abs(coefficient) <= 1.0e-12:
+                    if offset < 0.0:
+                        return False
+                    continue
+                parameter = offset / coefficient
+                if coefficient < 0.0:
+                    lower = max(lower, parameter)
+                else:
+                    upper = min(upper, parameter)
+                if lower > upper:
+                    return False
+            return True
+
+        def polygon_matches(polygon):
+            points = tuple(polygon)
+            if not points:
+                return False
+            if not crossing:
+                return all(rect.contains(point) for point in points)
+            return any(
+                segment_touches_rect(first, second)
+                for first, second in zip(points, points[1:])
+            )
         for item in nearby_items:
             if not isinstance(item, EntityGraphicsItem):
                 continue
@@ -588,8 +852,17 @@ class SceneAdapter:
             if not item.isVisible() or getattr(item, "editor_locked", False):
                 continue
             screen_path = transform.map(item.mapToScene(item.path()))
-            bounds = screen_path.boundingRect()
-            matches = rect.intersects(bounds) if crossing else rect.contains(bounds)
+            # A marquee is about real vector geometry, not its bounding box.
+            # Flattened screen polygons retain the contour-only contract even
+            # for closed paths, whose Qt painter path otherwise has a filled
+            # interior and would falsely intersect a small empty marquee.
+            matches = bool(screen_path.toSubpathPolygons()) and all(
+                polygon_matches(polygon)
+                for polygon in screen_path.toSubpathPolygons()
+            ) if not crossing else any(
+                polygon_matches(polygon)
+                for polygon in screen_path.toSubpathPolygons()
+            )
             if matches:
                 selected.append(entity_id)
         return tuple(selected)

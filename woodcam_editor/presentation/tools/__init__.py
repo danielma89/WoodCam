@@ -4,7 +4,17 @@ from __future__ import annotations
 
 from woodcam_editor.application import CommandExecutionCancelled, EditorMode
 
-from ..compat import CTRL_MODIFIER, SHIFT_MODIFIER, Signal, QtCore, QtWidgets, qt_enum
+from ..compat import (
+    ARROW_CURSOR,
+    CROSS_CURSOR,
+    CTRL_MODIFIER,
+    LEFT_BUTTON,
+    SHIFT_MODIFIER,
+    Signal,
+    QtCore,
+    QtWidgets,
+    qt_enum,
+)
 from .base import has_modifier
 from .draw import ArcTool, BezierTool, CircleTool, EllipseTool, LineTool, PolygonTool, StarTool, PolylineTool, RectangleTool
 from .node import NodeTool
@@ -37,6 +47,7 @@ class ToolManager(QtCore.QObject):
         self.overlays = overlays
         self.tools = {
             EditorMode.SELECT: SelectTool(self),
+            EditorMode.TRANSFORM: SelectTool(self),
             EditorMode.MEASURE: MeasureTool(self),
             EditorMode.NODE_EDIT: NodeTool(self),
             EditorMode.DRAW_LINE: LineTool(self),
@@ -70,6 +81,11 @@ class ToolManager(QtCore.QObject):
             "splice_route": "short",
         }
         self.active = None
+        # Operation dialogs may temporarily own canvas clicks (for example,
+        # manual CAM tab placement).  This is presentation-only state: it
+        # never becomes an EditorMode and never mutates VectorDocument.
+        self._point_capture_callback = None
+        self._point_capture_cancel_callback = None
         view.pointerPressed.connect(self.pointer_press)
         view.pointerMoved.connect(self.pointer_move)
         view.pointerReleased.connect(self.pointer_release)
@@ -78,14 +94,71 @@ class ToolManager(QtCore.QObject):
         self.activate(EditorMode.SELECT)
 
     def activate(self, mode, entity_id=None):
+        if self.point_capture_active:
+            self._clear_point_capture(notify_cancel=True)
         mode = mode if isinstance(mode, EditorMode) else EditorMode(mode)
         if self.active is not None:
             self.active.deactivate()
         self.controller.set_mode(mode, entity_id)
         actual = self.controller.mode
+        # Exact construction previews can safely be rendered at the display
+        # cadence: their confirming click recomputes the exact snapped point.
+        # Repair/modifier tools remain immediate because hover establishes a
+        # specific topology candidate that their next click consumes.
+        self.view.set_pointer_move_coalescing(
+            actual in {
+                EditorMode.DRAW_LINE,
+                EditorMode.DRAW_POLYLINE,
+                EditorMode.DRAW_RECTANGLE,
+                EditorMode.DRAW_CIRCLE,
+                EditorMode.DRAW_ELLIPSE,
+                EditorMode.DRAW_ARC,
+                EditorMode.DRAW_BEZIER,
+                EditorMode.DRAW_POLYGON,
+                EditorMode.DRAW_STAR,
+            }
+        )
         self.active = self.tools[actual]
         self.active.activate(self.controller.node_entity_id if actual == EditorMode.NODE_EDIT else entity_id)
         self.statusChanged.emit(self._mode_label(actual))
+
+    @property
+    def point_capture_active(self):
+        return self._point_capture_callback is not None
+
+    def begin_point_capture(self, callback, cancel_callback=None, status=""):
+        """Temporarily route left-click releases to an external operation.
+
+        The active editor tool is suspended, so selecting a CAM tab cannot
+        accidentally select, move or redraw vector entities underneath it.
+        """
+        if not callable(callback):
+            raise TypeError("point capture callback must be callable")
+        if self.point_capture_active:
+            self._clear_point_capture(notify_cancel=True)
+        self.activate(EditorMode.SELECT)
+        self._point_capture_callback = callback
+        self._point_capture_cancel_callback = (
+            cancel_callback if callable(cancel_callback) else None
+        )
+        self.view.setCursor(CROSS_CURSOR)
+        self.statusChanged.emit(str(status or "Clique no desenho para posicionar."))
+
+    def finish_point_capture(self, cancelled=False):
+        if not self.point_capture_active:
+            return False
+        self._clear_point_capture(notify_cancel=bool(cancelled))
+        self.activate(EditorMode.SELECT)
+        self.view.setCursor(ARROW_CURSOR)
+        return True
+
+    def _clear_point_capture(self, notify_cancel=False):
+        cancel_callback = self._point_capture_cancel_callback
+        self._point_capture_callback = None
+        self._point_capture_cancel_callback = None
+        self.view.setCursor(ARROW_CURSOR)
+        if notify_cancel and cancel_callback is not None:
+            self._dispatch(cancel_callback)
 
     def set_polygon_sides(self, sides):
         self.tools[EditorMode.DRAW_POLYGON].set_sides(sides)
@@ -120,15 +193,25 @@ class ToolManager(QtCore.QObject):
             recompute()
 
     def pointer_press(self, event):
+        if self.point_capture_active:
+            return
         self._dispatch(self.active.pointer_press, event)
 
     def pointer_move(self, event):
+        if self.point_capture_active:
+            return
         self._dispatch(self.active.pointer_move, event)
 
     def pointer_release(self, event):
+        if self.point_capture_active:
+            if event.button == LEFT_BUTTON:
+                self._dispatch(self._point_capture_callback, event)
+            return
         self._dispatch(self.active.pointer_release, event)
 
     def pointer_double_click(self, event):
+        if self.point_capture_active:
+            return
         self._dispatch(self.active.pointer_double_click, event)
 
     def _dispatch(self, callback, *args):
@@ -141,6 +224,11 @@ class ToolManager(QtCore.QObject):
     def key_press(self, event):
         key = event.key()
         modifiers = event.modifiers()
+        if self.point_capture_active:
+            if key == qt_enum(QtCore.Qt, "Key_Escape", "Key"):
+                self.finish_point_capture(cancelled=True)
+            event.accept()
+            return
         owner = self.parent()
         preview_bar = getattr(owner, "workflow_preview_bar", None)
         if preview_bar is not None and preview_bar.is_active:
@@ -187,6 +275,7 @@ class ToolManager(QtCore.QObject):
     def _mode_label(mode):
         return {
             EditorMode.SELECT: "Selecionar — 1 clique seleciona; arraste move o corpo",
+            EditorMode.TRANSFORM: "Transformar — alças redimensionam; arraste move a seleção",
             EditorMode.MEASURE: "Medir — dois pontos com Snap; não altera o desenho",
             EditorMode.NODE_EDIT: "Nós — clique seleciona; somente arrastar move",
             EditorMode.DRAW_LINE: "Linha — clique no início e no fim",

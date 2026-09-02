@@ -83,6 +83,165 @@ def _has_explicit_profile(part: Any) -> bool:
     return len(points) >= 3
 
 
+def _point_profile_location(point, profile, tolerance=1.0e-7):
+    """Return 0 outside, 1 on boundary or 2 inside a closed profile."""
+
+    x_value, y_value = point
+    inside = False
+    for index, start in enumerate(profile):
+        end = profile[(index + 1) % len(profile)]
+        ax, ay = start
+        bx, by = end
+        dx = bx - ax
+        dy = by - ay
+        length_squared = dx * dx + dy * dy
+        if length_squared > tolerance * tolerance:
+            ratio = ((x_value - ax) * dx + (y_value - ay) * dy) / length_squared
+            if -tolerance <= ratio <= 1.0 + tolerance:
+                nearest_x = ax + max(0.0, min(1.0, ratio)) * dx
+                nearest_y = ay + max(0.0, min(1.0, ratio)) * dy
+                if math.hypot(x_value - nearest_x, y_value - nearest_y) <= tolerance:
+                    return 1
+        crosses = (ay > y_value) != (by > y_value)
+        if crosses:
+            crossing_x = ax + (y_value - ay) * dx / (dy or 1.0e-30)
+            if crossing_x > x_value:
+                inside = not inside
+    return 2 if inside else 0
+
+
+def _hole_fits_profile(hole, profile, inner_profiles=()):
+    x_value, y_value, diameter = hole
+    radius = diameter * 0.5
+    if _point_profile_location((x_value, y_value), profile) != 2:
+        return False
+    if any(
+        _point_profile_location((x_value, y_value), inner_profile) != 0
+        for inner_profile in inner_profiles
+        if len(inner_profile) >= 3
+    ):
+        return False
+    # A top-face drilling circle may touch the profile numerically, but it
+    # cannot extend beyond it.  Four cardinal probes are sufficient for the
+    # circular payload and prevent loose rings from appearing beside a part.
+    return all(
+        _point_profile_location(point, profile) != 0
+        for point in (
+            (x_value - radius, y_value),
+            (x_value + radius, y_value),
+            (x_value, y_value - radius),
+            (x_value, y_value + radius),
+        )
+    )
+
+
+def _resolve_holes_inside_profile(profile, holes, inner_profiles=()):
+    """Reconcile old PanelNest XY conventions and reject detached holes."""
+
+    if len(profile) < 3:
+        return tuple(holes), 0
+    min_x = min(point[0] for point in profile)
+    min_y = min(point[1] for point in profile)
+    resolved = []
+    rejected = 0
+    for x_value, y_value, diameter in holes:
+        candidates = (
+            (x_value, y_value, diameter),
+            (x_value + min_x, y_value + min_y, diameter),
+            (y_value, x_value, diameter),
+            (y_value + min_x, x_value + min_y, diameter),
+        )
+        unique_candidates = []
+        seen = set()
+        for candidate in candidates:
+            key = tuple(round(float(value), 9) for value in candidate)
+            if key not in seen:
+                seen.add(key)
+                unique_candidates.append(candidate)
+        match = next(
+            (
+                candidate
+                for candidate in unique_candidates
+                if _hole_fits_profile(candidate, profile, inner_profiles)
+            ),
+            None,
+        )
+        if match is None:
+            rejected += 1
+        else:
+            resolved.append(match)
+    return tuple(resolved), rejected
+
+
+def _select_exact_piece_entities(exact_entities, part):
+    """Keep the one physical component represented by a PanelNest record.
+
+    A source object may contain repeated solids or auxiliary cylinders.  The
+    PanelNest record already expands quantity, so copying every root from that
+    Shape once per occurrence duplicates profiles and leaves loose circles.
+    Classification is read-only and selects the root whose dimensions best
+    match this record, keeping all of its descendants and pocket features.
+    """
+
+    from types import SimpleNamespace
+    from woodcam_editor.application.piece_organizer import classify_document_pieces
+
+    leaves = tuple(
+        entity
+        for entity in exact_entities
+        if type(entity).__name__ != "GroupEntity"
+    )
+    if not leaves:
+        return tuple(exact_entities), 0
+    try:
+        facade = SimpleNamespace(
+            entities_by_id={str(entity.id): entity for entity in leaves},
+            layers_by_id={},
+        )
+        classification = classify_document_pieces(facade)
+    except Exception:
+        return tuple(exact_entities), 0
+    if not classification.pieces:
+        return tuple(exact_entities), 0
+
+    expected = sorted(
+        (
+            max(0.0, _number(getattr(part, "length_mm", 0.0))),
+            max(0.0, _number(getattr(part, "width_mm", 0.0))),
+        ),
+        reverse=True,
+    )
+    order_by_id = {
+        str(entity.id): index for index, entity in enumerate(leaves)
+    }
+
+    def score(piece):
+        width = max(0.0, piece.bounds[2] - piece.bounds[0])
+        height = max(0.0, piece.bounds[3] - piece.bounds[1])
+        actual = sorted((width, height), reverse=True)
+        dimensional_error = (
+            abs(actual[0] - expected[0]) + abs(actual[1] - expected[1])
+            if expected[0] > 0.0 and expected[1] > 0.0
+            else -abs(float(piece.area))
+        )
+        return (
+            round(dimensional_error, 9),
+            -round(abs(float(piece.area)), 9),
+            order_by_id.get(str(piece.outer_id), len(leaves)),
+        )
+
+    chosen = min(classification.pieces, key=score)
+    selected_ids = {
+        str(chosen.outer_id),
+        *(str(value) for value in chosen.descendant_ids),
+        *(str(value) for value in chosen.feature_ids),
+    }
+    selected = tuple(
+        entity for entity in leaves if str(entity.id) in selected_ids
+    )
+    return selected, max(0, len(leaves) - len(selected))
+
+
 def import_panelnest_parts(
     parts: Iterable[Any],
     *,
@@ -119,6 +278,19 @@ def import_panelnest_parts(
         if isinstance(exact_entities_by_source, dict):
             exact_entities = tuple(exact_entities_by_source.get(source_key, ()) or ())
         if exact_entities:
+            exact_entities, discarded_exact = _select_exact_piece_entities(
+                exact_entities,
+                part,
+            )
+            if discarded_exact:
+                issues.append(
+                    ImportIssue(
+                        part_index,
+                        "PanelNestPart",
+                        "%s: %d vetor(es) solto(s) de outros componentes foram ignorados."
+                        % (label, discarded_exact),
+                    )
+                )
             try:
                 min_x = min(entity.bounds().min_x for entity in exact_entities)
                 max_x = max(entity.bounds().max_x for entity in exact_entities)
@@ -160,6 +332,21 @@ def import_panelnest_parts(
         elif not inner_loops and isinstance(inner_profiles_by_source, dict):
             # Compatibility with the first PanelNest bridge API.
             inner_loops = tuple(inner_profiles_by_source.get(source_key, ()) or ())
+        if not exact_entities:
+            holes, rejected_holes = _resolve_holes_inside_profile(
+                profile,
+                holes,
+                inner_loops,
+            )
+            if rejected_holes:
+                issues.append(
+                    ImportIssue(
+                        part_index,
+                        "PanelNestHole",
+                        "%s: %d furo(s) fora do perfil foram ignorados."
+                        % (label, rejected_holes),
+                    )
+                )
         for occurrence in range(quantity):
             occurrences.append(
                 (

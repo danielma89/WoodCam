@@ -28,6 +28,7 @@ from .document import (
     VectorDocument,
     WorkArea,
     entity_is_cam_eligible,
+    entity_is_remnant_cut,
     layer_is_cam_eligible,
 )
 from .commands import (
@@ -75,6 +76,7 @@ from .serialization import (
     canonical_json,
     deserialize_document,
     document_checksum,
+    geometry_checksum,
     document_from_dict,
     document_from_json,
     document_to_dict,
@@ -131,6 +133,7 @@ __all__ = [
     "VectorDocument",
     "WorkArea",
     "entity_is_cam_eligible",
+    "entity_is_remnant_cut",
     "layer_is_cam_eligible",
     "AddEntitiesCommand",
     "ArrayCopyCommand",
@@ -172,6 +175,7 @@ __all__ = [
     "canonical_json",
     "deserialize_document",
     "document_checksum",
+    "geometry_checksum",
     "document_from_dict",
     "document_from_json",
     "document_to_dict",

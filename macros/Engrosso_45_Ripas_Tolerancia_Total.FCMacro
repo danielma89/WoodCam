@@ -1,0 +1,1203 @@
+# -*- coding: utf-8 -*-
+# FreeCAD Macro: Engrosso_45_Ripas_Tolerancia_Total.FCMacro
+#
+# V3 - versao conservadora para evitar crashes do OpenCascade:
+# - NAO usa cut(), common(), fuse() ou booleans entre os engrossos.
+# - aceita Vertices, Edges ou objeto/Sketch inteiro.
+# - identifica o maior contorno conectado.
+# - cria um engrosso para cada trecho do contorno.
+# - juntas:
+#     * Meia-esquadria/bissetriz (45 graus em canto de 90 graus)
+#     * Anterior passa / proximo encolhe
+#     * Proximo passa / anterior encolhe
+# - trabalha no plano XY.
+#
+# IMPORTANTE:
+# A macro preserva o objeto original e cria novas Part::Feature.
+
+import math
+import FreeCAD as App
+import Part
+
+try:
+    from PySide import QtCore
+    try:
+        from PySide import QtWidgets
+    except ImportError:
+        from PySide import QtGui as QtWidgets
+except Exception:
+    from PySide2 import QtCore, QtWidgets
+
+
+TOL = 1e-5
+MITER_LIMIT_FACTOR = 8.0
+
+
+# ============================================================
+# GEOMETRIA 2D
+# ============================================================
+
+def pt(v):
+    return App.Vector(float(v.x), float(v.y), 0.0)
+
+def add(a, b):
+    return App.Vector(a.x + b.x, a.y + b.y, 0.0)
+
+def sub(a, b):
+    return App.Vector(a.x - b.x, a.y - b.y, 0.0)
+
+def mul(a, s):
+    return App.Vector(a.x * s, a.y * s, 0.0)
+
+def length(v):
+    return math.hypot(v.x, v.y)
+
+def distance(a, b):
+    return length(sub(a, b))
+
+def same(a, b, tol=TOL):
+    return distance(a, b) <= tol
+
+def unit(v):
+    L = length(v)
+    if L <= TOL:
+        raise ValueError("Segmento de comprimento zero.")
+    return App.Vector(v.x / L, v.y / L, 0.0)
+
+def cross(a, b):
+    return a.x * b.y - a.y * b.x
+
+def left_normal(d):
+    return App.Vector(-d.y, d.x, 0.0)
+
+def right_normal(d):
+    return App.Vector(d.y, -d.x, 0.0)
+
+def line_intersection(p, r, q, s):
+    den = cross(r, s)
+    if abs(den) < 1e-10:
+        return None
+    qp = sub(q, p)
+    t = cross(qp, s) / den
+    return add(p, mul(r, t))
+
+def polygon_area(points):
+    if len(points) < 3:
+        return 0.0
+    a = 0.0
+    for i in range(len(points)):
+        p = points[i]
+        q = points[(i + 1) % len(points)]
+        a += p.x * q.y - q.x * p.y
+    return 0.5 * a
+
+def quad_area(poly):
+    return abs(polygon_area(poly))
+
+
+# ============================================================
+# LEITURA DA SELECAO
+# ============================================================
+
+def edge_endpoints(edge):
+    try:
+        verts = list(edge.Vertexes)
+        if len(verts) >= 2:
+            return pt(verts[0].Point), pt(verts[-1].Point)
+    except Exception:
+        pass
+    return None
+
+def object_edges(obj):
+    try:
+        shp = obj.Shape
+        if not shp.isNull():
+            return list(shp.Edges)
+    except Exception:
+        pass
+    return []
+
+def append_unique(points, p):
+    for q in points:
+        if same(p, q):
+            return
+    points.append(p)
+
+def chains_from_edges(edges):
+    segs = []
+    for e in edges:
+        ep = edge_endpoints(e)
+        if not ep:
+            continue
+        a, b = ep
+        if not same(a, b):
+            segs.append([a, b])
+
+    chains = []
+
+    while segs:
+        a, b = segs.pop(0)
+        chain = [a, b]
+
+        progress = True
+        while progress and segs:
+            progress = False
+
+            for i, (p, q) in enumerate(segs):
+                if same(chain[-1], p):
+                    chain.append(q)
+                    segs.pop(i)
+                    progress = True
+                    break
+                if same(chain[-1], q):
+                    chain.append(p)
+                    segs.pop(i)
+                    progress = True
+                    break
+
+            if progress:
+                continue
+
+            for i, (p, q) in enumerate(segs):
+                if same(chain[0], q):
+                    chain.insert(0, p)
+                    segs.pop(i)
+                    progress = True
+                    break
+                if same(chain[0], p):
+                    chain.insert(0, q)
+                    segs.pop(i)
+                    progress = True
+                    break
+
+        if len(chain) >= 3 and same(chain[0], chain[-1]):
+            chain = chain[:-1]
+
+        chains.append(chain)
+
+    return chains
+
+def chain_perimeter(chain, close=True):
+    L = 0.0
+    for i in range(len(chain) - 1):
+        L += distance(chain[i], chain[i + 1])
+    if close and len(chain) >= 3:
+        L += distance(chain[-1], chain[0])
+    return L
+
+def read_selection():
+    sels = Gui.Selection.getSelectionEx()
+
+    vertices = []
+    selected_edges = []
+    whole_object_edges = []
+    received = []
+
+    for sel in sels:
+        obj = sel.Object
+        names = list(getattr(sel, "SubElementNames", []) or [])
+        subs = list(getattr(sel, "SubObjects", []) or [])
+        received.extend(names)
+
+        # Melhor fonte: os proprios SubObjects
+        for so in subs:
+            try:
+                typ = so.ShapeType
+            except Exception:
+                typ = ""
+
+            if typ == "Vertex":
+                try:
+                    append_unique(vertices, pt(so.Point))
+                except Exception:
+                    pass
+            elif typ == "Edge":
+                selected_edges.append(so)
+
+        # Fallback pelos nomes
+        for name in names:
+            try:
+                element = obj.Shape.getElement(name)
+            except Exception:
+                try:
+                    element = obj.getSubObject(name)
+                except Exception:
+                    element = None
+
+            if element is None:
+                continue
+
+            try:
+                typ = element.ShapeType
+            except Exception:
+                typ = ""
+
+            if typ == "Vertex":
+                try:
+                    append_unique(vertices, pt(element.Point))
+                except Exception:
+                    pass
+            elif typ == "Edge":
+                selected_edges.append(element)
+
+        # Objeto inteiro / Sketch inteiro
+        if not names and not subs:
+            whole_object_edges.extend(object_edges(obj))
+
+    if len(vertices) >= 2:
+        return {
+            "points": vertices,
+            "source": "vertices selecionados",
+            "closed_hint": False,
+            "chains": 1,
+            "received": received,
+        }
+
+    if selected_edges:
+        chains = [c for c in chains_from_edges(selected_edges) if len(c) >= 2]
+        if chains:
+            chains.sort(key=lambda c: chain_perimeter(c, False), reverse=True)
+            main = chains[0]
+
+            closed = False
+            if len(main) >= 3:
+                for e in selected_edges:
+                    ep = edge_endpoints(e)
+                    if not ep:
+                        continue
+                    a, b = ep
+                    if ((same(a, main[-1]) and same(b, main[0])) or
+                        (same(b, main[-1]) and same(a, main[0]))):
+                        closed = True
+                        break
+
+            return {
+                "points": main,
+                "source": "arestas selecionadas",
+                "closed_hint": closed,
+                "chains": len(chains),
+                "received": received,
+            }
+
+    if whole_object_edges:
+        chains = [c for c in chains_from_edges(whole_object_edges) if len(c) >= 2]
+        if chains:
+            # Maior cadeia = normalmente contorno externo.
+            chains.sort(key=lambda c: chain_perimeter(c, True), reverse=True)
+            main = chains[0]
+
+            return {
+                "points": main,
+                "source": "maior contorno do objeto",
+                "closed_hint": len(main) >= 3,
+                "chains": len(chains),
+                "received": received,
+            }
+
+    return {
+        "points": [],
+        "source": "nao reconhecido",
+        "closed_hint": False,
+        "chains": 0,
+        "received": received,
+    }
+
+
+# ============================================================
+# INTERFACE
+# ============================================================
+
+class EngrossoDialog(QtWidgets.QDialog):
+    def __init__(self, data):
+        super(EngrossoDialog, self).__init__()
+        self.setWindowTitle("Engrosso MDF - 45 graus")
+        self.setMinimumWidth(500)
+
+        root = QtWidgets.QVBoxLayout(self)
+
+        info = QtWidgets.QLabel(
+            "Selecao reconhecida como: {}\n"
+            "Pontos do contorno principal: {}".format(
+                data["source"], len(data["points"])
+            )
+        )
+        info.setWordWrap(True)
+        root.addWidget(info)
+
+        if data["chains"] > 1:
+            lab = QtWidgets.QLabel(
+                "Foram encontrados {} contornos desconectados. "
+                "Sera usado somente o maior; furos internos ficam ignorados.".format(
+                    data["chains"]
+                )
+            )
+            lab.setWordWrap(True)
+            root.addWidget(lab)
+
+        form = QtWidgets.QFormLayout()
+
+        self.width = QtWidgets.QDoubleSpinBox()
+        self.width.setRange(1.0, 1000.0)
+        self.width.setDecimals(1)
+        self.width.setValue(60.0)
+        self.width.setSuffix(" mm")
+
+        self.thick = QtWidgets.QDoubleSpinBox()
+        self.thick.setRange(1.0, 100.0)
+        self.thick.setDecimals(1)
+        self.thick.setValue(15.0)
+        self.thick.setSuffix(" mm")
+
+        self.zbase = QtWidgets.QDoubleSpinBox()
+        self.zbase.setRange(-5000.0, 5000.0)
+        self.zbase.setDecimals(1)
+        self.zbase.setValue(-15.0)
+        self.zbase.setSuffix(" mm")
+
+        self.side = QtWidgets.QComboBox()
+        self.side.addItem("Para dentro do contorno", "IN")
+        self.side.addItem("Para fora do contorno", "OUT")
+        self.side.addItem("Esquerda no sentido do contorno", "LEFT")
+        self.side.addItem("Direita no sentido do contorno", "RIGHT")
+
+        self.joint = QtWidgets.QComboBox()
+        # Meia-esquadria como padrao.
+        # Em cantos de 90 graus, cada peca recebe corte de 45 graus.
+        self.joint.addItem("45 graus / meia-esquadria", "MITER")
+        self.joint.addItem("Anterior passa inteiro; proximo encolhe", "TRIM_NEXT")
+        self.joint.addItem("Proximo passa inteiro; anterior encolhe", "TRIM_PREV")
+
+        form.addRow("Largura do engrosso:", self.width)
+        form.addRow("Espessura MDF:", self.thick)
+        form.addRow("Z inferior:", self.zbase)
+        form.addRow("Lado:", self.side)
+        form.addRow("Encontro:", self.joint)
+
+        root.addLayout(form)
+
+        self.closed = QtWidgets.QCheckBox("Contorno fechado")
+        self.closed.setChecked(bool(data["closed_hint"]))
+        root.addWidget(self.closed)
+
+        # ---------------- RIPAS INTERNAS ----------------
+        rib_group = QtWidgets.QGroupBox("Ripas internas")
+        rib_form = QtWidgets.QFormLayout(rib_group)
+
+        self.rib_count = QtWidgets.QSpinBox()
+        self.rib_count.setRange(0, 50)
+        self.rib_count.setValue(3)
+
+        self.rib_orientation = QtWidgets.QComboBox()
+        self.rib_orientation.addItem("Frente ↔ Fundo / vertical no desenho", "Y")
+        self.rib_orientation.addItem("Esquerda ↔ Direita / horizontal no desenho", "X")
+
+        self.rib_width = QtWidgets.QDoubleSpinBox()
+        self.rib_width.setRange(1.0, 1000.0)
+        self.rib_width.setDecimals(1)
+        self.rib_width.setValue(60.0)
+        self.rib_width.setSuffix(" mm")
+
+        self.connection_clearance = QtWidgets.QDoubleSpinBox()
+        self.connection_clearance.setRange(0.0, 20.0)
+        self.connection_clearance.setDecimals(2)
+        self.connection_clearance.setSingleStep(0.25)
+        self.connection_clearance.setValue(1.0)
+        self.connection_clearance.setSuffix(" mm")
+
+        rib_form.addRow("Quantidade:", self.rib_count)
+        rib_form.addRow("Sentido:", self.rib_orientation)
+        rib_form.addRow("Largura da ripa:", self.rib_width)
+        rib_form.addRow("Tolerancia por conexao (ripas + 45°):", self.connection_clearance)
+
+        root.addWidget(rib_group)
+
+        tol_info = QtWidgets.QLabel(
+            "A tolerancia tambem e aplicada nas meia-esquadrias. "
+            "Ex.: 1 mm faz cada peca recuar 1 mm em cada ponta conectada, "
+            "mantendo o corte em 45 graus."
+        )
+        tol_info.setWordWrap(True)
+        root.addWidget(tol_info)
+
+        safety = QtWidgets.QLabel(
+            "Modo 45 graus: nos cantos de 90 graus as duas pecas recebem meia-esquadria. "
+            "A geometria e calculada em 2D, sem operacoes booleanas entre as pecas. "
+            "Cantos geometricamente extremos usam encontro simples por seguranca."
+        )
+        safety.setWordWrap(True)
+        root.addWidget(safety)
+
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok |
+            QtWidgets.QDialogButtonBox.Cancel
+        )
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        root.addWidget(bb)
+
+
+def combo_value(c):
+    try:
+        return c.currentData()
+    except Exception:
+        return c.itemData(c.currentIndex())
+
+
+# ============================================================
+# DEFINICAO DOS SEGMENTOS
+# ============================================================
+
+def resolve_side(points, requested, closed):
+    if requested in ("LEFT", "RIGHT"):
+        return requested
+
+    if closed and len(points) >= 3:
+        a = polygon_area(points)
+        inside = "LEFT" if a > 0 else "RIGHT"
+
+        if requested == "IN":
+            return inside
+        return "RIGHT" if inside == "LEFT" else "LEFT"
+
+    return "LEFT" if requested == "IN" else "RIGHT"
+
+def make_segments(points, width, side, closed):
+    segs = []
+
+    pairs = [(points[i], points[i+1]) for i in range(len(points)-1)]
+    if closed:
+        pairs.append((points[-1], points[0]))
+
+    for a, b in pairs:
+        if same(a, b):
+            continue
+
+        d = unit(sub(b, a))
+        n = left_normal(d) if side == "LEFT" else right_normal(d)
+        n = mul(n, width)
+
+        segs.append({
+            "a": a,
+            "b": b,
+            "d": d,
+            "n": n,
+            "ai": add(a, n),
+            "bi": add(b, n),
+        })
+
+    return segs
+
+
+# ============================================================
+# JUNTAS SEM BOOLEAN
+# ============================================================
+
+def safe_inner_intersection(prev_seg, next_seg, corner, width):
+    inner = line_intersection(
+        prev_seg["ai"], prev_seg["d"],
+        next_seg["ai"], next_seg["d"]
+    )
+
+    if inner is None:
+        return None
+
+    # Evita mitras gigantes em angulos quase paralelos.
+    if distance(corner, inner) > width * MITER_LIMIT_FACTOR:
+        return None
+
+    return inner
+
+
+def miter_polygons(segs, closed, width, clearance=0.0):
+    n = len(segs)
+    joints = {}
+    joint_count = n if closed else n - 1
+
+    for i in range(joint_count):
+        j = (i + 1) % n
+        if not same(segs[i]["b"], segs[j]["a"]):
+            continue
+
+        corner = segs[i]["b"]
+        inner = safe_inner_intersection(segs[i], segs[j], corner, width)
+
+        if inner is not None:
+            joints[(i, j)] = inner
+
+    polys = []
+
+    for i, s in enumerate(segs):
+        outer_start = s["a"]
+        outer_end = s["b"]
+        inner_start = s["ai"]
+        inner_end = s["bi"]
+
+        prev_i = (i - 1) % n
+        next_i = (i + 1) % n
+
+        has_start_joint = ((prev_i, i) in joints and (closed or i > 0))
+        has_end_joint = ((i, next_i) in joints and (closed or i < n - 1))
+
+        if has_start_joint:
+            inner_start = joints[(prev_i, i)]
+
+        if has_end_joint:
+            inner_end = joints[(i, next_i)]
+
+        # ----------------------------------------------------
+        # TOLERANCIA NAS MEIA-ESQUADRIAS
+        # ----------------------------------------------------
+        # Para manter o angulo do corte, deslocamos OS DOIS pontos
+        # da face de corte pelo mesmo vetor ao longo do eixo da peca.
+        #
+        # Inicio da peca: avanca +d
+        # Fim da peca: recua -d
+        #
+        # Assim o plano/linha do chanfro permanece paralelo ao original.
+        if clearance > 0.0:
+            if has_start_joint:
+                shift_start = mul(s["d"], clearance)
+                outer_start = add(outer_start, shift_start)
+                inner_start = add(inner_start, shift_start)
+
+            if has_end_joint:
+                shift_end = mul(s["d"], -clearance)
+                outer_end = add(outer_end, shift_end)
+                inner_end = add(inner_end, shift_end)
+
+        poly = [outer_start, outer_end, inner_end, inner_start]
+
+        # Se a tolerancia ou a geometria deixar a peca degenerada,
+        # volta para a geometria sem tolerancia daquela peca.
+        if quad_area(poly) < 1e-4:
+            inner_start = s["ai"]
+            inner_end = s["bi"]
+
+            if has_start_joint:
+                inner_start = joints[(prev_i, i)]
+            if has_end_joint:
+                inner_end = joints[(i, next_i)]
+
+            poly = [s["a"], s["b"], inner_end, inner_start]
+
+        polys.append(poly)
+
+    return polys
+
+
+def trim_next_joint(prev_seg, next_seg):
+    """
+    Anterior passa inteiro.
+    Proximo comeca na face interna do anterior.
+    Calcula os dois pontos da linha de corte do proximo.
+    """
+    cut_origin = prev_seg["ai"]
+    cut_dir = prev_seg["d"]
+
+    outer_start = line_intersection(
+        next_seg["a"], next_seg["d"],
+        cut_origin, cut_dir
+    )
+    inner_start = line_intersection(
+        next_seg["ai"], next_seg["d"],
+        cut_origin, cut_dir
+    )
+
+    return outer_start, inner_start
+
+
+def trim_prev_joint(prev_seg, next_seg):
+    """
+    Proximo passa inteiro.
+    Anterior termina na face interna do proximo.
+    """
+    cut_origin = next_seg["ai"]
+    cut_dir = next_seg["d"]
+
+    outer_end = line_intersection(
+        prev_seg["a"], prev_seg["d"],
+        cut_origin, cut_dir
+    )
+    inner_end = line_intersection(
+        prev_seg["ai"], prev_seg["d"],
+        cut_origin, cut_dir
+    )
+
+    return outer_end, inner_end
+
+
+def butt_polygons(segs, closed, mode, width):
+    n = len(segs)
+
+    # Inicialmente cada segmento e um retangulo.
+    starts_outer = [s["a"] for s in segs]
+    ends_outer = [s["b"] for s in segs]
+    starts_inner = [s["ai"] for s in segs]
+    ends_inner = [s["bi"] for s in segs]
+
+    joint_count = n if closed else n - 1
+
+    for i in range(joint_count):
+        j = (i + 1) % n
+
+        if not same(segs[i]["b"], segs[j]["a"]):
+            continue
+
+        corner = segs[i]["b"]
+
+        if mode == "TRIM_NEXT":
+            os_, is_ = trim_next_joint(segs[i], segs[j])
+
+            if (os_ is not None and is_ is not None and
+                distance(corner, os_) <= width * MITER_LIMIT_FACTOR and
+                distance(corner, is_) <= width * MITER_LIMIT_FACTOR):
+                starts_outer[j] = os_
+                starts_inner[j] = is_
+
+        elif mode == "TRIM_PREV":
+            oe, ie = trim_prev_joint(segs[i], segs[j])
+
+            if (oe is not None and ie is not None and
+                distance(corner, oe) <= width * MITER_LIMIT_FACTOR and
+                distance(corner, ie) <= width * MITER_LIMIT_FACTOR):
+                ends_outer[i] = oe
+                ends_inner[i] = ie
+
+    polys = []
+
+    for i in range(n):
+        poly = [
+            starts_outer[i],
+            ends_outer[i],
+            ends_inner[i],
+            starts_inner[i],
+        ]
+
+        if quad_area(poly) < 1e-4:
+            poly = [
+                segs[i]["a"],
+                segs[i]["b"],
+                segs[i]["bi"],
+                segs[i]["ai"],
+            ]
+
+        polys.append(poly)
+
+    return polys
+
+
+
+# ============================================================
+# RIPAS INTERNAS - SEM BOOLEAN
+# ============================================================
+
+def inner_polygon_from_segments(segs, width):
+    """
+    Calcula o contorno interno do engrosso perimetral pela intersecao
+    das linhas deslocadas. Funciona bem para contornos fechados e
+    evita qualquer operacao booleana.
+    """
+    n = len(segs)
+    if n < 3:
+        return []
+
+    inner = []
+
+    for i in range(n):
+        prev_seg = segs[(i - 1) % n]
+        curr_seg = segs[i]
+        corner = curr_seg["a"]
+
+        p = line_intersection(
+            prev_seg["ai"], prev_seg["d"],
+            curr_seg["ai"], curr_seg["d"]
+        )
+
+        # Cantos quase paralelos ou mitra excessiva:
+        # usa uma media segura dos pontos deslocados.
+        if p is None or distance(corner, p) > width * MITER_LIMIT_FACTOR:
+            p = mul(add(prev_seg["bi"], curr_seg["ai"]), 0.5)
+
+        inner.append(p)
+
+    return inner
+
+
+def scanline_intervals(poly, axis, value):
+    """
+    Intersecoes de uma linha infinita com um poligono simples.
+
+    axis == "Y":
+        ripa corre no eixo Y, portanto x = value.
+        retorna intervalos (y0, y1).
+
+    axis == "X":
+        ripa corre no eixo X, portanto y = value.
+        retorna intervalos (x0, x1).
+
+    Usa regra half-open para evitar duplicar vertices.
+    """
+    hits = []
+    n = len(poly)
+
+    if n < 3:
+        return []
+
+    for i in range(n):
+        a = poly[i]
+        b = poly[(i + 1) % n]
+
+        if axis == "Y":
+            # linha x = value
+            x1, x2 = a.x, b.x
+
+            if abs(x2 - x1) < TOL:
+                continue
+
+            if ((x1 <= value < x2) or (x2 <= value < x1)):
+                t = (value - x1) / (x2 - x1)
+                y = a.y + t * (b.y - a.y)
+                hits.append(y)
+
+        else:
+            # linha y = value
+            y1, y2 = a.y, b.y
+
+            if abs(y2 - y1) < TOL:
+                continue
+
+            if ((y1 <= value < y2) or (y2 <= value < y1)):
+                t = (value - y1) / (y2 - y1)
+                x = a.x + t * (b.x - a.x)
+                hits.append(x)
+
+    hits.sort()
+
+    # Elimina duplicatas numericas muito proximas
+    clean = []
+    for h in hits:
+        if not clean or abs(h - clean[-1]) > TOL:
+            clean.append(h)
+
+    intervals = []
+    for i in range(0, len(clean) - 1, 2):
+        a = clean[i]
+        b = clean[i + 1]
+        if b - a > TOL:
+            intervals.append((a, b))
+
+    return intervals
+
+
+def rib_polygons(inner_poly, count, axis, rib_width, clearance):
+    """
+    Distribui N ripas igualmente dentro do contorno interno.
+
+    "clearance" e a tolerancia POR CONEXAO:
+    uma ripa com duas extremidades conectadas perde clearance em cada ponta.
+
+    Retorna lista:
+        (numero_ripa, numero_trecho, poligono)
+
+    Um contorno concavo pode produzir mais de um trecho em uma mesma
+    linha de ripa; nesse caso cada trecho vira uma peca separada.
+    """
+    if count <= 0 or len(inner_poly) < 3:
+        return []
+
+    xs = [p.x for p in inner_poly]
+    ys = [p.y for p in inner_poly]
+
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+
+    polys = []
+
+    if axis == "Y":
+        span = max_x - min_x
+        if span <= rib_width + TOL:
+            return []
+
+        step = span / float(count + 1)
+
+        for i in range(1, count + 1):
+            x = min_x + i * step
+            intervals = scanline_intervals(inner_poly, "Y", x)
+
+            for j, (y0, y1) in enumerate(intervals, 1):
+                # Tolerancia por conexao.
+                # Ex.: clearance=1 mm -> 1 mm em cada extremidade,
+                # totalizando 2 mm a menos no comprimento da ripa.
+                y0 += clearance
+                y1 -= clearance
+
+                if y1 - y0 <= TOL:
+                    continue
+
+                hw = rib_width / 2.0
+                poly = [
+                    App.Vector(x - hw, y0, 0),
+                    App.Vector(x + hw, y0, 0),
+                    App.Vector(x + hw, y1, 0),
+                    App.Vector(x - hw, y1, 0),
+                ]
+                polys.append((i, j, poly))
+
+    else:
+        span = max_y - min_y
+        if span <= rib_width + TOL:
+            return []
+
+        step = span / float(count + 1)
+
+        for i in range(1, count + 1):
+            y = min_y + i * step
+            intervals = scanline_intervals(inner_poly, "X", y)
+
+            for j, (x0, x1) in enumerate(intervals, 1):
+                x0 += clearance
+                x1 -= clearance
+
+                if x1 - x0 <= TOL:
+                    continue
+
+                hw = rib_width / 2.0
+                poly = [
+                    App.Vector(x0, y - hw, 0),
+                    App.Vector(x1, y - hw, 0),
+                    App.Vector(x1, y + hw, 0),
+                    App.Vector(x0, y + hw, 0),
+                ]
+                polys.append((i, j, poly))
+
+    return polys
+
+
+def add_rib_piece(doc, group, rib_index, segment_index, shape, rib_width, thickness):
+    name = unique_name(
+        doc,
+        "Ripa_{:02d}_{:02d}".format(rib_index, segment_index)
+    )
+
+    obj = doc.addObject("Part::Feature", name)
+    obj.Label = (
+        "Ripa interna {:02d}".format(rib_index)
+        if segment_index == 1
+        else "Ripa interna {:02d} - trecho {:02d}".format(
+            rib_index, segment_index
+        )
+    )
+    obj.Shape = shape
+
+    obj.addProperty("App::PropertyLength", "LarguraRipa", "MDF")
+    obj.addProperty("App::PropertyLength", "EspessuraMDF", "MDF")
+    obj.addProperty("App::PropertyInteger", "NumeroRipa", "MDF")
+
+    obj.LarguraRipa = rib_width
+    obj.EspessuraMDF = thickness
+    obj.NumeroRipa = rib_index
+
+    try:
+        obj.ViewObject.ShapeColor = (0.69, 0.52, 0.32)
+    except Exception:
+        pass
+
+    group.addObject(obj)
+    return obj
+
+
+
+# ============================================================
+# CONVERSAO POLIGONO -> SOLIDO
+# ============================================================
+
+def clean_polygon(poly):
+    clean = []
+    for p in poly:
+        if not clean or not same(clean[-1], p):
+            clean.append(p)
+
+    if len(clean) >= 2 and same(clean[0], clean[-1]):
+        clean = clean[:-1]
+
+    return clean
+
+def solid_from_polygon(poly, z, thickness):
+    poly = clean_polygon(poly)
+
+    if len(poly) < 3:
+        raise ValueError("Poligono com menos de 3 pontos.")
+
+    if abs(polygon_area(poly)) < 1e-4:
+        raise ValueError("Poligono degenerado.")
+
+    pts3 = [App.Vector(p.x, p.y, z) for p in poly]
+    pts3.append(pts3[0])
+
+    wire = Part.makePolygon(pts3)
+
+    if wire.isNull():
+        raise ValueError("Wire invalido.")
+
+    face = Part.Face(wire)
+
+    if face.isNull():
+        raise ValueError("Face invalida.")
+
+    solid = face.extrude(App.Vector(0, 0, thickness))
+
+    if solid.isNull():
+        raise ValueError("Solido invalido.")
+
+    return solid
+
+
+# ============================================================
+# OBJETOS FREECAD
+# ============================================================
+
+def unique_name(doc, base):
+    if doc.getObject(base) is None:
+        return base
+    i = 2
+    while doc.getObject("{}_{:02d}".format(base, i)):
+        i += 1
+    return "{}_{:02d}".format(base, i)
+
+def add_piece(doc, group, index, shape, width, thickness):
+    obj = doc.addObject(
+        "Part::Feature",
+        unique_name(doc, "Engrosso_{:02d}".format(index))
+    )
+    obj.Label = "Engrosso {:02d}".format(index)
+    obj.Shape = shape
+
+    obj.addProperty("App::PropertyLength", "LarguraEngrosso", "MDF")
+    obj.addProperty("App::PropertyLength", "EspessuraMDF", "MDF")
+    obj.LarguraEngrosso = width
+    obj.EspessuraMDF = thickness
+
+    try:
+        obj.ViewObject.ShapeColor = (0.78, 0.60, 0.38)
+    except Exception:
+        pass
+
+    group.addObject(obj)
+    return obj
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    data = read_selection()
+    points = list(data["points"])
+
+    if len(points) < 2:
+        QtWidgets.QMessageBox.warning(
+            None,
+            "Engrosso MDF - 45 graus",
+            "A macro nao conseguiu extrair um contorno da selecao.\n\n"
+            "Selecione o Sketch/objeto inteiro ou algumas arestas e tente novamente."
+        )
+        return
+
+    dlg = EngrossoDialog(data)
+    if dlg.exec_() != QtWidgets.QDialog.Accepted:
+        return
+
+    width = float(dlg.width.value())
+    thickness = float(dlg.thick.value())
+    zbase = float(dlg.zbase.value())
+    closed = bool(dlg.closed.isChecked())
+    requested_side = combo_value(dlg.side)
+    joint_mode = combo_value(dlg.joint)
+
+    rib_count = int(dlg.rib_count.value())
+    rib_axis = combo_value(dlg.rib_orientation)
+    rib_width = float(dlg.rib_width.value())
+    connection_clearance = float(dlg.connection_clearance.value())
+
+    # Remove repeticao final.
+    if len(points) > 2 and same(points[0], points[-1]):
+        points = points[:-1]
+        closed = True
+
+    if closed and len(points) < 3:
+        QtWidgets.QMessageBox.warning(
+            None,
+            "Engrosso MDF - 45 graus",
+            "Contorno fechado precisa de pelo menos 3 pontos."
+        )
+        return
+
+    side = resolve_side(points, requested_side, closed)
+    segs = make_segments(points, width, side, closed)
+
+    if not segs:
+        QtWidgets.QMessageBox.warning(
+            None,
+            "Engrosso MDF - 45 graus",
+            "Nenhum segmento valido foi encontrado."
+        )
+        return
+
+    if joint_mode == "MITER":
+        polygons = miter_polygons(segs, closed, width, connection_clearance)
+    else:
+        polygons = butt_polygons(segs, closed, joint_mode, width)
+
+    # Antes de adicionar ao documento, tenta gerar todos os solidos.
+    # Se uma peca falhar, usa um retangulo simples para aquele trecho.
+    solids = []
+    fallback_count = 0
+
+    for i, poly in enumerate(polygons):
+        try:
+            sh = solid_from_polygon(poly, zbase, thickness)
+        except Exception:
+            fallback_count += 1
+            s = segs[i]
+            safe_poly = [s["a"], s["b"], s["bi"], s["ai"]]
+            try:
+                sh = solid_from_polygon(safe_poly, zbase, thickness)
+            except Exception as err:
+                QtWidgets.QMessageBox.critical(
+                    None,
+                    "Engrosso MDF - 45 graus",
+                    "Nao foi possivel criar o trecho {}.\n\n{}".format(
+                        i + 1, str(err)
+                    )
+                )
+                return
+
+        solids.append(sh)
+
+    # --------------------------------------------------------
+    # RIPAS INTERNAS
+    # --------------------------------------------------------
+    rib_shapes = []
+
+    if rib_count > 0:
+        if not closed:
+            QtWidgets.QMessageBox.warning(
+                None,
+                "Engrosso MDF - 45 graus",
+                "As ripas internas exigem um contorno fechado.\n\n"
+                "O engrosso perimetral sera criado, mas as ripas internas nao."
+            )
+        else:
+            inner_poly = inner_polygon_from_segments(segs, width)
+
+            for rib_i, part_i, rib_poly in rib_polygons(
+                inner_poly,
+                rib_count,
+                rib_axis,
+                rib_width,
+                connection_clearance
+            ):
+                try:
+                    rib_shape = solid_from_polygon(
+                        rib_poly,
+                        zbase,
+                        thickness
+                    )
+                    rib_shapes.append((rib_i, part_i, rib_shape))
+                except Exception:
+                    # Se uma ripa especifica nao puder ser criada,
+                    # ignora apenas aquela peca.
+                    pass
+
+    doc = App.ActiveDocument
+    if doc is None:
+        doc = App.newDocument("Engrossos")
+
+    group = doc.addObject(
+        "App::Part",
+        unique_name(doc, "Engrossos_Seguros")
+    )
+    group.Label = "Engrossos seguros"
+
+    group.addProperty("App::PropertyLength", "Largura", "Parametros")
+    group.addProperty("App::PropertyLength", "Espessura", "Parametros")
+    group.addProperty("App::PropertyString", "Junta", "Parametros")
+    group.addProperty("App::PropertyString", "Direcao", "Parametros")
+    group.addProperty("App::PropertyString", "FonteSelecao", "Parametros")
+    group.addProperty("App::PropertyInteger", "QuantidadeRipasInternas", "Ripas")
+    group.addProperty("App::PropertyLength", "LarguraRipasInternas", "Ripas")
+    group.addProperty("App::PropertyLength", "ToleranciaPorConexao", "Tolerancias")
+    group.addProperty("App::PropertyString", "AplicacaoTolerancia", "Tolerancias")
+    group.addProperty("App::PropertyString", "SentidoRipasInternas", "Ripas")
+
+    group.Largura = width
+    group.Espessura = thickness
+    group.Junta = joint_mode
+    group.Direcao = requested_side
+    group.FonteSelecao = data["source"]
+    group.QuantidadeRipasInternas = rib_count
+    group.LarguraRipasInternas = rib_width
+    group.ToleranciaPorConexao = connection_clearance
+    group.AplicacaoTolerancia = "Ripas internas + meia-esquadria 45 graus"
+    group.SentidoRipasInternas = (
+        "Frente-Fundo / Y" if rib_axis == "Y"
+        else "Esquerda-Direita / X"
+    )
+
+    for i, sh in enumerate(solids, 1):
+        add_piece(doc, group, i, sh, width, thickness)
+
+    for rib_i, part_i, rib_shape in rib_shapes:
+        add_rib_piece(
+            doc,
+            group,
+            rib_i,
+            part_i,
+            rib_shape,
+            rib_width,
+            thickness
+        )
+
+    doc.recompute()
+
+    # Nao fazemos operacoes booleanas nem refinamento de shape.
+    try:
+        Gui.activeDocument().activeView().fitAll()
+    except Exception:
+        pass
+
+    msg = (
+        "{} engrosso(s) perimetral(is) criado(s).\n"
+        "{} trecho(s) de ripa interna criado(s).\n\n"
+        "Modo dos cantos: {}\n"
+        "Ripas solicitadas: {}\n"
+        "Tolerancia: {:.2f} mm por conexao\n"
+        "Aplicada em: ripas internas + encontros 45 graus\n"
+        "Peca com 2 conexoes: {:.2f} mm menor no total\n"
+        "Sentido das ripas: {}\n"
+        "Selecao: {}"
+    ).format(
+        len(solids),
+        len(rib_shapes),
+        joint_mode,
+        rib_count,
+        connection_clearance,
+        connection_clearance * 2.0,
+        "Frente-Fundo / Y" if rib_axis == "Y" else "Esquerda-Direita / X",
+        data["source"]
+    )
+
+    if fallback_count:
+        msg += (
+            "\n\n{} canto(s) geometricamente problemático(s) foram "
+            "convertidos para encontro simples por seguranca."
+        ).format(fallback_count)
+
+    QtWidgets.QMessageBox.information(
+        None,
+        "Engrosso MDF - 45 graus",
+        msg
+    )
+
+
+main()

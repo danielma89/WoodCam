@@ -6,6 +6,7 @@ from operations import (
     CUT_SIDE_INSIDE,
     CUT_SIDE_ON_LINE,
     CUT_SIDE_OUTSIDE,
+    build_common_line_cut_job,
     build_profile_cut_moves,
     build_drill_moves,
     build_machining_job,
@@ -15,11 +16,14 @@ from operations import (
     build_external_cut_job,
     build_external_cut_moves,
     compensated_polygon,
+    external_compensation_detail_loss,
     generate_depth_steps,
     offset_closed_polygon,
     order_contours_by_nearest,
     select_entry_distance,
     split_nested_contours,
+    tab_retained_cut_depth,
+    _best_fixation_tab_ranges,
     _tab_ranges,
 )
 
@@ -27,6 +31,12 @@ from operations import (
 class OperationsTest(unittest.TestCase):
     def test_depth_steps_include_final_depth(self):
         self.assertEqual(generate_depth_steps(10.0, 3.0), [3.0, 6.0, 9.0, 10.0])
+
+    def test_depth_steps_only_machine_the_interval_after_initial_depth(self):
+        self.assertEqual(
+            generate_depth_steps(7.0, 0.4, start_depth=6.3),
+            [6.7, 7.0],
+        )
 
     def test_depth_extra_is_merged_into_last_material_pass(self):
         self.assertEqual(
@@ -73,6 +83,14 @@ class OperationsTest(unittest.TestCase):
         self.assertAlmostEqual(max(point[0] for point in outside), 103.0)
         self.assertAlmostEqual(min(point[0] for point in inside), 3.0)
         self.assertAlmostEqual(max(point[0] for point in inside), 97.0)
+
+    def test_external_compensation_rounds_acute_tip_at_physical_tool_radius(self):
+        pointed = [(0.0, 0.0), (20.0, 100.0), (0.0, 200.0)]
+
+        outside = compensated_polygon(pointed, 4.0, CUT_SIDE_OUTSIDE)
+
+        self.assertLessEqual(max(point[0] for point in outside), 22.0 + 1e-9)
+        self.assertGreater(len(outside), len(pointed))
 
     def test_internal_cut_shrinks_a_discretized_circle(self):
         circle = [
@@ -122,6 +140,127 @@ class OperationsTest(unittest.TestCase):
         square = [(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)]
         with self.assertRaisesRegex(ValueError, "estreito demais"):
             compensated_polygon(square, 6.0, CUT_SIDE_INSIDE)
+
+    def test_external_compensation_reports_a_slot_narrower_than_the_tool(self):
+        narrow_slot = [
+            (0.0, 0.0),
+            (100.0, 0.0),
+            (100.0, 100.0),
+            (52.0, 100.0),
+            (52.0, 60.0),
+            (50.0, 60.0),
+            (50.0, 100.0),
+            (0.0, 100.0),
+        ]
+        issue = external_compensation_detail_loss(narrow_slot, 4.0)
+        self.assertIsNotNone(issue)
+        self.assertGreater(issue["distance_to_compensated_path"], 2.5)
+        self.assertGreaterEqual(issue["point"][1], 60.0)
+        self.assertEqual(issue["cleanup_modes"], ("slot_centerline",))
+        self.assertEqual(
+            issue["cleanup_paths"],
+            (((51.0, 100.0), (51.0, 60.0)),),
+        )
+        # A fresa Ø4 centrada na fenda de 2 mm excede cada parede em apenas
+        # 1 mm. Seguir as duas paredes excederia 2 mm em cada lado.
+        centre_x = issue["cleanup_paths"][0][0][0]
+        self.assertEqual(centre_x - 4.0 * 0.5, 49.0)
+        self.assertEqual(centre_x + 4.0 * 0.5, 53.0)
+
+    def test_external_compensation_centres_tapered_and_stepped_slot(self):
+        narrow_slot = [
+            (0.0, 0.0),
+            (100.0, 0.0),
+            (100.0, 100.0),
+            (54.0, 100.0),
+            (54.0, 80.0),
+            (53.0, 80.0),
+            (53.0, 55.0),
+            (52.0, 55.0),
+            (52.0, 30.0),
+            (50.0, 30.0),
+            (50.0, 100.0),
+            (0.0, 100.0),
+        ]
+
+        issue = external_compensation_detail_loss(narrow_slot, 4.0)
+
+        self.assertIsNotNone(issue)
+        self.assertEqual(issue["cleanup_modes"], ("slot_medial_axis",))
+        self.assertEqual(
+            issue["cleanup_paths"],
+            (
+                (
+                    (52.0, 100.0),
+                    (52.0, 80.0),
+                    (51.5, 67.5),
+                    (51.5, 55.0),
+                    (51.0, 42.5),
+                    (51.0, 30.0),
+                ),
+            ),
+        )
+        source_trace = tuple(narrow_slot[3:11])
+        self.assertNotEqual(issue["cleanup_paths"][0], source_trace)
+
+        angle = math.radians(31.0)
+        cosine = math.cos(angle)
+        sine = math.sin(angle)
+        rotated = [
+            (
+                point[0] * cosine - point[1] * sine,
+                point[0] * sine + point[1] * cosine,
+            )
+            for point in narrow_slot
+        ]
+        rotated_issue = external_compensation_detail_loss(rotated, 4.0)
+        self.assertIsNotNone(rotated_issue)
+        self.assertEqual(
+            rotated_issue["cleanup_modes"],
+            ("slot_medial_axis",),
+        )
+        rotated_path = rotated_issue["cleanup_paths"][0]
+        restored_path = [
+            (
+                point[0] * cosine + point[1] * sine,
+                -point[0] * sine + point[1] * cosine,
+            )
+            for point in rotated_path
+        ]
+        self.assertEqual(len(restored_path), 6)
+        for actual, expected in zip(
+            restored_path,
+            issue["cleanup_paths"][0],
+        ):
+            self.assertAlmostEqual(actual[0], expected[0], places=6)
+            self.assertAlmostEqual(actual[1], expected[1], places=6)
+
+        reversed_issue = external_compensation_detail_loss(
+            list(reversed(narrow_slot)),
+            4.0,
+        )
+        self.assertIsNotNone(reversed_issue)
+        self.assertEqual(
+            reversed_issue["cleanup_paths"],
+            issue["cleanup_paths"],
+        )
+
+    def test_external_compensation_accepts_an_ordinary_rectangle(self):
+        rectangle = [(0.0, 0.0), (100.0, 0.0), (100.0, 50.0), (0.0, 50.0)]
+        self.assertIsNone(external_compensation_detail_loss(rectangle, 4.0))
+
+    def test_external_compensation_accepts_a_slot_wider_than_the_tool(self):
+        wide_slot = [
+            (0.0, 0.0),
+            (100.0, 0.0),
+            (100.0, 100.0),
+            (56.0, 100.0),
+            (56.0, 60.0),
+            (50.0, 60.0),
+            (50.0, 100.0),
+            (0.0, 100.0),
+        ]
+        self.assertIsNone(external_compensation_detail_loss(wide_slot, 4.0))
 
     def test_drilling_ignores_hole_diameter_and_uses_center(self):
         holes = [
@@ -211,6 +350,93 @@ class OperationsTest(unittest.TestCase):
             [move["z"] for move in moves if move["type"] == "feed_drill"],
             [-3.0, -6.0],
         )
+
+    def test_counterbore_opens_flat_screw_head_seat_before_main_hole(self):
+        moves = build_drill_moves(
+            [{"x": 20.0, "y": 30.0, "diameter_mm": 5.0, "depth_mm": 12.0}],
+            final_depth=15.5,
+            stepdown=3.0,
+            safe_height=8.0,
+            tool_diameter=4.0,
+            material_thickness=15.0,
+            use_helical=True,
+            counterbore_enabled=True,
+            counterbore_diameter=10.0,
+            counterbore_depth=3.0,
+            tool_type="end_mill",
+        )
+
+        seat_moves = [move for move in moves if move.get("counterbore")]
+        self.assertTrue(any(move["type"] == "feed_helix" for move in seat_moves))
+        seat_cutting = [
+            move
+            for move in seat_moves
+            if move["type"] in {"feed_helix", "feed_cut"}
+        ]
+        self.assertAlmostEqual(min(move["z"] for move in seat_cutting), -3.0)
+        self.assertAlmostEqual(
+            max(
+                math.hypot(move["x"] - 20.0, move["y"] - 30.0)
+                for move in seat_cutting
+            ),
+            3.0,
+        )
+        main_cutting = [
+            move
+            for move in moves
+            if not move.get("counterbore")
+            and move["type"] in {"feed_drill", "feed_helix", "feed_cut"}
+        ]
+        self.assertAlmostEqual(min(move["z"] for move in main_cutting), -12.0)
+        self.assertLess(
+            max(index for index, move in enumerate(moves) if move.get("counterbore")),
+            min(
+                index
+                for index, move in enumerate(moves)
+                if not move.get("counterbore")
+                and move["type"] in {"feed_drill", "feed_helix", "feed_cut"}
+            ),
+        )
+
+    def test_counterbore_depth_is_relative_to_initial_z(self):
+        moves = build_drill_moves(
+            [{"x": 0.0, "y": 0.0, "diameter_mm": 5.0, "depth_mm": 10.0}],
+            final_depth=15.5,
+            stepdown=3.0,
+            safe_height=8.0,
+            tool_diameter=4.0,
+            start_depth=2.0,
+            counterbore_enabled=True,
+            counterbore_diameter=10.0,
+            counterbore_depth=3.0,
+        )
+        seat_cutting = [
+            move
+            for move in moves
+            if move.get("counterbore")
+            and move["type"] in {"feed_plunge", "feed_helix", "feed_cut"}
+        ]
+        self.assertEqual(min(move["z"] for move in seat_cutting), -5.0)
+
+    def test_counterbore_rejects_non_flat_tool_and_invalid_diameter(self):
+        hole = [{"x": 0.0, "y": 0.0, "diameter_mm": 5.0, "depth_mm": 10.0}]
+        common = dict(
+            final_depth=15.5,
+            stepdown=3.0,
+            safe_height=8.0,
+            tool_diameter=6.0,
+            counterbore_enabled=True,
+            counterbore_depth=3.0,
+        )
+        with self.assertRaisesRegex(ValueError, "menor que a fresa"):
+            build_drill_moves(hole, counterbore_diameter=4.0, **common)
+        with self.assertRaisesRegex(ValueError, "fresa de topo"):
+            build_drill_moves(
+                hole,
+                counterbore_diameter=10.0,
+                tool_type="drill",
+                **common,
+            )
 
     def test_non_peck_drilling_descends_directly_to_final_depth(self):
         holes = [{"x": 20.0, "y": 30.0, "diameter_mm": 3.0, "depth_mm": 10.0}]
@@ -607,6 +833,368 @@ class OperationsTest(unittest.TestCase):
         self.assertTrue(any(move["type"] == "feed_ramp" for move in moves))
         self.assertEqual(moves[-1], {"type": "rapid", "x": None, "y": None, "z": 8.0})
 
+    def test_common_line_cut_keeps_polyline_open(self):
+        polyline = [(0.0, 0.0), (20.0, 0.0), (20.0, 10.0)]
+        moves = build_common_line_cut_job(
+            [polyline],
+            final_depth=3.0,
+            stepdown=3.0,
+            ramp_length=0.0,
+            safe_height=8.0,
+        )
+
+        cut_points = [
+            (move["x"], move["y"])
+            for move in moves
+            if move["type"] == "feed_cut"
+        ]
+        self.assertEqual(cut_points, [(20.0, 0.0), (20.0, 10.0)])
+        self.assertFalse(any(move.get("tab") for move in moves))
+        self.assertTrue(
+            all(move.get("common_line") for move in moves if move["type"].startswith("feed_"))
+        )
+
+    def test_common_line_cut_uses_all_depths_without_retracting_between_passes(self):
+        moves = build_common_line_cut_job(
+            [(0.0, 0.0), (30.0, 0.0)],
+            final_depth=7.0,
+            stepdown=3.0,
+            ramp_length=0.0,
+            safe_height=8.0,
+            material_thickness=6.0,
+        )
+
+        plunges = [move["z"] for move in moves if move["type"] == "feed_plunge"]
+        self.assertEqual(plunges, [-0.0, -3.0, -7.0])
+        rapid_indexes = [index for index, move in enumerate(moves) if move["type"] == "rapid"]
+        self.assertEqual(rapid_indexes, [0, len(moves) - 1])
+        self.assertEqual(
+            [(move["x"], move["y"], move["z"]) for move in moves if move["type"] == "feed_cut"],
+            [(30.0, 0.0, -3.0), (0.0, 0.0, -7.0)],
+        )
+
+    def test_common_line_ramp_follows_vertices_and_cleans_same_open_path(self):
+        polyline = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (20.0, 10.0)]
+        moves = build_common_line_cut_job(
+            [polyline],
+            final_depth=3.0,
+            stepdown=3.0,
+            ramp_length=15.0,
+            safe_height=8.0,
+        )
+
+        ramp_points = [
+            (round(move["x"], 6), round(move["y"], 6), move["z"])
+            for move in moves
+            if move["type"] == "feed_ramp"
+        ]
+        self.assertEqual(ramp_points, [(10.0, 0.0, -2.0), (10.0, 5.0, -3.0)])
+        cut_points = [
+            (move["x"], move["y"])
+            for move in moves
+            if move["type"] == "feed_cut"
+        ]
+        self.assertEqual(
+            cut_points,
+            [
+                (10.0, 10.0),
+                (20.0, 10.0),
+                (10.0, 10.0),
+                (10.0, 0.0),
+                (0.0, 0.0),
+            ],
+        )
+        paired = list(zip(cut_points, cut_points[1:]))
+        self.assertNotIn(((20.0, 10.0), (0.0, 0.0)), paired)
+
+    def test_common_line_job_orders_and_reverses_by_nearest_endpoint(self):
+        moves = build_common_line_cut_job(
+            [
+                [(0.0, 0.0), (10.0, 0.0)],
+                [(80.0, 0.0), (90.0, 0.0)],
+            ],
+            final_depth=3.0,
+            stepdown=3.0,
+            ramp_length=0.0,
+            safe_height=8.0,
+            start_xy=(100.0, 0.0),
+            return_to_start=True,
+        )
+
+        positioned_rapids = [
+            (move["x"], move["y"])
+            for move in moves
+            if move["type"] == "rapid" and move["x"] is not None
+        ]
+        self.assertEqual(positioned_rapids, [(90.0, 0.0), (10.0, 0.0), (100.0, 0.0)])
+
+    def test_common_line_shared_priority_precedes_nearer_release_perimeter(self):
+        moves = build_common_line_cut_job(
+            [
+                {
+                    "points": [(0.0, 0.0), (10.0, 0.0)],
+                    "edge_tabs": (True,),
+                    "priority": 1,
+                },
+                {
+                    "points": [(80.0, 0.0), (90.0, 0.0)],
+                    "edge_tabs": (False,),
+                    "priority": 0,
+                },
+            ],
+            final_depth=3.0,
+            stepdown=3.0,
+            ramp_length=0.0,
+            safe_height=8.0,
+            start_xy=(0.0, 0.0),
+            tab_thickness=1.0,
+        )
+        positioned_rapids = [
+            (move["x"], move["y"])
+            for move in moves
+            if move["type"] == "rapid" and move.get("x") is not None
+        ]
+        self.assertEqual(positioned_rapids[0], (80.0, 0.0))
+
+    def test_common_line_cut_honors_start_depth_and_custom_passes(self):
+        moves = build_common_line_cut_job(
+            [[(0.0, 0.0), (20.0, 0.0)]],
+            final_depth=8.0,
+            stepdown=4.0,
+            ramp_length=0.0,
+            safe_height=8.0,
+            start_depth=2.0,
+            pass_depths=[1.0, 5.0],
+        )
+
+        self.assertEqual(
+            [move["z"] for move in moves if move["type"] == "feed_plunge"],
+            [-2.0, -3.0, -8.0],
+        )
+
+    def test_common_line_cut_rejects_closed_or_degenerate_input(self):
+        with self.assertRaisesRegex(ValueError, "permanecer aberta"):
+            build_common_line_cut_job(
+                [[(0.0, 0.0), (10.0, 0.0), (0.0, 0.0)]],
+                3.0,
+                3.0,
+                0.0,
+                8.0,
+            )
+        with self.assertRaisesRegex(ValueError, "pelo menos 2 pontos"):
+            build_common_line_cut_job(
+                [[(0.0, 0.0), (0.0, 0.0)]],
+                3.0,
+                3.0,
+                0.0,
+                8.0,
+            )
+        with self.assertRaisesRegex(ValueError, "passo de profundidade"):
+            build_common_line_cut_job(
+                [[(0.0, 0.0), (10.0, 0.0)]],
+                3.0,
+                0.0,
+                0.0,
+                8.0,
+            )
+
+    def test_common_line_tab_interval_is_never_cut_below_retained_height(self):
+        moves = build_common_line_cut_job(
+            [
+                {"points": [(0.0, 0.0), (12.0, 0.0)], "tab": True},
+                {"points": [(12.0, 0.0), (30.0, 0.0)], "tab": False},
+            ],
+            final_depth=15.0,
+            stepdown=5.0,
+            ramp_length=8.0,
+            safe_height=8.0,
+            tab_thickness=3.0,
+        )
+
+        tab_moves = [move for move in moves if move.get("tab")]
+        self.assertTrue(tab_moves)
+        self.assertEqual(
+            {round(move["z"], 6) for move in tab_moves},
+            {0.0, -5.0, -12.0},
+        )
+        self.assertFalse(
+            any(
+                move.get("tab") and move["z"] < -12.0 - 1e-9
+                for move in moves
+            )
+        )
+
+    def test_common_line_tab_edges_stay_in_one_continuous_cut_trail(self):
+        moves = build_common_line_cut_job(
+            [
+                {
+                    "points": [
+                        (0.0, 0.0),
+                        (10.0, 0.0),
+                        (20.0, 0.0),
+                        (30.0, 0.0),
+                    ],
+                    "edge_tabs": (False, True, False),
+                }
+            ],
+            final_depth=10.0,
+            stepdown=5.0,
+            ramp_length=0.0,
+            safe_height=8.0,
+            tab_thickness=2.0,
+        )
+
+        self.assertEqual(
+            sum(move["type"] == "rapid" and move.get("x") is not None for move in moves),
+            1,
+        )
+        self.assertEqual(
+            sum(move["type"] == "rapid" and move.get("x") is None for move in moves),
+            1,
+        )
+        self.assertTrue(any(move.get("tab") and move["z"] == -8.0 for move in moves))
+
+    def test_common_line_network_accepts_closed_owner_only_trail(self):
+        moves = build_common_line_cut_job(
+            [
+                {
+                    "points": [
+                        (0.0, 0.0),
+                        (20.0, 0.0),
+                        (20.0, 10.0),
+                        (0.0, 10.0),
+                        (0.0, 0.0),
+                    ],
+                    "edge_tabs": (False, True, False, False),
+                    "priority": 1,
+                },
+                {
+                    "points": [(30.0, 0.0), (30.0, 10.0)],
+                    "edge_tabs": (False,),
+                    "priority": 0,
+                },
+            ],
+            final_depth=6.0,
+            stepdown=3.0,
+            ramp_length=0.0,
+            safe_height=8.0,
+            tab_thickness=2.0,
+        )
+
+        positioned_rapids = [
+            (move["x"], move["y"])
+            for move in moves
+            if move["type"] == "rapid" and move.get("x") is not None
+        ]
+        self.assertEqual(positioned_rapids, [(30.0, 0.0), (0.0, 0.0)])
+        self.assertTrue(any(move.get("tab") and move["z"] == -4.0 for move in moves))
+        self.assertFalse(any(move.get("tab") and move["z"] < -8.0 for move in moves))
+
+    def test_best_fixation_adds_geometric_minimum_to_normal_contour(self):
+        rectangle = [(0.0, 0.0), (120.0, 0.0), (120.0, 60.0), (0.0, 60.0)]
+        moves = build_external_cut_moves(
+            rectangle,
+            final_depth=10.0,
+            stepdown=10.0,
+            ramp_length=0.0,
+            safe_height=8.0,
+            tabs_enabled=True,
+            tab_length=8.0,
+            tab_thickness=2.0,
+            tab_count=1,
+            tab_best_fixation=True,
+        )
+        tab_points = {
+            (round(move["x"], 6), round(move["y"], 6))
+            for move in moves
+            if move.get("tab") and move.get("x") is not None
+        }
+        self.assertGreaterEqual(len(tab_points), 3)
+
+    def test_best_fixation_limits_the_real_free_span_on_a_long_strip(self):
+        path = [
+            (0.0, 0.0),
+            (1000.0, 0.0),
+            (1000.0, 50.0),
+            (0.0, 50.0),
+            (0.0, 0.0),
+        ]
+        ranges = _best_fixation_tab_ranges(
+            path,
+            2100.0,
+            10.0,
+            4,
+            6.0,
+        )
+        centres = sorted((start + end) * 0.5 for start, end in ranges)
+        gaps = [
+            second - first for first, second in zip(centres, centres[1:])
+        ]
+        gaps.append(2100.0 - centres[-1] + centres[0])
+        self.assertGreaterEqual(len(ranges), 7)
+        self.assertLessEqual(max(gaps), 300.0)
+
+    def test_common_line_custom_depth_cannot_cut_a_tab_then_restore_it(self):
+        moves = build_common_line_cut_job(
+            [{"points": [(0.0, 0.0), (12.0, 0.0)], "tab": True}],
+            final_depth=15.0,
+            stepdown=15.0,
+            ramp_length=0.0,
+            safe_height=8.0,
+            tab_thickness=3.0,
+            pass_depths=[13.0, 2.0],
+        )
+
+        cutting_depths = [
+            move["z"]
+            for move in moves
+            if move.get("x") is not None and move["type"] != "rapid"
+        ]
+        self.assertGreaterEqual(min(cutting_depths), -12.0)
+        self.assertEqual(
+            [move["z"] for move in moves if move.get("tab")],
+            [-0.0, -0.0, -12.0, -12.0],
+        )
+
+    def test_common_line_3d_tab_ramps_up_and_back_without_later_recut(self):
+        moves = build_common_line_cut_job(
+            [{"points": [(0.0, 0.0), (10.0, 0.0)], "tab": True}],
+            final_depth=10.0,
+            stepdown=5.0,
+            ramp_length=5.0,
+            safe_height=8.0,
+            tab_thickness=2.0,
+            tabs_3d=True,
+        )
+
+        final_tab_moves = [move for move in moves if move.get("tab")]
+        self.assertEqual(
+            [(move["x"], move["z"]) for move in final_tab_moves],
+            [(5.0, -0.0), (10.0, -5.0), (5.0, -8.0), (0.0, -10.0)],
+        )
+        self.assertFalse(
+            any(
+                move.get("type") == "feed_cut"
+                and move.get("x") == 5.0
+                and move.get("z") < -8.0
+                for move in moves
+            )
+        )
+
+    def test_orthogonal_common_line_compensation_joins_grid_corners(self):
+        rectangle = [(0.0, 0.0), (80.0, 0.0), (80.0, 40.0), (0.0, 40.0)]
+        compensated = compensated_polygon(
+            rectangle,
+            6.0,
+            CUT_SIDE_OUTSIDE,
+            common_line_join=True,
+        )
+
+        self.assertEqual(len(compensated), 4)
+        self.assertEqual(
+            {(round(x, 6), round(y, 6)) for x, y in compensated},
+            {(-3.0, -3.0), (83.0, -3.0), (83.0, 43.0), (-3.0, 43.0)},
+        )
     def test_external_cut_does_not_retract_between_passes(self):
         rectangle = [(0.0, 0.0), (100.0, 0.0), (100.0, 50.0), (0.0, 50.0)]
         moves = build_external_cut_moves(rectangle, 6.0, 3.0, 30.0, 8.0, tool_diameter=6.0)
@@ -929,7 +1517,7 @@ class OperationsTest(unittest.TestCase):
         self.assertEqual(climb_cut_points[0], (100.0, 50.0))
         self.assertEqual(conventional_cut_points[0], (100.0, 0.0))
 
-    def test_automatic_tabs_leave_bridges_only_on_final_pass(self):
+    def test_automatic_tabs_retain_the_piece_from_the_first_pass(self):
         rectangle = [(0.0, 0.0), (100.0, 0.0), (100.0, 50.0), (0.0, 50.0)]
         moves = build_external_cut_moves(
             rectangle,
@@ -947,8 +1535,10 @@ class OperationsTest(unittest.TestCase):
 
         tab_moves = [move for move in moves if move.get("tab")]
         self.assertTrue(tab_moves)
-        self.assertTrue(all(move["z"] == -12.0 for move in tab_moves))
-        self.assertFalse(any(move.get("tab") and move["z"] == -7.0 for move in moves))
+        self.assertEqual(
+            {round(move["z"], 6) for move in tab_moves},
+            {0.0, -12.0},
+        )
         self.assertTrue(
             any(
                 move["type"] == "feed_cut"
@@ -957,6 +1547,131 @@ class OperationsTest(unittest.TestCase):
                 for move in moves
             )
         )
+
+    def test_tab_height_is_physical_material_left_from_the_top(self):
+        self.assertEqual(
+            tab_retained_cut_depth(15.0, 3.0, final_depth=15.5),
+            12.0,
+        )
+        self.assertEqual(
+            tab_retained_cut_depth(15.0, 3.0, final_depth=18.0),
+            12.0,
+        )
+        moves = build_common_line_cut_job(
+            [
+                {"points": [(0.0, 0.0), (12.0, 0.0)], "tab": True},
+                {"points": [(12.0, 0.0), (30.0, 0.0)], "tab": False},
+            ],
+            final_depth=15.5,
+            stepdown=5.0,
+            ramp_length=0.0,
+            safe_height=8.0,
+            material_thickness=15.0,
+            tab_thickness=15.0,
+            tabs_3d=True,
+        )
+        tab_moves = [move for move in moves if move.get("tab")]
+        self.assertTrue(tab_moves)
+        self.assertTrue(all(move["z"] == 0.2 for move in tab_moves))
+        self.assertFalse(any(move.get("tab") and move["z"] < 0.0 for move in moves))
+
+    def test_disabled_tabs_ignore_dormant_height_larger_than_material(self):
+        moves = build_external_cut_moves(
+            [(0.0, 0.0), (100.0, 0.0), (100.0, 50.0), (0.0, 50.0)],
+            final_depth=6.0,
+            stepdown=3.0,
+            ramp_length=0.0,
+            safe_height=8.0,
+            compensate_external=False,
+            smart_entry=False,
+            material_thickness=3.0,
+            tabs_enabled=False,
+            tab_thickness=15.0,
+        )
+
+        self.assertTrue(moves)
+        self.assertFalse(any(move.get("tab") for move in moves))
+        self.assertTrue(
+            any(
+                move.get("type") == "feed_cut" and move.get("z") == -6.0
+                for move in moves
+            )
+        )
+
+        common_moves = build_common_line_cut_job(
+            [
+                {
+                    "points": [(0.0, 0.0), (50.0, 0.0), (100.0, 0.0)],
+                    "edge_tabs": (False, False),
+                }
+            ],
+            final_depth=6.0,
+            stepdown=3.0,
+            ramp_length=0.0,
+            safe_height=8.0,
+            material_thickness=3.0,
+            tab_thickness=15.0,
+        )
+        self.assertTrue(common_moves)
+        self.assertFalse(any(move.get("tab") for move in common_moves))
+        self.assertTrue(
+            any(
+                move.get("type") == "feed_cut" and move.get("z") == -6.0
+                for move in common_moves
+            )
+        )
+
+    def test_initial_depth_does_not_lower_the_physical_tab(self):
+        self.assertEqual(
+            tab_retained_cut_depth(
+                15.0,
+                14.0,
+                final_depth=15.5,
+                start_depth=6.0,
+            ),
+            1.0,
+        )
+        moves = build_profile_cut_moves(
+            [(0.0, 0.0), (100.0, 0.0), (100.0, 50.0), (0.0, 50.0)],
+            final_depth=15.5,
+            stepdown=6.0,
+            ramp_length=0.0,
+            safe_height=8.0,
+            material_thickness=15.0,
+            start_depth=6.0,
+            tabs_enabled=True,
+            tab_length=10.0,
+            tab_thickness=14.0,
+            tab_count=4,
+        )
+        tab_depths = [move["z"] for move in moves if move.get("tab")]
+        self.assertTrue(tab_depths)
+        self.assertGreaterEqual(min(tab_depths), -1.0)
+
+    def test_high_tabs_use_lower_automatic_density(self):
+        path = [
+            (0.0, 0.0),
+            (1000.0, 0.0),
+            (1000.0, 50.0),
+            (0.0, 50.0),
+            (0.0, 0.0),
+        ]
+        ranges = _best_fixation_tab_ranges(
+            path,
+            2100.0,
+            10.0,
+            4,
+            6.0,
+            15.0,
+            14.0,
+        )
+        centres = sorted((start + end) * 0.5 for start, end in ranges)
+        gaps = [
+            second - first for first, second in zip(centres, centres[1:])
+        ]
+        gaps.append(2100.0 - centres[-1] + centres[0])
+        self.assertEqual(len(ranges), 5)
+        self.assertLessEqual(max(gaps), 500.0)
 
     def test_manual_tab_positions_override_automatic_distribution(self):
         ranges = _tab_ranges(
@@ -967,6 +1682,54 @@ class OperationsTest(unittest.TestCase):
         )
 
         self.assertEqual(ranges, [(144.0, 156.0)])
+
+    def test_manual_xy_tabs_belong_only_to_the_clicked_contour(self):
+        left = [(0.0, 0.0), (100.0, 0.0), (100.0, 60.0), (0.0, 60.0)]
+        right = [(300.0, 0.0), (400.0, 0.0), (400.0, 60.0), (300.0, 60.0)]
+        moves = build_external_cut_job(
+            (left, right),
+            final_depth=6.0,
+            stepdown=6.0,
+            ramp_length=0.0,
+            safe_height=8.0,
+            compensate_external=False,
+            smart_entry=False,
+            tabs_enabled=True,
+            tab_length=8.0,
+            tab_thickness=2.0,
+            tab_count=0,
+            tab_positions=(
+                {"x": 20.0, "y": 0.0},
+                {"x": 50.0, "y": 0.0},
+                {"x": 80.0, "y": 0.0},
+            ),
+        )
+
+        self.assertEqual(
+            {move["profile_id"] for move in moves if move.get("tab")},
+            {"profile-0001"},
+        )
+
+    def test_custom_depth_pass_never_descends_below_tab_height(self):
+        rectangle = [(0.0, 0.0), (100.0, 0.0), (100.0, 50.0), (0.0, 50.0)]
+        moves = build_external_cut_moves(
+            rectangle,
+            15.0,
+            15.0,
+            0.0,
+            8.0,
+            compensate_external=False,
+            smart_entry=False,
+            tabs_enabled=True,
+            tab_length=12.0,
+            tab_thickness=3.0,
+            tab_count=4,
+            pass_depths=[13.0, 2.0],
+        )
+
+        tab_moves = [move for move in moves if move.get("tab")]
+        self.assertTrue(tab_moves)
+        self.assertGreaterEqual(min(move["z"] for move in tab_moves), -12.0)
 
     def test_gcode_identifies_selected_3d_tool(self):
         lines = build_gcode(

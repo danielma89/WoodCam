@@ -190,34 +190,70 @@ def _ellipse_shape(entity: Any, FreeCAD: Any, Part: Any):
     return shape
 
 
-def build_derived_shape(vector_document: Any):
+def _entity_derived_shape(entity: Any, FreeCAD: Any, Part: Any):
+    class_name = type(entity).__name__.lower()
+    if "path" in class_name or hasattr(entity, "spans"):
+        return _path_shape(entity, FreeCAD, Part)
+    if "ellipse" in class_name or hasattr(entity, "radius_x"):
+        return _ellipse_shape(entity, FreeCAD, Part)
+    if "circle" in class_name or (
+        hasattr(entity, "center") and hasattr(entity, "radius")
+    ):
+        return _circle_shape(entity, FreeCAD, Part)
+    return None
+
+
+def build_derived_shape(vector_document: Any, entity_shape_cache: Optional[dict] = None):
     """Build a read-only OCC cache from domain entities."""
 
     FreeCAD, Part = _freecad_modules()
     entities = _attribute(vector_document, "entities_by_id", default={}) or {}
     shapes = []
+    updated_cache = {}
     for entity in entities.values() if hasattr(entities, "values") else entities:
-        class_name = type(entity).__name__.lower()
         try:
-            if "path" in class_name or hasattr(entity, "spans"):
-                shape = _path_shape(entity, FreeCAD, Part)
-            elif "ellipse" in class_name or hasattr(entity, "radius_x"):
-                shape = _ellipse_shape(entity, FreeCAD, Part)
-            elif "circle" in class_name or (
-                hasattr(entity, "center") and hasattr(entity, "radius")
-            ):
-                shape = _circle_shape(entity, FreeCAD, Part)
+            cached = (entity_shape_cache or {}).get(str(entity.id))
+            if cached is not None and cached[0] is entity:
+                shape = cached[1]
             else:
-                shape = None
+                shape = _entity_derived_shape(entity, FreeCAD, Part)
+            updated_cache[str(entity.id)] = (entity, shape)
             if shape is not None and not shape.isNull():
                 shapes.append(shape)
         except Exception:
             # A cache failure for one unsupported entity must not destroy the
             # authoritative JSON or prevent the other entities from showing.
+            updated_cache.pop(str(getattr(entity, "id", "")), None)
             continue
+    if entity_shape_cache is not None:
+        entity_shape_cache.clear()
+        entity_shape_cache.update(updated_cache)
     if not shapes:
         return Part.Shape()
     return Part.makeCompound(shapes)
+
+
+def _recompute_derived_feature(document: Any, feature: Any) -> None:
+    """Recompute only the derived vector feature when FreeCAD supports it.
+
+    ``Document.recompute()`` without an object list walks the complete FCStd.
+    In a parametric furniture document that made confirming one new 2D vector
+    wait for every spreadsheet, body and CAM dependency, even though only the
+    hidden WoodCAM projection changed.  GeometryJSON is already persisted in
+    the same transaction; limiting recompute to its derived feature keeps the
+    host model untouched and removes that unrelated multi-second pause.
+
+    Older FreeCAD builds and lightweight test doubles may expose only the
+    no-argument overload, so retain a narrow compatibility fallback.
+    """
+
+    recompute = getattr(document, "recompute", None)
+    if not callable(recompute):
+        return
+    try:
+        recompute([feature])
+    except TypeError:
+        recompute()
 
 
 class FreeCADDocumentStore(VectorDocumentStore):
@@ -228,9 +264,76 @@ class FreeCADDocumentStore(VectorDocumentStore):
         self.document = freecad_document or FreeCAD.ActiveDocument
         if self.document is None:
             raise DocumentStoreError("Abra ou crie um documento no FreeCAD.")
+        # Domain entities are immutable and commands replace only the changed
+        # instances.  Reuse OCC shapes for identical instances so applying one
+        # T-bone does not rebuild every contour in the nesting.
+        self._entity_shape_cache = {}
 
     def _feature(self):
         return self.document.getObject(VECTOR_DOCUMENT_FEATURE_NAME)
+
+    def _prime_entity_shape_cache(self, feature: Any, vector_document: Any) -> None:
+        """Reuse the validated host cache when it still matches every entity.
+
+        A strict count/bounds/edge/length match prevents a stale or externally
+        replaced Shape from becoming authoritative; on any mismatch the cache
+        stays empty and the next save rebuilds it from GeometryJSON normally.
+        """
+
+        self._entity_shape_cache.clear()
+        host_shape = getattr(feature, "Shape", None)
+        if host_shape is None or bool(getattr(host_shape, "isNull", lambda: True)()):
+            return
+        entities = tuple(
+            entity
+            for entity in vector_document.entities_by_id.values()
+            if type(entity).__name__ != "GroupEntity"
+        )
+        try:
+            child_shapes = tuple(host_shape.childShapes())
+        except Exception:
+            return
+        if len(child_shapes) != len(entities):
+            return
+
+        tolerance = 1.0e-6
+        primed = {}
+        unmatched_shapes = list(child_shapes)
+        for entity in entities:
+            try:
+                bounds = entity.bounds()
+                expected_edges = len(tuple(getattr(entity, "spans", ()) or ()))
+                if expected_edges <= 0:
+                    expected_edges = 1
+                spans = tuple(getattr(entity, "spans", ()) or ())
+                expected_length = (
+                    sum(float(span.length()) for span in spans) if spans else None
+                )
+
+                matching_index = None
+                for index, candidate in enumerate(unmatched_shapes):
+                    host_bounds = candidate.BoundBox
+                    if (
+                        abs(float(bounds.min_x) - float(host_bounds.XMin)) > tolerance
+                        or abs(float(bounds.min_y) - float(host_bounds.YMin)) > tolerance
+                        or abs(float(bounds.max_x) - float(host_bounds.XMax)) > tolerance
+                        or abs(float(bounds.max_y) - float(host_bounds.YMax)) > tolerance
+                        or len(tuple(candidate.Edges)) != expected_edges
+                    ):
+                        continue
+                    if expected_length is not None and abs(
+                        float(candidate.Length) - expected_length
+                    ) > max(tolerance, expected_length * 1.0e-8):
+                        continue
+                    matching_index = index
+                    break
+                if matching_index is None:
+                    return
+                shape = unmatched_shapes.pop(matching_index)
+            except Exception:
+                return
+            primed[str(entity.id)] = (entity, shape)
+        self._entity_shape_cache.update(primed)
 
     def exists(self) -> bool:
         feature = self._feature()
@@ -243,14 +346,14 @@ class FreeCADDocumentStore(VectorDocumentStore):
         feature = self._feature()
         if feature is None:
             feature = self.document.addObject("Part::FeaturePython", VECTOR_DOCUMENT_FEATURE_NAME)
-        feature.Label = "Documento vetorial (interno)"
-        self._ensure_group().addObject(feature)
-        view_object = getattr(feature, "ViewObject", None)
-        if view_object is not None and hasattr(view_object, "ShowInTree"):
-            try:
-                view_object.ShowInTree = False
-            except Exception:
-                pass
+            feature.Label = "Documento vetorial (interno)"
+            self._ensure_group().addObject(feature)
+            view_object = getattr(feature, "ViewObject", None)
+            if view_object is not None and hasattr(view_object, "ShowInTree"):
+                try:
+                    view_object.ShowInTree = False
+                except Exception:
+                    pass
         for property_type, property_name in PROPERTY_SPECS:
             if property_name not in list(getattr(feature, "PropertiesList", []) or []):
                 feature.addProperty(property_type, property_name, PROPERTY_GROUP)
@@ -306,6 +409,7 @@ class FreeCADDocumentStore(VectorDocumentStore):
                 "O documento vetorial salvo falhou na validação. O JSON original "
                 "foi preservado e não será sobrescrito."
             ) from error
+        self._prime_entity_shape_cache(feature, vector_document)
         return vector_document
 
     def save(
@@ -315,6 +419,7 @@ class FreeCADDocumentStore(VectorDocumentStore):
         transaction_label: str = "WoodCAM 2D — Salvar desenho",
         use_transaction: bool = True,
         source_metadata: Optional[dict] = None,
+        refresh_derived_shape: bool = True,
     ) -> StoredDocumentInfo:
         serialize, _deserialize, validate = _serialization_api()
         validate(vector_document)
@@ -331,6 +436,11 @@ class FreeCADDocumentStore(VectorDocumentStore):
 
         with self._transaction(transaction_label, use_transaction):
             feature = self._ensure_feature()
+            # A metadata-only first command may create the feature before any
+            # OCC cache exists. Later layer toggles preserve the existing cache.
+            refresh_shape = bool(refresh_derived_shape) or not str(
+                getattr(feature, "Checksum", "") or ""
+            ).strip()
             feature.SchemaVersion = schema_version
             feature.DocumentUUID = document_uuid
             feature.GeometryJSON = geometry_json
@@ -338,8 +448,11 @@ class FreeCADDocumentStore(VectorDocumentStore):
             feature.Checksum = checksum
             feature.LastMigration = str(getattr(serialized, "last_migration", "") or "")
             feature.SourceMetadataJSON = _canonical_json(metadata)
-            feature.Shape = build_derived_shape(vector_document)
-            self.document.recompute()
+            if refresh_shape:
+                feature.Shape = build_derived_shape(
+                    vector_document, self._entity_shape_cache
+                )
+                _recompute_derived_feature(self.document, feature)
 
         return StoredDocumentInfo(
             feature_name=feature.Name,
@@ -353,19 +466,35 @@ class FreeCADDocumentStore(VectorDocumentStore):
         feature = self._feature()
         if feature is None:
             raise DocumentStoreError("O documento vetorial ainda não foi persistido.")
-        feature.Shape = build_derived_shape(vector_document)
-        self.document.recompute()
+        feature.Shape = build_derived_shape(
+            vector_document, self._entity_shape_cache
+        )
+        _recompute_derived_feature(self.document, feature)
 
     def stored_info(self) -> Optional[StoredDocumentInfo]:
         feature = self._feature()
-        if feature is None or not str(getattr(feature, "GeometryJSON", "") or "").strip():
+        if feature is None:
             return None
+        # ``stored_info`` is polled by the UI only to notice FreeCAD
+        # Undo/Redo.  Reading ``GeometryJSON`` here materializes the complete
+        # vector document string every 350 ms; on a production nesting that
+        # needless copy competes directly with pan and drawing repaints.
+        # Modern stores always persist a checksum alongside the JSON, so use
+        # that constant-size marker.  Touch the large payload only as a
+        # compatibility fallback for an old/incomplete feature.
+        checksum = str(getattr(feature, "Checksum", "") or "").strip()
+        if not checksum:
+            geometry_json = str(
+                getattr(feature, "GeometryJSON", "") or ""
+            ).strip()
+            if not geometry_json:
+                return None
         return StoredDocumentInfo(
             feature_name=feature.Name,
             document_uuid=str(getattr(feature, "DocumentUUID", "") or ""),
             schema_version=int(getattr(feature, "SchemaVersion", 0) or 0),
             revision=int(getattr(feature, "Revision", 0) or 0),
-            checksum=str(getattr(feature, "Checksum", "") or ""),
+            checksum=checksum,
         )
 
 

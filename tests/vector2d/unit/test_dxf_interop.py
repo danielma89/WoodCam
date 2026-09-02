@@ -4,7 +4,12 @@ import tempfile
 import unittest
 
 from woodcam_editor.domain.document import Layer, VectorDocument
-from woodcam_editor.domain.entities import CircleEntity, EllipseEntity, PathEntity
+from woodcam_editor.domain.entities import (
+    CircleEntity,
+    EllipseEntity,
+    GroupEntity,
+    PathEntity,
+)
 from woodcam_editor.domain.primitives import Vec2
 from woodcam_editor.domain.spans import ArcSpan, CubicBezierSpan, LineSpan
 from woodcam_editor.domain.validation import redundant_open_overline_entity_ids
@@ -19,6 +24,56 @@ FIXTURE = os.path.abspath(
 
 
 class DxfInteropTests(unittest.TestCase):
+    def test_selected_compound_expands_all_children_once(self):
+        document = VectorDocument.create_default()
+        exterior_layer = Layer(
+            id="layer-exterior-hidden",
+            name="Corte externo",
+            color="#e11d48",
+            purpose="cut",
+            visible=False,
+            order=10,
+        )
+        pocket_layer = Layer(
+            id="layer-pocket",
+            name="Rebaixos importados",
+            color="#0f766e",
+            purpose="pocket",
+            order=11,
+        )
+        document.add_layers((exterior_layer, pocket_layer))
+        exterior = PathEntity.from_points(
+            exterior_layer.id,
+            (Vec2(0, 0), Vec2(100, 0), Vec2(100, 50), Vec2(0, 50)),
+            closed=True,
+        )
+        pocket = CircleEntity(pocket_layer.id, Vec2(20, 20), 5)
+        compound = GroupEntity(
+            layer_id=document.active_layer_id,
+            child_ids=(exterior.id, pocket.id),
+        )
+        document.add_entities((exterior, pocket, compound))
+
+        handle = tempfile.NamedTemporaryFile(suffix=".dxf", delete=False)
+        handle.close()
+        try:
+            export_dxf(
+                document,
+                handle.name,
+                entity_ids=(compound.id, pocket.id),
+                visible_only=False,
+            )
+            imported = import_dxf(handle.name, layer_id="temporary")
+        finally:
+            os.unlink(handle.name)
+
+        self.assertEqual(len(imported.entities), 2)
+        self.assertEqual(
+            sorted(type(entity).__name__ for entity in imported.entities),
+            ["CircleEntity", "PathEntity"],
+        )
+        self.assertEqual(set(imported.layers), {"Corte externo", "Rebaixos importados"})
+
     def test_panelnest_style_line_copies_are_detected_over_closed_polyline(self):
         document = VectorDocument.create_default()
         layer = document.active_layer_id

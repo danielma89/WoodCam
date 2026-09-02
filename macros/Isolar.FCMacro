@@ -1,0 +1,65 @@
+import FreeCAD as App
+import FreeCADGui as Gui
+
+def toggle_isolate():
+    doc = App.ActiveDocument
+    if not doc:
+        return
+
+    if not hasattr(App, "IsolateState"):
+        App.IsolateState = {}
+
+    doc_name = doc.Name
+
+    # --- MODO RESTAURAR ---
+    if doc_name in App.IsolateState and App.IsolateState[doc_name].get('isolated', False):
+        saved_states = App.IsolateState[doc_name].get('visibility_states', {})
+        for obj in doc.Objects:
+            if obj.Name in saved_states and obj.ViewObject:
+                obj.ViewObject.Visibility = saved_states[obj.Name]
+
+        App.IsolateState[doc_name]['isolated'] = False
+        App.Console.PrintMessage("Visibilidade original restaurada.\n")
+
+    # --- MODO ISOLAR ---
+    else:
+        selection = Gui.Selection.getSelection()
+        if not selection:
+            App.Console.PrintWarning("Nenhuma peça selecionada! (Dica: Use um atalho de teclado ou botão na barra para não perder a seleção).\n")
+            return
+
+        saved_states = {}
+        keep_visible = set(selection)
+
+        # Função inteligente: acha as "pastas" e "grupos" (pais) da peça selecionada
+        # para garantir que o FreeCAD não faça a peça sumir ao ocultar a pasta.
+        def add_parents(obj):
+            for parent in obj.InList:
+                # Se for Grupo, Part ou Body, mantemos visível
+                if parent.isDerivedFrom("App::DocumentObjectGroup") or \
+                   parent.isDerivedFrom("App::Part") or \
+                   parent.isDerivedFrom("PartDesign::Body"):
+                    keep_visible.add(parent)
+                    add_parents(parent)
+
+        # Rastreia a árvore da seleção atual
+        for sel in selection:
+            add_parents(sel)
+
+        # Salva o estado atual e aplica o isolamento
+        for obj in doc.Objects:
+            if obj.ViewObject:
+                saved_states[obj.Name] = obj.ViewObject.Visibility
+
+                if obj in keep_visible:
+                    obj.ViewObject.Visibility = True
+                else:
+                    obj.ViewObject.Visibility = False
+
+        App.IsolateState[doc_name] = {
+            'isolated': True,
+            'visibility_states': saved_states
+        }
+        App.Console.PrintMessage("Peça isolada com sucesso.\n")
+
+toggle_isolate()

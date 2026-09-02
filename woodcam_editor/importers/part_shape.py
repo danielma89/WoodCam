@@ -290,6 +290,133 @@ def _plane_projection(face: Any, normal: tuple[float, float, float]) -> _PlanePr
     return _PlaneProjection(origin, axis_x, axis_y)
 
 
+def _face_plane_level(face: Any, normal: tuple[float, float, float]) -> float:
+    """Signed position of a planar face along the manufacturing normal."""
+
+    try:
+        point = _point3(face.CenterOfMass)
+    except Exception:
+        vertices = list(getattr(face, "Vertexes", []) or [])
+        if not vertices:
+            raise ValueError("A face não possui posição mensurável.")
+        point = _point3(vertices[0].Point)
+    return _dot(point, normal)
+
+
+def _same_shape(first: Any, second: Any) -> bool:
+    try:
+        return bool(first.isSame(second))
+    except Exception:
+        return first is second
+
+
+def _pocket_floor_faces(
+    solid: Any,
+    reference_face: Any,
+    reference_normal: tuple[float, float, float],
+    tolerance: float = 1.0e-7,
+) -> tuple[tuple[Any, float, float, float], ...]:
+    """Find planar floors below a panel surface without altering the solid.
+
+    A through-cut has no parallel bottom face and therefore produces no
+    pocket.  A blind recess, including one open to the stock edge, exposes a
+    face with the same outward normal below the selected manufacturing plane.
+    """
+
+    try:
+        reference_level = _face_plane_level(reference_face, reference_normal)
+    except Exception:
+        return ()
+    result = []
+    for face in list(getattr(solid, "Faces", []) or []):
+        if _same_shape(face, reference_face) or not _is_planar_face(face):
+            continue
+        normal = _face_normal(face)
+        if normal is None or _dot(reference_normal, normal) < 1.0 - 1.0e-6:
+            continue
+        try:
+            bottom_level = _face_plane_level(face, reference_normal)
+            depth = reference_level - bottom_level
+            area = float(getattr(face, "Area", 0.0) or 0.0)
+        except Exception:
+            continue
+        if depth <= tolerance or area <= tolerance:
+            continue
+        result.append((face, depth, reference_level, bottom_level))
+    return tuple(
+        sorted(
+            result,
+            key=lambda value: (
+                round(float(value[1]), 9),
+                -round(float(getattr(value[0], "Area", 0.0) or 0.0), 9),
+            ),
+        )
+    )
+
+
+def _manufacturing_surface_face(
+    solid: Any,
+    reference_face: Any,
+    reference_normal: tuple[float, float, float],
+    tolerance: float = 1.0e-7,
+) -> Any:
+    """Build a temporary stock silhouette on the selected manufacturing plane.
+
+    The most detailed broad face is correct for finding machining features,
+    but its outer wire follows any recess that opens onto an edge. Used
+    directly as ``cut_external``, that makes a shallow groove look like stock
+    removed through the full thickness. The largest parallel planar face is
+    the intact stock side (or either equivalent side for a through-cut), so its
+    exact outer wire is the safe cutting silhouette. Pocket floors are still
+    imported separately as machining regions. All candidates are OCC copies;
+    the source solid and FCStd document remain untouched.
+    """
+
+    try:
+        reference_level = _face_plane_level(reference_face, reference_normal)
+    except Exception:
+        return reference_face
+    projected = []
+    for face in list(getattr(solid, "Faces", []) or []):
+        if not _is_planar_face(face):
+            continue
+        normal = _face_normal(face)
+        if normal is None or abs(_dot(reference_normal, normal)) < 1.0 - 1.0e-6:
+            continue
+        try:
+            if float(getattr(face, "Area", 0.0) or 0.0) <= tolerance:
+                continue
+            level = _face_plane_level(face, reference_normal)
+            copied = face.copy()
+            distance = reference_level - level
+            if abs(distance) > tolerance:
+                import FreeCAD  # type: ignore
+
+                copied.translate(
+                    FreeCAD.Vector(
+                        reference_normal[0] * distance,
+                        reference_normal[1] * distance,
+                        reference_normal[2] * distance,
+                    )
+                )
+            # On equal-area front/back faces prefer the side whose OCC
+            # orientation agrees with the selected manufacturing normal.
+            # Mixing opposite-oriented copies in a later dogbone fusion can
+            # leave a shell split into several coincident faces.
+            projected.append((copied, _dot(reference_normal, normal)))
+        except Exception:
+            continue
+    if not projected:
+        return reference_face
+    return max(
+        projected,
+        key=lambda value: (
+            float(getattr(value[0], "Area", 0.0) or 0.0),
+            float(value[1]),
+        ),
+    )[0]
+
+
 def _select_panel_face(solid: Any):
     """Choose the useful broad face of a panel, never one thickness side.
 
@@ -397,7 +524,11 @@ def _faces_have_positive_overlap(first: Any, second: Any, tolerance: float = 1.0
         return False
 
 
-def _fuse_overlapping_xy_faces(source_shapes: Iterable[tuple[Any, Optional[_PlaneProjection]]]):
+def _fuse_overlapping_xy_faces(
+    source_shapes: Iterable[
+        tuple[Any, Optional[_PlaneProjection], tuple[tuple[Any, float, float, float], ...]]
+    ]
+):
     """Fuse overlapping coplanar source faces into one import outline.
 
     A dogbone-style cutout is often authored as a square plus four circular
@@ -416,16 +547,16 @@ def _fuse_overlapping_xy_faces(source_shapes: Iterable[tuple[Any, Optional[_Plan
     # share the same physical plane *and* positive material area.
     candidates = tuple(source_shapes)
     groups = []
-    for face, projection in candidates:
+    for face, projection, pocket_faces in candidates:
         matching = [
             index
             for index, group in enumerate(groups)
             if any(_faces_have_positive_overlap(face, member[0]) for member in group)
         ]
         if not matching:
-            groups.append([(face, projection)])
+            groups.append([(face, projection, pocket_faces)])
             continue
-        combined = [(face, projection)]
+        combined = [(face, projection, pocket_faces)]
         for index in reversed(matching):
             combined.extend(groups.pop(index))
         groups.append(combined)
@@ -444,10 +575,26 @@ def _fuse_overlapping_xy_faces(source_shapes: Iterable[tuple[Any, Optional[_Plan
             ).removeSplitter()
             if bool(getattr(combined_shape, "isNull", lambda: True)()):
                 raise ValueError("união OCC retornou forma nula")
+            fused_faces = list(getattr(combined_shape, "Faces", []) or [])
+            if len(fused_faces) == 1:
+                # A generic one-face Shell has no ``OuterWire`` attribute.
+                # Unwrap it so the exact fused dogbone is classified as the
+                # component's external contour rather than an internal cut.
+                combined_shape = fused_faces[0]
             # Each temporary fusion remains in the plane established by the
             # first face.  Reusing that projection avoids a per-solid local
             # origin/axis from separating members that are now one profile.
-            fused.append((combined_shape, group[0][1]))
+            fused.append(
+                (
+                    combined_shape,
+                    group[0][1],
+                    tuple(
+                        pocket
+                        for member in group
+                        for pocket in tuple(member[2] or ())
+                    ),
+                )
+            )
         except Exception:
             # A failed boolean must not make an import lose geometry.
             fused.extend(group)
@@ -715,6 +862,12 @@ def _edge_to_span(
     curve_name = _curve_name(curve)
 
     if "line" in curve_name:
+        # OCC can expose a degenerate seam/vertex as a linear edge.  It may
+        # already be zero length in 3D or collapse only after projection to
+        # the panel plane.  Such an edge carries no machinable geometry and
+        # must become an import issue, not abort the complete board snapshot.
+        if start.almost_equals(end, 1.0e-9):
+            return None, "Aresta linear degenerada (comprimento zero) ignorada."
         return _line_span(api, start, end), None
 
     if "circle" in curve_name:
@@ -903,7 +1056,21 @@ def _collect_tree_shape_sources(sources: Iterable[Any]) -> tuple[_ShapeSource, .
 
 
 def _stage_tree_imports(results: Iterable[ImportResult]) -> tuple[Any, ...]:
-    """Park independent flattened boards in a compact, non-nesting grid."""
+    """Park independent physical boards in a compact, non-nesting grid.
+
+    One Assembly tree leaf is not necessarily one board.  Parametric furniture
+    generators commonly expose a single ``PartDesign::Feature`` whose Shape is
+    a compound containing several solids.  Those solids may even have the same
+    XY footprint at different Z heights.  ``import_part_shape`` stamps every
+    post-fusion face component and ``_mark_tree_result_instance`` turns that
+    component into a physical-instance scope.  Stage each scope independently
+    so containment never mistakes an upper board for a hole in a lower one.
+
+    GroupEntity remains a logical selection wrapper around already transformed
+    children; applying the translation to the group as well would move the
+    geometry twice.  This routine therefore transforms leaves only, just like
+    the previous one-result-per-board implementation.
+    """
 
     from woodcam_editor.domain.entities import GroupEntity
     from woodcam_editor.domain.primitives import Affine2D, Vec2
@@ -911,20 +1078,32 @@ def _stage_tree_imports(results: Iterable[ImportResult]) -> tuple[Any, ...]:
     blocks = []
     total_area = 0.0
     widest = 25.0
-    for result in results:
-        entities = tuple(result.entities)
-        leaves = tuple(entity for entity in entities if not isinstance(entity, GroupEntity))
-        if not leaves:
-            continue
-        min_x = min(entity.bounds().min_x for entity in leaves)
-        min_y = min(entity.bounds().min_y for entity in leaves)
-        max_x = max(entity.bounds().max_x for entity in leaves)
-        max_y = max(entity.bounds().max_y for entity in leaves)
-        width = max(0.0, max_x - min_x)
-        height = max(0.0, max_y - min_y)
-        blocks.append((entities, min_x, min_y, width, height))
-        total_area += (width + 25.0) * (height + 25.0)
-        widest = max(widest, width + 25.0)
+    for result_index, result in enumerate(results):
+        # Dict insertion order preserves the OCC/component order and keeps the
+        # staging deterministic across save/reopen and repeated imports.
+        scoped_entities = {}
+        for entity in tuple(result.entities):
+            metadata = dict(getattr(entity, "metadata", {}) or {})
+            instance_id = str(metadata.get("source_tree_instance_id", "") or "")
+            scope = instance_id or "result:%06d" % int(result_index)
+            scoped_entities.setdefault(scope, []).append(entity)
+
+        for entities_value in scoped_entities.values():
+            entities = tuple(entities_value)
+            leaves = tuple(
+                entity for entity in entities if not isinstance(entity, GroupEntity)
+            )
+            if not leaves:
+                continue
+            min_x = min(entity.bounds().min_x for entity in leaves)
+            min_y = min(entity.bounds().min_y for entity in leaves)
+            max_x = max(entity.bounds().max_x for entity in leaves)
+            max_y = max(entity.bounds().max_y for entity in leaves)
+            width = max(0.0, max_x - min_x)
+            height = max(0.0, max_y - min_y)
+            blocks.append((entities, min_x, min_y, width, height))
+            total_area += (width + 25.0) * (height + 25.0)
+            widest = max(widest, width + 25.0)
     if not blocks:
         return ()
 
@@ -955,10 +1134,16 @@ def _mark_tree_result_instance(
 ) -> ImportResult:
     """Attach a stable physical-board scope to one imported tree leaf."""
 
-    instance_id = "%03d:%s" % (int(index), source.name)
+    base_instance_id = "%03d:%s" % (int(index), source.name)
     entities = []
     for entity in result.entities:
         metadata = dict(getattr(entity, "metadata", {}) or {})
+        component_id = str(metadata.get("source_shape_component_id", "") or "")
+        instance_id = (
+            base_instance_id + ":" + component_id
+            if component_id
+            else base_instance_id
+        )
         metadata.update(
             {
                 "source_tree_instance_id": instance_id,
@@ -1019,6 +1204,8 @@ def import_part_shape(
     placement: Any = None,
     flatten_solids: bool = False,
     compound_groups: bool = False,
+    _projection: Optional[_PlaneProjection] = None,
+    _stage_projection: bool = True,
 ) -> ImportResult:
     """Copy an OCC Shape without modifying/hiding the source object.
 
@@ -1033,6 +1220,15 @@ def import_part_shape(
     (the same semantic role as ``Part.makeCompound(face.Wires)`` in the
     Assembly→DXF macro).  It is opt-in because low-level boolean callers
     already create their own compound group.
+
+    ``_projection`` and ``_stage_projection`` are internal continuations of
+    the manufacturing plane.
+    A blind-pocket floor belongs to the same upright board as its broad face;
+    importing that floor in global XY collapses it into a line and moves
+    circular recesses away from the panel.  Staging the recursively projected
+    floor on its own also destroys its position relative to the stock.  Pocket
+    extraction therefore passes the immutable projection through and defers
+    staging until the complete board is assembled.
     """
 
     api = _domain_api()
@@ -1046,7 +1242,7 @@ def import_part_shape(
     # issue instead of guessing a cabinet face.  The explicit experimental
     # ``flatten_solids`` path remains available to a caller that truly has no
     # PanelNest layout to use.
-    source_shapes = [(shape, None)]
+    source_shapes = [(shape, _projection, ())]
     source_issues = []
     solids = list(getattr(shape, "Solids", []) or [])
     if solids:
@@ -1069,7 +1265,13 @@ def import_part_shape(
                     )
                     continue
                 projection = _plane_projection(face, normal)
-            solid_faces.append((face, projection))
+            solid_faces.append(
+                (
+                    _manufacturing_surface_face(solid, face, normal),
+                    projection,
+                    _pocket_floor_faces(solid, face, normal),
+                )
+            )
         if solid_faces:
             source_shapes = _fuse_overlapping_xy_faces(solid_faces)
         else:
@@ -1082,7 +1284,16 @@ def import_part_shape(
     # compound only after those transforms, keeping it in VectorDocument
     # instead of storing geometric state in the scene.
     compound_child_groups = []
-    for source_shape, projection in source_shapes:
+    for component_index, (
+        source_shape,
+        projection,
+        pocket_faces,
+    ) in enumerate(source_shapes, start=1):
+        # This identity is assigned *after* the conservative coplanar overlap
+        # fusion.  A square plus partially overlapping circular pads (dogbone)
+        # is therefore one component, while coincident boards in different Z
+        # planes remain separate physical pieces.
+        component_id = "component-%03d" % int(component_index)
         outer_wire = getattr(source_shape, "OuterWire", None)
 
         def wire_is_outer(candidate):
@@ -1151,7 +1362,10 @@ def import_part_shape(
                         role = "drill" if float(radius) * 2.0 <= 12.0 + 1e-9 else "cut_internal"
                     except (TypeError, ValueError):
                         role = "drill"
-            role_metadata = {"import_role": role}
+            role_metadata = {
+                "import_role": role,
+                "source_shape_component_id": component_id,
+            }
             if len(wire_edges) == 1 and bool(getattr(wire_edges[0], "isClosed", lambda: False)()):
                 entity, message = _full_curve_entity(
                     wire_edges[0],
@@ -1192,18 +1406,149 @@ def import_part_shape(
                         metadata=role_metadata,
                     )
                 )
+
+        # A blind recess is represented by its planar bottom face, not by the
+        # stock outline.  Import that face through the same exact OCC converter
+        # and mark the resulting vectors as machining regions.  Closed pockets
+        # often repeat the same XY boundary as an inner wire on the top face;
+        # keep only the semantic pocket copy so diagnostics never see a false
+        # duplicate.  An edge-open recess has no such top inner wire and is the
+        # case that motivated this extraction.
+        if pocket_faces:
+            from woodcam_editor.domain.validation import _geometry_signature
+
+            for pocket_index, (
+                pocket_face,
+                pocket_depth,
+                reference_level,
+                bottom_level,
+            ) in enumerate(pocket_faces, start=1):
+                pocket_result = import_part_shape(
+                    pocket_face,
+                    layer_id=layer_id,
+                    placement=placement,
+                    flatten_solids=False,
+                    compound_groups=False,
+                    _projection=projection,
+                    _stage_projection=False,
+                )
+                pocket_leaves = tuple(
+                    entity
+                    for entity in pocket_result.entities
+                    if type(entity).__name__ != "GroupEntity"
+                )
+                outer_candidates = tuple(
+                    entity
+                    for entity in pocket_leaves
+                    if str(
+                        (getattr(entity, "metadata", {}) or {}).get(
+                            "import_role", ""
+                        )
+                        or ""
+                    )
+                    == "cut_external"
+                )
+                if not outer_candidates:
+                    issues.append(
+                        ImportIssue(
+                            pocket_index - 1,
+                            "PocketFace",
+                            "O fundo de um rebaixo foi detectado, mas não formou uma região fechada.",
+                        )
+                    )
+                    continue
+                region = max(
+                    outer_candidates,
+                    key=lambda entity: abs(
+                        float(getattr(entity, "signed_area", lambda *_: 0.0)(0.05))
+                    )
+                    if hasattr(entity, "signed_area")
+                    else float(entity.bounds().width * entity.bounds().height),
+                )
+                region_signature = _geometry_signature(region, 1.0e-6, 0.01)
+                matching_indices = [
+                    index
+                    for index, entity in enumerate(source_entities)
+                    if str(
+                        (getattr(entity, "metadata", {}) or {}).get(
+                            "import_role", ""
+                        )
+                        or ""
+                    )
+                    in {"cut_internal", "drill"}
+                    and _geometry_signature(entity, 1.0e-6, 0.01)
+                    == region_signature
+                ]
+                is_small_blind_drill = bool(
+                    type(region).__name__ == "CircleEntity"
+                    and float(getattr(region, "radius", 0.0) or 0.0) * 2.0
+                    <= 12.0 + 1.0e-9
+                )
+                common_metadata = {
+                    "source_shape_component_id": component_id,
+                    "source_pocket_index": int(pocket_index),
+                    "pocket_depth_mm": float(pocket_depth),
+                    "source_reference_level_mm": float(reference_level),
+                    "source_bottom_level_mm": float(bottom_level),
+                }
+                if is_small_blind_drill:
+                    if matching_indices:
+                        match_index = matching_indices[0]
+                        existing = source_entities[match_index]
+                        metadata = dict(getattr(existing, "metadata", {}) or {})
+                        metadata.update(common_metadata)
+                        metadata["source_depth_mm"] = float(pocket_depth)
+                        source_entities[match_index] = replace(
+                            existing,
+                            metadata=metadata,
+                        )
+                    else:
+                        metadata = dict(getattr(region, "metadata", {}) or {})
+                        metadata.update(common_metadata)
+                        metadata.update(
+                            {
+                                "import_role": "drill",
+                                "source_depth_mm": float(pocket_depth),
+                            }
+                        )
+                        source_entities.append(replace(region, metadata=metadata))
+                    continue
+
+                for index in reversed(matching_indices):
+                    source_entities.pop(index)
+                region_metadata = dict(getattr(region, "metadata", {}) or {})
+                region_metadata.update(common_metadata)
+                region_metadata["import_role"] = "pocket_region"
+                region = replace(region, metadata=region_metadata)
+                source_entities.append(region)
+                for island in pocket_leaves:
+                    if island.id == region.id:
+                        continue
+                    island_metadata = dict(getattr(island, "metadata", {}) or {})
+                    island_metadata.update(common_metadata)
+                    island_metadata.update(
+                        {
+                            "import_role": "pocket_island",
+                            "pocket_region_id": str(region.id),
+                        }
+                    )
+                    source_entities.append(
+                        replace(island, metadata=island_metadata)
+                    )
         if projection is None:
             entities.extend(source_entities)
             if compound_groups and len(source_entities) > 1:
                 compound_child_groups.append(
-                    tuple(str(entity.id) for entity in source_entities)
+                    (component_id, tuple(str(entity.id) for entity in source_entities))
                 )
-        elif source_entities:
+        elif source_entities and _stage_projection:
             flattened_groups.append(source_entities)
             if compound_groups and len(source_entities) > 1:
                 compound_child_groups.append(
-                    tuple(str(entity.id) for entity in source_entities)
+                    (component_id, tuple(str(entity.id) for entity in source_entities))
                 )
+        elif source_entities:
+            entities.extend(source_entities)
 
     # A local plane has no useful shared XY position with the assembly.  Put
     # every flattened solid in a compact staging grid so that piece recognition
@@ -1260,15 +1605,17 @@ def import_part_shape(
                 metadata={
                     "name": "Peça importada",
                     "source_kind": "part_face_compound",
+                    "source_shape_component_id": component_id,
                 },
             )
-            for child_ids in compound_child_groups
+            for component_id, child_ids in compound_child_groups
         )
 
     metadata = {
         "source_kind": "part_shape",
         "source_name": str(getattr(source, "Name", "") or ""),
         "source_label": str(getattr(source, "Label", "") or ""),
+        "source_shape_component_count": len(source_shapes),
     }
     source_layer_key = metadata["source_name"] or "part_shape:default"
     source_layer_name = metadata["source_label"] or metadata["source_name"] or "Forma importada"
@@ -1290,6 +1637,18 @@ def import_part_shape(
             name="Furos",
             color="#2563eb",
             purpose="drill",
+        ),
+        "pocket_region": ImportLayerDescriptor(
+            source_key=source_layer_key + ":pocket_region",
+            name="Rebaixos importados",
+            color="#0f766e",
+            purpose="pocket",
+        ),
+        "pocket_island": ImportLayerDescriptor(
+            source_key=source_layer_key + ":pocket_island",
+            name="Ilhas de rebaixo",
+            color="#0d9488",
+            purpose="pocket",
         ),
     }
     marked_entities = []

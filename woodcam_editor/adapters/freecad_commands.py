@@ -76,10 +76,19 @@ class FreeCADCommandSession:
             opened = True
             change_set = command.apply(self.vector_document)
             command_applied = True
+            geometry_changed = any(
+                bool(getattr(change_set, name, ()))
+                for name in ("added", "changed", "removed")
+            )
             self.store.save(
                 self.vector_document,
                 transaction_label=str(getattr(command, "label", "WoodCAM 2D — Editar vetores")),
                 use_transaction=False,
+                # Layer, Piece2D, work-area and document-metadata commands do
+                # not alter the OCC projection. Rebuilding the 2,000+ edge
+                # compound and recomputing the whole FCStd for a visibility
+                # checkbox made a visual toggle take tens of seconds.
+                refresh_derived_shape=bool(geometry_changed),
             )
             self.document.commitTransaction()
             opened = False

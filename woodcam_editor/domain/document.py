@@ -16,6 +16,52 @@ UNITS = "mm"
 COORDINATE_SYSTEM = "xy_cartesian_y_up"
 LAYER_PURPOSES = frozenset(("design", "construction", "reference", "cut", "pocket", "drill"))
 NON_CAM_LAYER_PURPOSES = frozenset(("construction", "reference"))
+POCKET_REGION_ROLES = frozenset(("pocket_region", "pocket_island"))
+REMNANT_CUT_ROLE = "remnant_cut"
+
+
+def entity_manufacturing_role(entity: Any) -> str:
+    """Return an entity's explicit manufacturing meaning, when present."""
+
+    return str(
+        (getattr(entity, "metadata", {}) or {}).get("import_role", "") or ""
+    ).strip().lower()
+
+
+def entity_is_pocket_feature(entity: Any) -> bool:
+    """Pocket boundaries are machining regions, not through-cut contours."""
+
+    return entity_manufacturing_role(entity) in POCKET_REGION_ROLES
+
+
+def entity_is_pocket_region(entity: Any) -> bool:
+    return entity_manufacturing_role(entity) == "pocket_region"
+
+
+def entity_is_remnant_cut(entity: Any) -> bool:
+    """Return whether an open path is an explicit stock-separation cut."""
+
+    metadata = dict(getattr(entity, "metadata", {}) or {})
+    role = str(
+        metadata.get("woodcam_role", "")
+        or metadata.get("import_role", "")
+        or ""
+    ).strip().lower()
+    return role == REMNANT_CUT_ROLE
+
+
+def pocket_feature_owner_key(entity: Any) -> Tuple[str, ...]:
+    """Stable source scope used to keep a pocket attached to its board."""
+
+    metadata = dict(getattr(entity, "metadata", {}) or {})
+    instance = str(
+        metadata.get("panelnest_instance_id", "")
+        or metadata.get("source_tree_instance_id", "")
+        or ""
+    )
+    component = str(metadata.get("source_shape_component_id", "") or "")
+    batch = str(metadata.get("import_batch_id", "") or "")
+    return tuple(value for value in (batch, instance, component) if value)
 
 
 def layer_is_cam_eligible(layer: Any) -> bool:
@@ -141,6 +187,29 @@ class Piece2D:
         if not self.rotations_allowed or not all(math.isfinite(value) for value in self.rotations_allowed):
             raise InvariantError("piece requires finite allowed rotations")
 
+    @property
+    def pocket_path_ids(self) -> Tuple[str, ...]:
+        """Machining-only pocket boundaries carried rigidly with this piece.
+
+        The optional relation lives in metadata to keep schema-v1 FCStd files
+        readable while shallow machining semantics are introduced.  Geometry
+        remains in normal VectorDocument entities and is never duplicated.
+        """
+
+        values = self.metadata.get("pocket_path_ids", ())
+        if not isinstance(values, (tuple, list)):
+            return ()
+        return tuple(str(value) for value in values if str(value))
+
+    @property
+    def marking_path_ids(self) -> Tuple[str, ...]:
+        """Open engraving/marking paths carried rigidly with this piece."""
+
+        values = self.metadata.get("marking_path_ids", ())
+        if not isinstance(values, (tuple, list)):
+            return ()
+        return tuple(str(value) for value in values if str(value))
+
 
 @dataclass
 class VectorDocument:
@@ -226,7 +295,12 @@ class VectorDocument:
         self.entities_by_id.update((entity.id, entity) for entity in entities)
         changed_ids = set(ids)
         for piece_id, piece in tuple(self.pieces_by_id.items()):
-            references = {piece.outer_path_id, *piece.inner_path_ids}
+            references = {
+                piece.outer_path_id,
+                *piece.inner_path_ids,
+                *piece.pocket_path_ids,
+                *piece.marking_path_ids,
+            }
             if changed_ids.intersection(references) and not piece.stale:
                 self.pieces_by_id[piece_id] = replace(piece, stale=True)
         if bump_revision and entities:
@@ -244,7 +318,30 @@ class VectorDocument:
             if piece.outer_path_id in removed_ids:
                 continue
             inner = tuple(path_id for path_id in piece.inner_path_ids if path_id not in removed_ids)
-            updated_pieces[piece_id] = replace(piece, inner_path_ids=inner, stale=True) if inner != piece.inner_path_ids else piece
+            pockets = tuple(
+                path_id for path_id in piece.pocket_path_ids
+                if path_id not in removed_ids
+            )
+            markings = tuple(
+                path_id for path_id in piece.marking_path_ids
+                if path_id not in removed_ids
+            )
+            if (
+                inner != piece.inner_path_ids
+                or pockets != piece.pocket_path_ids
+                or markings != piece.marking_path_ids
+            ):
+                metadata = dict(piece.metadata or {})
+                metadata["pocket_path_ids"] = list(pockets)
+                metadata["marking_path_ids"] = list(markings)
+                updated_pieces[piece_id] = replace(
+                    piece,
+                    inner_path_ids=inner,
+                    metadata=metadata,
+                    stale=True,
+                )
+            else:
+                updated_pieces[piece_id] = piece
         self.pieces_by_id = updated_pieces
         # Groups with deleted children become invalid and are therefore removed,
         # including parent groups affected by that first cascading removal.
@@ -266,7 +363,12 @@ class VectorDocument:
         if len(set(ids)) != len(ids) or any(piece_id in self.pieces_by_id for piece_id in ids):
             raise InvariantError("cannot add duplicate piece IDs")
         for piece in pieces:
-            references = {piece.outer_path_id, *piece.inner_path_ids}
+            references = {
+                piece.outer_path_id,
+                *piece.inner_path_ids,
+                *piece.pocket_path_ids,
+                *piece.marking_path_ids,
+            }
             missing = references - set(self.entities_by_id)
             if missing:
                 raise InvariantError("piece references missing entities: %s" % sorted(missing))
@@ -310,7 +412,12 @@ class VectorDocument:
                 if missing:
                     raise InvariantError("group %s references missing children" % entity.id)
         for piece in self.pieces_by_id.values():
-            missing = {piece.outer_path_id, *piece.inner_path_ids} - set(self.entities_by_id)
+            missing = {
+                piece.outer_path_id,
+                *piece.inner_path_ids,
+                *piece.pocket_path_ids,
+                *piece.marking_path_ids,
+            } - set(self.entities_by_id)
             if missing:
                 raise InvariantError("piece %s references missing paths" % piece.id)
         span_ids = []

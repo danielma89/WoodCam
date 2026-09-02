@@ -14,7 +14,14 @@ import itertools
 import math
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from .document import VectorDocument, WorkArea, entity_is_cam_eligible
+from .document import (
+    VectorDocument,
+    WorkArea,
+    entity_is_cam_eligible,
+    entity_is_pocket_feature,
+    entity_is_remnant_cut,
+    pocket_feature_owner_key,
+)
 from .entities import CircleEntity, EllipseEntity, GroupEntity, PathEntity
 from .primitives import DEFAULT_EPSILON, InvariantError, Vec2
 from .topology import build_containment_tree, build_topology, nearby_open_endpoint_pairs
@@ -541,6 +548,24 @@ def _is_intentional_relief_touch(
     return False
 
 
+def _pocket_feature_relationship(first, second) -> bool:
+    """Return whether two contours belong to one imported shallow feature.
+
+    A pocket open to the stock edge legitimately shares a segment with the
+    piece profile.  The explicit source component is required; unrelated
+    contours are never excused merely because one happens to be on a pocket
+    layer.
+    """
+
+    if first is None or second is None:
+        return False
+    if not (entity_is_pocket_feature(first) or entity_is_pocket_feature(second)):
+        return False
+    first_owner = pocket_feature_owner_key(first)
+    second_owner = pocket_feature_owner_key(second)
+    return bool(first_owner and second_owner and first_owner == second_owner)
+
+
 def validate_document(
     document: VectorDocument,
     *,
@@ -549,6 +574,7 @@ def validate_document(
     microspan_length: float = 0.01,
     deflection: float = 0.01,
     include_non_cam_layers: bool = False,
+    entity_ids: Optional[Iterable[str]] = None,
 ) -> ValidationReport:
     """Return a deterministic, read-only report for editor and CAM gating.
 
@@ -580,10 +606,17 @@ def validate_document(
         )
         return ValidationReport(tuple(issues), document.revision)
 
+    requested_scope = (
+        None
+        if entity_ids is None
+        else frozenset(str(entity_id) for entity_id in entity_ids)
+    )
     all_cam_entities = tuple(
         entity
         for entity in sorted(document.entities_by_id.values(), key=lambda item: item.id)
+        if requested_scope is None or entity.id in requested_scope
         if include_non_cam_layers or entity_is_cam_eligible(document, entity)
+        if not entity_is_remnant_cut(entity)
     )
     valid_work_areas = []
     if document.work_area is not None:
@@ -710,6 +743,10 @@ def validate_document(
                 continue
             original_id = same_scope_ids[0]
             for duplicate_id in same_scope_ids[1:]:
+                original = document.entities_by_id.get(original_id)
+                duplicate = document.entities_by_id.get(duplicate_id)
+                if _pocket_feature_relationship(original, duplicate):
+                    continue
                 issues.append(
                     _make_issue(
                         Severity.ERROR,
@@ -761,6 +798,12 @@ def validate_document(
             )
         return boundary_contact_cache[pair]
 
+    def pocket_feature_contact(first_id: str, second_id: str) -> bool:
+        return _pocket_feature_relationship(
+            document.entities_by_id.get(first_id),
+            document.entities_by_id.get(second_id),
+        )
+
     for node in topology.branch_nodes:
         branch_entity_ids = tuple(sorted({ref.entity_id for ref in node.references}))
         if (
@@ -772,6 +815,7 @@ def validate_document(
             continue
         if len(branch_entity_ids) > 1 and all(
             boundary_only_contact(first_id, second_id)
+            or pocket_feature_contact(first_id, second_id)
             for first_id, second_id in itertools.combinations(branch_entity_ids, 2)
         ):
             # These are independent closed pieces touching before organization,
@@ -820,6 +864,8 @@ def validate_document(
         if not intersections:
             continue
         pair = tuple(sorted((left.entity_id, right.entity_id)))
+        if pair[0] != pair[1] and pocket_feature_contact(pair[0], pair[1]):
+            continue
         intersections_by_pair.setdefault(pair, []).extend(item.point for item in intersections)
         spans_by_pair.setdefault(pair, set()).update((left.span_id, right.span_id))
     for pair in sorted(intersections_by_pair):

@@ -1,3 +1,6 @@
+import math
+
+
 DEFAULT_PRESETS = {
     "material_thickness": 15.0,
     "depth_extra": 0.5,
@@ -37,13 +40,30 @@ DEFAULT_PRESETS = {
     "operation_start_depth": 0.0,
     "operation_cut_depth": 15.5,
     "cut_allowance_offset": 0.0,
+    "common_line_tolerance": 0.02,
+    "cut_depth_strategy": "hybrid_piece_bidirectional",
+    "tab_release_mode": "keep_tabs",
+    "tab_release_supervision": "per_piece",
+    "tab_release_ramp_angle_degrees": 12.0,
+    "tab_release_minimum_depth_step": 0.5,
+    "spindle_spinup_seconds": 1.0,
+    "loose_waste_fixation": "disabled",
+    "screw_pilot_diameter": 0.0,
+    "screw_pilot_depth": 0.0,
+    "screw_head_diameter": 10.0,
+    "screw_safety_margin": 3.0,
+    "screw_head_height": 3.0,
     "cut_last_pass_allowance": 0.0,
     "tab_length": 12.0,
     "tab_thickness": 3.0,
+    "tab_surface_clearance": 0.2,
     "tab_count": 4,
+    "tab_best_fixation": True,
     "use_helical_drilling": True,
     "helix_pitch": 1.0,
     "helix_stepover_percent": 40.0,
+    "hole_counterbore_diameter": 10.0,
+    "hole_counterbore_depth": 3.0,
     "peck_step": 3.0,
     "peck_retract_clearance": 0.5,
     "dwell_seconds": 0.0,
@@ -199,3 +219,57 @@ MACHINE_LIMITS = {
     "z_min": -80.0,
     "z_max": 80.0,
 }
+
+
+def normalize_work_area_presets(values):
+    """Return safe, ordered work-area presets from persisted JSON data.
+
+    Presets are personal convenience data, not project geometry.  The helper
+    deliberately accepts both the current list format and an older/name-keyed
+    dictionary so a malformed preference can never prevent WoodCAM opening.
+    """
+
+    if isinstance(values, dict):
+        source = []
+        for name, item in values.items():
+            if not isinstance(item, dict):
+                continue
+            normalized_item = dict(item)
+            normalized_item["name"] = name
+            source.append(normalized_item)
+    elif isinstance(values, (tuple, list)):
+        source = values
+    else:
+        return []
+    result = []
+    seen = set()
+    for raw in source:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name", "")).strip()
+        key = name.casefold()
+        try:
+            width = float(raw.get("width", 0.0))
+            height = float(raw.get("height", 0.0))
+            depth = float(raw.get("depth", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if (
+            not name
+            or key in seen
+            or not all(math.isfinite(value) for value in (width, height, depth))
+            or width <= 0.0
+            or height <= 0.0
+            or depth < 0.0
+        ):
+            continue
+        seen.add(key)
+        result.append(
+            {
+                "name": name,
+                "width": width,
+                "height": height,
+                "depth": depth,
+            }
+        )
+    return result

@@ -118,6 +118,63 @@ def _segment_distance(a1, a2, b1, b2):
     )
 
 
+def _points_bounds(points):
+    return (
+        min(point[0] for point in points),
+        min(point[1] for point in points),
+        max(point[0] for point in points),
+        max(point[1] for point in points),
+    )
+
+
+def _bounds_distance(first, second):
+    dx = max(first[0] - second[2], second[0] - first[2], 0.0)
+    dy = max(first[1] - second[3], second[1] - first[3], 0.0)
+    return math.hypot(dx, dy)
+
+
+def _segment_bounds(segment):
+    return _points_bounds(segment)
+
+
+def _near_segment_pairs(first_bounds, second_bounds, maximum_distance):
+    """Broad phase for segment distance checks, in deterministic order."""
+
+    maximum_distance = max(0.0, float(maximum_distance))
+    events = []
+    for index, bounds in enumerate(first_bounds):
+        events.append((bounds[0] - maximum_distance, 0, 0, index))
+        events.append((bounds[2] + maximum_distance, 1, 0, index))
+    for index, bounds in enumerate(second_bounds):
+        events.append((bounds[0] - maximum_distance, 0, 1, index))
+        events.append((bounds[2] + maximum_distance, 1, 1, index))
+
+    active_first = set()
+    active_second = set()
+    candidates = set()
+    for _x, event_kind, collection, index in sorted(events):
+        if event_kind == 1:
+            (active_first if collection == 0 else active_second).discard(index)
+            continue
+        if collection == 0:
+            for other_index in active_second:
+                if (
+                    _bounds_distance(first_bounds[index], second_bounds[other_index])
+                    <= maximum_distance + GEOMETRY_EPSILON
+                ):
+                    candidates.add((index, other_index))
+            active_first.add(index)
+        else:
+            for other_index in active_first:
+                if (
+                    _bounds_distance(first_bounds[other_index], second_bounds[index])
+                    <= maximum_distance + GEOMETRY_EPSILON
+                ):
+                    candidates.add((other_index, index))
+            active_second.add(index)
+    return tuple(sorted(candidates))
+
+
 def _point_in_polygon(point, polygon):
     points = _clean_contour_points(polygon)
     inside = False
@@ -139,7 +196,7 @@ def _point_in_polygon(point, polygon):
     return inside
 
 
-def _contour_distance(first, second):
+def _contour_distance(first, second, maximum_relevant_distance=None):
     first_points = _clean_contour_points(first)
     second_points = _clean_contour_points(second)
     if _point_in_polygon(first_points[0], second_points) or _point_in_polygon(second_points[0], first_points):
@@ -149,15 +206,33 @@ def _contour_distance(first, second):
     second_segments = _closed_segments(second)
     min_distance = None
 
-    for a1, a2 in first_segments:
-        for b1, b2 in second_segments:
-            distance = _segment_distance(a1, a2, b1, b2)
-            if min_distance is None or distance < min_distance:
-                min_distance = distance
-            if min_distance <= GEOMETRY_EPSILON:
-                return 0.0
+    if maximum_relevant_distance is None:
+        segment_pairs = (
+            (first_index, second_index)
+            for first_index in range(len(first_segments))
+            for second_index in range(len(second_segments))
+        )
+    else:
+        segment_pairs = _near_segment_pairs(
+            tuple(_segment_bounds(segment) for segment in first_segments),
+            tuple(_segment_bounds(segment) for segment in second_segments),
+            maximum_relevant_distance,
+        )
 
-    return min_distance if min_distance is not None else 0.0
+    for first_index, second_index in segment_pairs:
+        a1, a2 = first_segments[first_index]
+        b1, b2 = second_segments[second_index]
+        distance = _segment_distance(a1, a2, b1, b2)
+        if min_distance is None or distance < min_distance:
+            min_distance = distance
+        if min_distance <= GEOMETRY_EPSILON:
+            return 0.0
+
+    if min_distance is not None:
+        return min_distance
+    if maximum_relevant_distance is not None:
+        return float(maximum_relevant_distance)
+    return 0.0
 
 
 def validate_external_cut_clearance(contours, settings):
@@ -166,21 +241,76 @@ def validate_external_cut_clearance(contours, settings):
     if len(contours) < 2:
         return
 
+    common_line_mode = str(
+        settings.get("common_line_mode", "preserve_dimensions")
+    )
+    if (
+        settings.get("common_line_enabled")
+        and common_line_mode == "on_vector"
+        and "common_line_shared_pairs" not in settings
+    ):
+        # The dedicated common-line planner validates crossings, area overlap
+        # and ownership first. It calls this validator again with the exact
+        # contour pairs that genuinely share a positive-length boundary.
+        return
+
     tool_diameter = float(settings.get("tool_diameter", 0.0))
+    if settings.get("common_line_enabled"):
+        tool_diameter += 2.0 * float(
+            settings.get("cut_allowance_offset", 0.0) or 0.0
+        )
     if tool_diameter <= 0.0:
         return
 
     required_clearance = tool_diameter
+    shared_pairs = {
+        tuple(sorted((int(pair[0]), int(pair[1]))))
+        for pair in (settings.get("common_line_shared_pairs", ()) or ())
+        if len(pair) >= 2
+    }
+    clean_contours = [_clean_contour_points(contour) for contour in contours]
+    contour_bounds = [_points_bounds(contour) for contour in clean_contours]
     for first_index in range(len(contours)):
         for second_index in range(first_index + 1, len(contours)):
-            clearance = _contour_distance(contours[first_index], contours[second_index])
+            if (first_index, second_index) in shared_pairs:
+                continue
+            if (
+                _bounds_distance(
+                    contour_bounds[first_index], contour_bounds[second_index]
+                )
+                + GEOMETRY_EPSILON
+                >= required_clearance
+            ):
+                continue
+            clearance = _contour_distance(
+                clean_contours[first_index],
+                clean_contours[second_index],
+                maximum_relevant_distance=required_clearance,
+            )
             if clearance + GEOMETRY_EPSILON < required_clearance:
+                if settings.get("common_line_enabled") and common_line_mode == "on_vector":
+                    explanation = (
+                        "A folga é menor que o diâmetro efetivo e este par não "
+                        "forma uma fronteira comum coincidente. O corte foi "
+                        "bloqueado para não converter silenciosamente corte "
+                        "externo em corte sobre a linha."
+                    )
+                elif settings.get("common_line_enabled"):
+                    explanation = (
+                        "Para linha comum preservando medidas, a folga deve "
+                        "coincidir com o diâmetro efetivo da fresa."
+                    )
+                else:
+                    explanation = (
+                        "Ative linha comum somente para um layout preparado "
+                        "para essa estratégia."
+                    )
                 raise ValueError(
                     "Espaçamento insuficiente entre os contornos "
                     f"{first_index + 1} e {second_index + 1}: {clearance:.2f} mm. "
                     "Para corte externo independente com compensação de fresa, deixe pelo menos "
                     f"{required_clearance:.2f} mm entre as peças. "
-                    "Corte compartilhado/common-line ainda não está implementado no WoodCAM 2D."
+                    + explanation
                 )
 
 
@@ -246,7 +376,11 @@ def validate_selected_contours(contours, settings=None):
                 f"de {machine_x_size:.1f} x {machine_y_size:.1f} mm."
             )
 
-    validate_external_cut_clearance(contours, settings)
+    # Intersections are normally a blocking safety check.  The UI may offer
+    # an explicit one-time override after warning the operator; it is never
+    # enabled implicitly.
+    if not (settings and settings.get("ignore_contour_intersections")):
+        validate_external_cut_clearance(contours, settings)
 
 
 def validate_settings(settings):
@@ -295,6 +429,58 @@ def validate_settings(settings):
             )
         if float(settings.get("cut_last_pass_allowance", 0.0)) < 0.0:
             raise ValueError("O sobre-metal da última passada não pode ser negativo.")
+        if settings.get("cut_tabs_enabled", False):
+            tab_height = float(settings.get("tab_thickness", 0.0) or 0.0)
+            material_height = float(settings["material_thickness"])
+            if tab_height < 0.0:
+                raise ValueError("A altura intacta da tab não pode ser negativa.")
+            if tab_height > material_height + 1.0e-7:
+                raise ValueError(
+                    "A altura intacta da tab não pode ultrapassar a espessura do material."
+                )
+        waste_mode = str(settings.get("loose_waste_fixation", "disabled"))
+        if waste_mode not in {"disabled", "tabs", "screws"}:
+            raise ValueError("A fixação de restos soltos selecionada é inválida.")
+        if waste_mode != "disabled" and not settings.get(
+            "common_line_enabled", False
+        ):
+            raise ValueError(
+                "A fixação automática de restos exige o plano de Linha comum."
+            )
+        if waste_mode == "screws":
+            for key, label in (
+                ("screw_pilot_diameter", "diâmetro piloto"),
+                ("screw_pilot_depth", "profundidade piloto"),
+                ("screw_head_diameter", "diâmetro da cabeça"),
+                ("screw_safety_margin", "margem do parafuso"),
+                ("screw_head_height", "altura da cabeça"),
+            ):
+                if float(settings.get(key, 0.0) or 0.0) < 0.0:
+                    raise ValueError("O %s não pode ser negativo." % label)
+            if float(settings.get("screw_head_diameter", 0.0) or 0.0) <= 0.0:
+                raise ValueError(
+                    "O diâmetro da cabeça/arruela do parafuso deve ser positivo."
+                )
+            pilot_diameter = float(
+                settings.get("screw_pilot_diameter", 0.0) or 0.0
+            )
+            if (
+                pilot_diameter > 1.0e-9
+                and pilot_diameter
+                < float(settings.get("tool_diameter", 0.0)) - 1.0e-7
+            ):
+                raise ValueError(
+                    "O diâmetro piloto não pode ser menor que a fresa atual; "
+                    "use 0 para adotar o diâmetro da fresa."
+                )
+            if str(settings.get("tool_type", "end_mill")) not in {
+                "end_mill",
+                "compression",
+            }:
+                raise ValueError(
+                    "Os furos piloto exigem fresa de topo/compressão com "
+                    "mergulho vertical confirmado."
+                )
     if settings["stepdown"] <= 0:
         raise ValueError("O stepdown deve ser maior que zero.")
     if settings["feed_xy"] <= 0:
@@ -313,6 +499,18 @@ def validate_settings(settings):
         raise ValueError("A cota inicial não pode ser negativa.")
     if settings.get("cut_depth", settings.get("final_depth", 0.0)) <= 0:
         raise ValueError("A profundidade de corte deve ser maior que zero.")
+    start_depth = float(settings.get("start_depth", 0.0) or 0.0)
+    final_depth = float(
+        settings.get(
+            "final_depth",
+            settings.get("cut_depth", 0.0),
+        )
+        or 0.0
+    )
+    if final_depth <= start_depth + 1.0e-9:
+        raise ValueError(
+            "A profundidade final Z deve ser maior que a profundidade inicial."
+        )
     if not 1.0 <= settings.get("helix_stepover_percent", 40.0) <= 100.0:
         raise ValueError("O passo lateral da hélice deve ficar entre 1% e 100%.")
     if settings.get("peck_enabled", False) and settings.get("peck_step", 0.0) <= 0:
@@ -321,6 +519,35 @@ def validate_settings(settings):
         raise ValueError("A folga de retração não pode ser negativa.")
     if settings.get("dwell_seconds", 0.0) < 0:
         raise ValueError("O tempo de permanência não pode ser negativo.")
+    if (
+        settings.get("operation_mode") == "holes"
+        and settings.get("hole_counterbore_enabled", False)
+    ):
+        counterbore_diameter = float(
+            settings.get("hole_counterbore_diameter", 0.0)
+        )
+        counterbore_depth = float(settings.get("hole_counterbore_depth", 0.0))
+        if counterbore_diameter <= 0.0:
+            raise ValueError("O diâmetro do rebaixo da cabeça deve ser maior que zero.")
+        if counterbore_diameter + 1.0e-9 < float(settings["tool_diameter"]):
+            raise ValueError("O diâmetro do rebaixo não pode ser menor que a fresa.")
+        if counterbore_depth <= 0.0:
+            raise ValueError(
+                "A profundidade do rebaixo da cabeça deve ser maior que zero."
+            )
+        available_hole_depth = max(0.0, final_depth - start_depth)
+        if counterbore_depth > available_hole_depth + 1.0e-9:
+            raise ValueError(
+                "A profundidade do rebaixo da cabeça não pode ultrapassar a "
+                "profundidade restante do furo."
+            )
+        if str(settings.get("tool_type", "end_mill")) not in {
+            "end_mill",
+            "compression",
+        }:
+            raise ValueError(
+                "O rebaixo da cabeça exige fresa de topo ou de compressão."
+            )
     if settings["rpm"] <= 0:
         raise ValueError("O RPM deve ser maior que zero.")
     if settings.get("simulation_speed_multiplier", 1.0) <= 0:

@@ -1,7 +1,15 @@
 import unittest
 
 from woodcam_editor.adapters.freecad_commands import FreeCADCommandSession
-from woodcam_editor.domain import AddEntitiesCommand, PathEntity, Vec2, VectorDocument
+from woodcam_editor.application import UpdateLayerCommand, UpdateLayersCommand
+from woodcam_editor.domain import (
+    AddEntitiesCommand,
+    InMemoryCommandHistory,
+    Layer,
+    PathEntity,
+    Vec2,
+    VectorDocument,
+)
 
 
 class _Document:
@@ -22,9 +30,11 @@ class _Store:
     def __init__(self):
         self.document = _Document()
         self.saved = None
+        self.save_kwargs = None
 
-    def save(self, value, **_kwargs):
+    def save(self, value, **kwargs):
         self.saved = value.clone()
+        self.save_kwargs = dict(kwargs)
 
     def load(self):
         return self.saved.clone() if self.saved is not None else None
@@ -45,6 +55,41 @@ class FreeCADCommandSessionTest(unittest.TestCase):
         self.assertEqual(
             [entry[0] for entry in store.document.transactions],
             ["open", "commit"],
+        )
+        self.assertTrue(store.save_kwargs["refresh_derived_shape"])
+
+    def test_layer_visibility_persists_without_rebuilding_occ_projection(self):
+        vector_document = VectorDocument.create_default()
+        store = _Store()
+        session = FreeCADCommandSession(vector_document, store)
+
+        session.execute(
+            UpdateLayerCommand(vector_document.active_layer_id, visible=False)
+        )
+
+        self.assertFalse(
+            vector_document.layers_by_id[vector_document.active_layer_id].visible
+        )
+        self.assertFalse(store.save_kwargs["refresh_derived_shape"])
+
+    def test_consolidated_layers_toggle_and_undo_as_one_command(self):
+        vector_document = VectorDocument.create_default()
+        second = Layer(name="Corte externo", purpose="cut", order=1)
+        vector_document.add_layers((second,))
+        layer_ids = (vector_document.active_layer_id, second.id)
+        history = InMemoryCommandHistory(vector_document)
+
+        change_set = history.execute(
+            UpdateLayersCommand(layer_ids, visible=False)
+        )
+
+        self.assertEqual(change_set.layers_changed, frozenset(layer_ids))
+        self.assertTrue(
+            all(not vector_document.layers_by_id[value].visible for value in layer_ids)
+        )
+        history.undo()
+        self.assertTrue(
+            all(vector_document.layers_by_id[value].visible for value in layer_ids)
         )
 
     def test_failed_save_aborts_and_restores_in_memory_document(self):

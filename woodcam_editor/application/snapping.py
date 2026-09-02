@@ -86,6 +86,8 @@ class SnapSettings:
     on_geometry: bool = True
     grid: bool = True
     grid_spacing_mm: float = 10.0
+    grid_origin_x_mm: float = 0.0
+    grid_origin_y_mm: float = 0.0
     # Smart snaps are measured from the active drawing/measurement anchor.
     # They are screen-radius candidates just like endpoint/grid snaps, never
     # hidden constraints in the document.
@@ -138,11 +140,69 @@ def _span_id(span: Any) -> Optional[str]:
     return None if value is None else str(value)
 
 
+def _entity_is_near_point(
+    entity: Any,
+    point: Any,
+    world_radius: float,
+    bounds: Any = None,
+) -> bool:
+    """Conservatively reject entities outside the screen snap neighbourhood.
+
+    Every supported snap target lies inside its entity bounds.  Filtering by
+    those bounds therefore changes no result or priority, but avoids asking
+    hundreds of distant spans for nearest points on every mouse movement.
+    Unknown/custom entities remain eligible instead of being guessed away.
+    """
+
+    try:
+        if bounds is None:
+            bounds_method = getattr(entity, "bounds", None)
+            if not callable(bounds_method):
+                return True
+            bounds = bounds_method()
+        min_x = float(bounds.min_x)
+        min_y = float(bounds.min_y)
+        max_x = float(bounds.max_x)
+        max_y = float(bounds.max_y)
+        px, py = _xy(point)
+    except Exception:
+        return True
+    radius = max(0.0, float(world_radius))
+    return not (
+        max_x < px - radius
+        or min_x > px + radius
+        or max_y < py - radius
+        or min_y > py + radius
+    )
+
+
 class SnapEngine:
     """Ranks geometric snap candidates using a screen-space radius."""
 
     def __init__(self, settings: Optional[SnapSettings] = None) -> None:
         self.settings = settings or SnapSettings()
+        # Domain entities are immutable: an edit replaces the object while an
+        # unchanged vector keeps the same identity.  Cache its bounds so mouse
+        # hover does not rebuild every BBox hundreds of times per second.
+        # Keeping the object beside the value also makes Python id reuse safe.
+        self._bounds_cache = {}
+
+    def _entity_bounds(self, entity: Any) -> Any:
+        entity_id = _entity_id(entity)
+        key = entity_id if entity_id is not None else "@%d" % id(entity)
+        cached = self._bounds_cache.get(key)
+        if cached is not None and cached[0] is entity:
+            return cached[1]
+        method = getattr(entity, "bounds", None)
+        if not callable(method):
+            bounds = False
+        else:
+            try:
+                bounds = method()
+            except Exception:
+                bounds = False
+        self._bounds_cache[key] = (entity, bounds)
+        return bounds
 
     def find(
         self,
@@ -162,21 +222,50 @@ class SnapEngine:
             for entity in _document_entities(document)
             if self._entity_is_editable_visible(document, entity)
         )
+        world_radius = self.settings.radius_px / max(1.0e-12, pixels_per_mm)
+        nearby = []
         for entity in entities:
+            bounds = self._entity_bounds(entity)
+            if bounds is False or _entity_is_near_point(
+                entity,
+                point,
+                world_radius,
+                bounds,
+            ):
+                nearby.append(entity)
+        nearby_entities = tuple(nearby)
+        if len(self._bounds_cache) > max(128, len(entities) * 2):
+            live_keys = {
+                _entity_id(entity) or "@%d" % id(entity)
+                for entity in entities
+            }
+            live_object_ids = {id(entity) for entity in entities}
+            self._bounds_cache = {
+                key: value
+                for key, value in self._bounds_cache.items()
+                if key in live_keys and id(value[0]) in live_object_ids
+            }
+        for entity in nearby_entities:
             if _entity_id(entity) in excluded:
                 continue
             candidates.extend(self._entity_candidates(point, entity, pixels_per_mm))
         if self.settings.intersection:
             candidates.extend(
-                self._intersection_candidates(point, entities, pixels_per_mm)
+                self._intersection_candidates(point, nearby_entities, pixels_per_mm)
             )
         if self.settings.grid and self.settings.grid_spacing_mm > 1e-12:
             x, y = _xy(point)
             spacing = self.settings.grid_spacing_mm
+            origin_x = float(self.settings.grid_origin_x_mm)
+            origin_y = float(self.settings.grid_origin_y_mm)
             candidates.append(
                 self._candidate(
                     point,
-                    _make_like(point, round(x / spacing) * spacing, round(y / spacing) * spacing),
+                    _make_like(
+                        point,
+                        origin_x + round((x - origin_x) / spacing) * spacing,
+                        origin_y + round((y - origin_y) / spacing) * spacing,
+                    ),
                     SnapKind.GRID,
                     pixels_per_mm,
                 )
@@ -187,7 +276,7 @@ class SnapEngine:
                     point,
                     reference_point,
                     pixels_per_mm,
-                    entities,
+                    nearby_entities,
                     excluded,
                 )
             )

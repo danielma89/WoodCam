@@ -29,6 +29,7 @@ class PathEntity:
     layer_id: str
     spans: tuple
     closed: bool
+    metadata: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,14 @@ class CircleEntity:
     layer_id: str
     center: Point
     radius: float
+
+
+@dataclass(frozen=True)
+class GroupEntity:
+    id: str
+    layer_id: str
+    child_ids: tuple
+    type: str = "group"
 
 
 @dataclass(frozen=True)
@@ -104,6 +113,70 @@ def regular_polygon(identifier, center, radius, sides=16, layer_id="design"):
 
 
 class GeometryAdapterTests(unittest.TestCase):
+    def test_remnant_cut_is_reserved_for_the_open_centerline_bridge(self):
+        remnant = PathEntity(
+            "remnant",
+            "design",
+            (LineSpan(Point(0, 40), Point(100, 40)),),
+            False,
+            {"woodcam_role": "remnant_cut"},
+        )
+        document = Document(
+            {remnant.id: remnant},
+            {"design": Layer("design")},
+        )
+
+        self.assertEqual(
+            document_to_woodcam_geometry(document),
+            {"contours": [], "holes": []},
+        )
+
+    def test_whole_document_ignores_group_relationship_and_uses_leaf_geometry(self):
+        outer = rectangle()
+        group = GroupEntity("group-board", "design", (outer.id,))
+        document = Document(
+            {outer.id: outer, group.id: group},
+            {"design": Layer("design")},
+        )
+
+        geometry = document_to_woodcam_geometry(document)
+
+        self.assertEqual(len(geometry["contours"]), 1)
+        self.assertEqual(geometry["contours"][0][0], (0.0, 0.0))
+
+    def test_pocket_region_is_sent_only_when_explicitly_selected(self):
+        outer = rectangle()
+        pocket = PathEntity(
+            "pocket",
+            "design",
+            (
+                LineSpan(Point(0, 10), Point(40, 10)),
+                LineSpan(Point(40, 10), Point(40, 30)),
+                LineSpan(Point(40, 30), Point(0, 30)),
+                LineSpan(Point(0, 30), Point(0, 10)),
+            ),
+            True,
+            {
+                "import_role": "pocket_region",
+                "pocket_depth_mm": 5.0,
+            },
+        )
+        document = Document(
+            {outer.id: outer, pocket.id: pocket},
+            {"design": Layer("design")},
+        )
+
+        complete = document_to_woodcam_geometry(document)
+        selected = document_to_woodcam_geometry(
+            document,
+            entity_ids=(pocket.id,),
+        )
+
+        self.assertEqual(len(complete["contours"]), 1)
+        self.assertEqual(complete["contours"][0][0], (0.0, 0.0))
+        self.assertEqual(len(selected["contours"]), 1)
+        self.assertEqual(selected["contours"][0][0], (0.0, 10.0))
+
     def test_cam_contract_preserves_path_and_exact_circle_hole(self):
         outer = rectangle()
         hole = CircleEntity("hole", "design", Point(20, 25), 5)
@@ -123,6 +196,24 @@ class GeometryAdapterTests(unittest.TestCase):
         self.assertEqual(geometry["holes"][0]["y"], 25.0)
         self.assertEqual(geometry["holes"][0]["diameter_mm"], 10.0)
         self.assertGreaterEqual(len(geometry["holes"][0]["points"]), 12)
+
+    def test_selected_circle_can_be_preserved_as_pocket_contour(self):
+        circle = CircleEntity("pocket-circle", "design", Point(20, 25), 5)
+        document = Document(
+            {circle.id: circle},
+            {"design": Layer("design")},
+        )
+
+        geometry = document_to_woodcam_geometry(
+            document,
+            entity_ids=(circle.id,),
+            deflection=0.1,
+            classify_small_circles_as_holes=False,
+        )
+
+        self.assertEqual(geometry["holes"], [])
+        self.assertEqual(len(geometry["contours"]), 1)
+        self.assertGreaterEqual(len(geometry["contours"][0]), 12)
 
     def test_open_design_path_blocks_cam_in_strict_mode(self):
         path = PathEntity(

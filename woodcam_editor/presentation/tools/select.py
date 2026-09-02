@@ -5,6 +5,7 @@ from __future__ import annotations
 from woodcam_editor.application import EditorMode
 
 from ..compat import (
+    ALT_MODIFIER,
     CTRL_MODIFIER,
     LEFT_BUTTON,
     SHIFT_MODIFIER,
@@ -31,6 +32,7 @@ class SelectTool(EditorTool):
         self.resize_handle = None
         self.resize_bounds = None
         self.resize_preview = None
+        self.hit_was_selected = False
 
     def activate(self, entity_id=None):
         self.overlays.clear_nodes()
@@ -48,6 +50,14 @@ class SelectTool(EditorTool):
         self.selection_before = self.controller.selection.ids
         shift = has_modifier(event.modifiers, SHIFT_MODIFIER)
         if self.controller.selection.ids and not shift:
+            if self.overlays.hit_test_selection_pivot(self.view, event.screen_pos):
+                # The centre control is the explicit, visible target for a
+                # transform move.  Empty space inside a contour/bounds never
+                # becomes a hidden hit region. Test it before nearby handles:
+                # degenerate vectors can place them only a few pixels apart.
+                self.hit_id = self.controller.selection.primary_id
+                self.marquee = False
+                return
             handle = self.overlays.hit_test_selection_handle(
                 self.view, event.screen_pos
             )
@@ -58,17 +68,9 @@ class SelectTool(EditorTool):
                 return
         raw_hit_id = self.adapter.hit_test_body(self.view, event.screen_pos)
         self.hit_id = self.controller.grouped_selection_id_for_hit(raw_hit_id)
-        # Aspire lets a selected set move when the drag starts in the empty
-        # area inside its transform bounds.  A body hit is not required in
-        # that case; otherwise a multi-selection looked frozen whenever the
-        # user grabbed the gap between two vectors.
-        if self.hit_id is None and self.controller.selection.ids and not shift:
-            bounds = self.controller.selection_bounds()
-            if bounds is not None and bounds.contains_point(
-                self.controller.vec(event.scene_pos.x(), event.scene_pos.y()),
-                tolerance=0.0,
-            ):
-                self.hit_id = self.controller.selection.primary_id or self.controller.selection.ids[0]
+        self.hit_was_selected = bool(
+            self.hit_id is not None and self.hit_id in self.selection_before
+        )
         if self.hit_id is not None:
             if shift:
                 self.controller.selection.toggle(self.hit_id)
@@ -105,6 +107,11 @@ class SelectTool(EditorTool):
         if self.hit_id is None or self.hit_id not in self.controller.selection:
             return
         delta = event.scene_pos - self.press_scene
+        if has_modifier(event.modifiers, ALT_MODIFIER):
+            if abs(delta.x()) >= abs(delta.y()):
+                delta.setY(0.0)
+            else:
+                delta.setX(0.0)
         self.adapter.preview_translation(self.controller.selection.ids, delta)
         bounds = self.controller.selection_bounds()
         if bounds is not None:
@@ -167,11 +174,38 @@ class SelectTool(EditorTool):
                 self.controller.selection.replace(ids)
         elif self.dragging and self.hit_id is not None:
             delta = event.scene_pos - self.press_scene
+            if has_modifier(event.modifiers, ALT_MODIFIER):
+                if abs(delta.x()) >= abs(delta.y()):
+                    delta.setY(0.0)
+                else:
+                    delta.setX(0.0)
             self.adapter.clear_preview()
-            self.controller.move_entities(
-                self.controller.selection.ids,
-                self.controller.vec(delta.x(), delta.y()),
-            )
+            movement = self.controller.vec(delta.x(), delta.y())
+            if has_modifier(event.modifiers, CTRL_MODIFIER):
+                self.controller.array_copy_selection(2, 1, movement.x, movement.y)
+            else:
+                self.controller.move_entities(self.controller.selection.ids, movement)
+        elif (
+            self.hit_id is not None
+            and self.hit_was_selected
+            and not shift
+            and self.controller.mode == EditorMode.SELECT
+        ):
+            # A later click on an already selected vector exposes transform
+            # handles.  Node editing is deliberately exclusive to N.
+            self._reset()
+            self.manager.activate(EditorMode.TRANSFORM)
+            return
+        elif (
+            self.hit_id is not None
+            and self.controller.mode == EditorMode.TRANSFORM
+            and not self.hit_was_selected
+        ):
+            # Selecting another vector is a fresh SELECT gesture, not a
+            # transform of the previous selection.
+            self._reset()
+            self.manager.activate(EditorMode.SELECT)
+            return
         self.overlays.clear_transient()
         self._reset()
 
@@ -206,12 +240,9 @@ class SelectTool(EditorTool):
         return min_x, min_y, max_x, max_y
 
     def pointer_double_click(self, event):
-        entity_id = self.adapter.hit_test_body(self.view, event.screen_pos)
-        if entity_id is None:
-            return
-        self.controller.selection.select_only(entity_id)
-        self.manager.activate(EditorMode.NODE_EDIT, entity_id)
-        self.manager.editSelectionRequested.emit()
+        # Deliberately no node-mode shortcut here.  System double-click timing
+        # must not compete with the explicit SELECT -> TRANSFORM -> N flow.
+        return
 
     def key_press(self, event):
         key = event.key()
@@ -231,6 +262,8 @@ class SelectTool(EditorTool):
         if key == qt_enum(QtCore.Qt, "Key_Escape", "Key"):
             if self.press_screen is not None:
                 self.cancel()
+            elif self.controller.mode == EditorMode.TRANSFORM:
+                self.manager.activate(EditorMode.SELECT)
             else:
                 self.controller.selection.clear()
             event.accept()

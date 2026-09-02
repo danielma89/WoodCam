@@ -61,10 +61,12 @@ document.recompute()
 document.saveAs(path)
 FreeCAD.closeDocument(document.Name)
 reopened = FreeCAD.openDocument(path)
-reloaded = FreeCADDocumentStore(reopened).load()
+reopened_store = FreeCADDocumentStore(reopened)
+reloaded = reopened_store.load()
 assert set(reloaded.entities_by_id) == {outer.id, hole.id}
 assert reloaded.work_area.width == 1850
 assert reloaded.work_area.height == 2750
+assert set(reopened_store._entity_shape_cache) == {outer.id, hole.id}
 FreeCAD.closeDocument(reopened.Name)
 os.unlink(path)
 print("FreeCAD document store smoke: OK")

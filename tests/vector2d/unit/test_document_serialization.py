@@ -16,6 +16,7 @@ from woodcam_editor.domain import (
     WorkArea,
     deserialize_document,
     document_checksum,
+    geometry_checksum,
     document_from_dict,
     document_to_dict,
     serialize_document,
@@ -137,7 +138,21 @@ class SerializationTests(unittest.TestCase):
         with self.assertRaises(SerializationError):
             serialize_document(document)
 
+    def test_geometry_checksum_ignores_piece_cache_but_changes_with_vectors(self):
+        document = complex_document()
+        before = geometry_checksum(document)
+        document.pieces_by_id["piece-1"] = Piece2D(
+            id="piece-1",
+            name="Peça 01",
+            outer_path_id="path-main",
+            inner_path_ids=("circle-hole",),
+        )
+        self.assertEqual(before, geometry_checksum(document))
+        document.entities_by_id["circle-hole"] = CircleEntity(
+            document.active_layer_id, Vec2(31, 22), 3, id="circle-hole"
+        )
+        self.assertNotEqual(before, geometry_checksum(document))
+
 
 if __name__ == "__main__":
     unittest.main()
-

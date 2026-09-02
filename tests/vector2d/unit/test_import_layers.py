@@ -1,10 +1,15 @@
 import unittest
 
 from woodcam_editor.domain.document import Layer, VectorDocument
-from woodcam_editor.domain.entities import CircleEntity
+from woodcam_editor.domain.entities import CircleEntity, GroupEntity, PathEntity
 from woodcam_editor.domain.primitives import Vec2
+from woodcam_editor.domain.spans import LineSpan
 from woodcam_editor.importers.layers import remap_import_layers
-from woodcam_editor.importers.part_shape import ImportResult, import_part_shape
+from woodcam_editor.importers.part_shape import (
+    ImportResult,
+    _stage_tree_imports,
+    import_part_shape,
+)
 
 
 class _Point:
@@ -57,6 +62,52 @@ class _Shape:
 
 
 class ImportLayerRemapTests(unittest.TestCase):
+    @staticmethod
+    def _rectangle(layer_id, entity_id, min_x, min_y, max_x, max_y, instance_id):
+        points = (
+            Vec2(min_x, min_y),
+            Vec2(max_x, min_y),
+            Vec2(max_x, max_y),
+            Vec2(min_x, max_y),
+        )
+        return PathEntity(
+            layer_id=layer_id,
+            spans=tuple(
+                LineSpan(points[index], points[(index + 1) % len(points)])
+                for index in range(len(points))
+            ),
+            closed=True,
+            id=entity_id,
+            metadata={"source_tree_instance_id": instance_id},
+        )
+
+    def test_tree_staging_partitions_components_inside_the_same_result(self):
+        first = self._rectangle(
+            "layer", "first", 0.0, 0.0, 100.0, 80.0, "001:Leaf:component-001"
+        )
+        second = self._rectangle(
+            "layer", "second", 0.0, 0.0, 40.0, 20.0, "001:Leaf:component-002"
+        )
+        wrapper = GroupEntity(
+            layer_id="layer",
+            child_ids=(second.id,),
+            id="second-group",
+            metadata={"source_tree_instance_id": "001:Leaf:component-002"},
+        )
+
+        staged = _stage_tree_imports((ImportResult((first, second, wrapper)),))
+        staged_paths = [entity for entity in staged if isinstance(entity, PathEntity)]
+
+        self.assertEqual(len(staged_paths), 2)
+        first_bounds, second_bounds = (entity.bounds() for entity in staged_paths)
+        self.assertFalse(
+            first_bounds.max_x > second_bounds.min_x
+            and second_bounds.max_x > first_bounds.min_x
+            and first_bounds.max_y > second_bounds.min_y
+            and second_bounds.max_y > first_bounds.min_y
+        )
+        self.assertIs(next(entity for entity in staged if isinstance(entity, GroupEntity)), wrapper)
+
     def test_part_wire_reorients_alternating_occ_edges_without_moving_points(self):
         edges = (
             _Edge((0, 0), (10, 0)),
@@ -81,6 +132,26 @@ class ImportLayerRemapTests(unittest.TestCase):
                 (Vec2(0, 10), Vec2(0, 0)),
             },
         )
+
+    def test_part_wire_skips_zero_length_occ_edge_without_aborting_board(self):
+        edges = (
+            _Edge((0, 0), (10, 0)),
+            _Edge((10, 0), (10, 0)),
+            _Edge((10, 0), (10, 10)),
+            _Edge((10, 10), (0, 10)),
+            _Edge((0, 10), (0, 0)),
+        )
+
+        result = import_part_shape(
+            _Shape((_Wire(edges),), edges),
+            layer_id="layer",
+        )
+
+        self.assertEqual(len(result.entities), 1)
+        self.assertTrue(result.entities[0].closed)
+        self.assertEqual(len(result.entities[0].spans), 4)
+        self.assertEqual(len(result.issues), 1)
+        self.assertIn("comprimento zero", result.issues[0].message)
 
     def test_three_argument_import_result_remains_compatible(self):
         document = VectorDocument.create_default()

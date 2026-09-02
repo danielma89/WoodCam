@@ -1,5 +1,7 @@
 import unittest
+from unittest.mock import patch
 
+import validators as validators_module
 from validators import validate_selected_contours, validate_settings
 
 
@@ -49,6 +51,130 @@ def _full_settings(**overrides):
 
 
 class ValidatorsTest(unittest.TestCase):
+    def test_final_depth_is_absolute_and_must_be_below_initial_z(self):
+        validate_settings(
+            _full_settings(
+                start_depth=6.3,
+                cut_depth=7.0,
+                final_depth=7.0,
+                depth_input_mode="absolute_final",
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "maior que a profundidade inicial"):
+            validate_settings(
+                _full_settings(
+                    start_depth=7.0,
+                    cut_depth=7.0,
+                    final_depth=7.0,
+                    depth_input_mode="absolute_final",
+                )
+            )
+
+    def test_counterbore_depth_is_limited_to_remaining_hole_interval(self):
+        base = _full_settings(
+            operation_mode="holes",
+            start_depth=6.0,
+            cut_depth=7.0,
+            final_depth=7.0,
+            depth_input_mode="absolute_final",
+            tool_type="end_mill",
+            hole_counterbore_enabled=True,
+            hole_counterbore_diameter=10.0,
+            hole_counterbore_depth=1.0,
+        )
+        validate_settings(base)
+        with self.assertRaisesRegex(ValueError, "profundidade restante"):
+            validate_settings(dict(base, hole_counterbore_depth=1.1))
+
+    def test_clearance_validation_skips_exact_distance_for_far_contours(self):
+        contours = [
+            [
+                (index * 20.0, 0.0),
+                (index * 20.0 + 10.0, 0.0),
+                (index * 20.0 + 10.0, 10.0),
+                (index * 20.0, 10.0),
+            ]
+            for index in range(80)
+        ]
+
+        with patch.object(
+            validators_module,
+            "_contour_distance",
+            wraps=validators_module._contour_distance,
+        ) as contour_distance:
+            validate_selected_contours(contours, _settings(tool_diameter=6.0))
+
+        self.assertEqual(contour_distance.call_count, 0)
+
+    def test_tab_height_is_limited_by_material_not_final_overcut(self):
+        validate_settings(
+            _full_settings(
+                operation_mode="cut",
+                cut_tabs_enabled=True,
+                tab_thickness=15.0,
+                material_thickness=15.0,
+                final_depth=15.5,
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "ultrapassar a espessura"):
+            validate_settings(
+                _full_settings(
+                    operation_mode="cut",
+                    cut_tabs_enabled=True,
+                    tab_thickness=15.1,
+                    material_thickness=15.0,
+                    final_depth=15.5,
+                )
+            )
+
+    def test_tab_height_is_independent_from_initial_cut_depth(self):
+        validate_settings(
+            _full_settings(
+                operation_mode="cut",
+                cut_tabs_enabled=True,
+                start_depth=6.0,
+                tab_thickness=15.0,
+                material_thickness=15.0,
+                final_depth=15.5,
+            )
+        )
+
+    def test_screw_fixation_requires_common_line_and_feasible_pilot_diameter(self):
+        valid = _full_settings(
+            operation_mode="cut",
+            common_line_enabled=True,
+            loose_waste_fixation="screws",
+            screw_pilot_diameter=6.0,
+            screw_pilot_depth=20.0,
+            screw_head_diameter=10.0,
+            screw_safety_margin=3.0,
+            screw_head_height=3.0,
+            tool_type="end_mill",
+        )
+        validate_settings(valid)
+        with self.assertRaisesRegex(ValueError, "menor que a fresa"):
+            validate_settings(dict(valid, screw_pilot_diameter=4.0))
+        with self.assertRaisesRegex(ValueError, "exige o plano de Linha comum"):
+            validate_settings(dict(valid, common_line_enabled=False))
+
+    def test_hole_counterbore_validates_diameter_depth_and_tool(self):
+        valid = _full_settings(
+            operation_mode="holes",
+            tool_type="end_mill",
+            hole_counterbore_enabled=True,
+            hole_counterbore_diameter=10.0,
+            hole_counterbore_depth=3.0,
+            cut_depth=12.0,
+            final_depth=12.0,
+        )
+        validate_settings(valid)
+        with self.assertRaisesRegex(ValueError, "menor que a fresa"):
+            validate_settings(dict(valid, hole_counterbore_diameter=5.0))
+        with self.assertRaisesRegex(ValueError, "ultrapassar"):
+            validate_settings(dict(valid, hole_counterbore_depth=13.0))
+        with self.assertRaisesRegex(ValueError, "fresa de topo"):
+            validate_settings(dict(valid, tool_type="drill"))
+
     def test_rapid_feed_has_no_arbitrary_upper_limit(self):
         validate_settings(_full_settings(rapid_feed=18000.0))
 
@@ -58,6 +184,53 @@ class ValidatorsTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "Espaçamento insuficiente"):
             validate_selected_contours([first, second], _settings(tool_diameter=6.0))
+
+    def test_common_line_on_vector_defers_touching_topology_to_its_planner(self):
+        first = [(0.0, 0.0), (100.0, 0.0), (100.0, 50.0), (0.0, 50.0)]
+        second = [(0.0, 50.0), (100.0, 50.0), (100.0, 100.0), (0.0, 100.0)]
+
+        validate_selected_contours(
+            [first, second],
+            _settings(
+                common_line_enabled=True,
+                common_line_mode="on_vector",
+            ),
+        )
+
+    def test_on_vector_allows_only_pairs_proven_shared_by_the_planner(self):
+        first = [(0.0, 0.0), (100.0, 0.0), (100.0, 50.0), (0.0, 50.0)]
+        touching = [(0.0, 50.0), (100.0, 50.0), (100.0, 100.0), (0.0, 100.0)]
+        narrow_gap = [(0.0, 53.0), (100.0, 53.0), (100.0, 100.0), (0.0, 100.0)]
+        settings = _settings(
+            tool_diameter=6.0,
+            common_line_enabled=True,
+            common_line_mode="on_vector",
+        )
+
+        validate_selected_contours(
+            [first, touching],
+            dict(settings, common_line_shared_pairs={(0, 1)}),
+        )
+        with self.assertRaisesRegex(ValueError, "não forma uma fronteira comum"):
+            validate_selected_contours(
+                [first, narrow_gap],
+                dict(settings, common_line_shared_pairs=set()),
+            )
+
+    def test_dimension_preserving_common_line_uses_effective_tool_diameter(self):
+        first = [(0.0, 0.0), (100.0, 0.0), (100.0, 50.0), (0.0, 50.0)]
+        gap_eight = [(0.0, 58.0), (100.0, 58.0), (100.0, 100.0), (0.0, 100.0)]
+        gap_seven = [(0.0, 57.0), (100.0, 57.0), (100.0, 100.0), (0.0, 100.0)]
+        settings = _settings(
+            tool_diameter=6.0,
+            common_line_enabled=True,
+            common_line_mode="preserve_dimensions",
+            cut_allowance_offset=1.0,
+        )
+
+        validate_selected_contours([first, gap_eight], settings)
+        with self.assertRaisesRegex(ValueError, "8.00 mm"):
+            validate_selected_contours([first, gap_seven], settings)
 
     def test_external_cut_blocks_gap_smaller_than_tool_diameter(self):
         first = [(0.0, 0.0), (100.0, 0.0), (100.0, 50.0), (0.0, 50.0)]
@@ -84,6 +257,15 @@ class ValidatorsTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "0.00 mm"):
             validate_selected_contours([first, second], _settings(tool_diameter=6.0))
+
+    def test_explicit_override_allows_overlapping_contours(self):
+        first = [(0.0, 0.0), (100.0, 0.0), (100.0, 50.0), (0.0, 50.0)]
+        second = [(50.0, 25.0), (150.0, 25.0), (150.0, 75.0), (50.0, 75.0)]
+
+        validate_selected_contours(
+            [first, second],
+            _settings(ignore_contour_intersections=True),
+        )
 
     def test_clearance_validation_is_disabled_without_external_compensation(self):
         first = [(0.0, 0.0), (100.0, 0.0), (100.0, 50.0), (0.0, 50.0)]

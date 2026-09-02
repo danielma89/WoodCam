@@ -6,17 +6,126 @@ from dataclasses import replace
 import math
 
 from .compat import Signal, QtCore, QtWidgets, qt_enum
+from .i18n import translate_text
 from woodcam_editor.application.pieces import piece_rotation_mode
 from woodcam_editor.domain import CircleEntity, EllipseEntity, Vec2
 
 
-class LayerPanel(QtWidgets.QGroupBox):
+class CollapsibleGroupBox(QtWidgets.QGroupBox):
+    """Group box with a real disclosure arrow and clipped collapsed body.
+
+    The panel widgets keep their state and signal wiring while collapsed; only
+    their viewport is removed.  This avoids rebuilding forms on every expand
+    and keeps the behaviour identical under PySide2 and PySide6.
+    """
+
+    collapsedChanged = Signal(bool)
+
+    def __init__(self, title, parent=None):
+        super(CollapsibleGroupBox, self).__init__(title, parent)
+        self._collapsed = False
+        self._expanded_maximum_height = self.maximumHeight()
+        self._collapsed_child_state = {}
+        self._collapse_button = QtWidgets.QToolButton(self)
+        self._collapse_button.setObjectName("sectionCollapseButton")
+        self._collapse_button.setAutoRaise(False)
+        self._collapse_button.setFixedSize(27, 22)
+        self._collapse_button.setFocusPolicy(
+            qt_enum(QtCore.Qt, "NoFocus", "FocusPolicy")
+        )
+        self._collapse_button.setStyleSheet(
+            "QToolButton#sectionCollapseButton {"
+            " color: #075985; background: #dbeafe; border: 1px solid #7dd3fc;"
+            " border-radius: 4px; font-size: 15px; font-weight: bold; padding: 0;"
+            "}"
+            "QToolButton#sectionCollapseButton:hover {"
+            " color: #ffffff; background: #0284c7; border-color: #0369a1;"
+            "}"
+            "QToolButton#sectionCollapseButton:pressed { background: #0369a1; }"
+        )
+        self._collapse_button.setToolTip("Recolher esta seção")
+        self._collapse_button.clicked.connect(self.toggle_collapsed)
+        self._sync_collapse_button()
+
+    @property
+    def collapsed(self):
+        return self._collapsed
+
+    def _header_height(self):
+        return max(25, self.fontMetrics().height() + 10)
+
+    def _sync_collapse_button(self):
+        # Native Qt arrows were only a few grey pixels in the FreeCAD theme.
+        # A text chevron keeps the action clear on light/dark themes and
+        # provides a substantially larger click target.
+        self._collapse_button.setText("▶" if self._collapsed else "▼")
+        self._collapse_button.setToolTip(
+            translate_text(
+                "Expandir esta seção" if self._collapsed else "Recolher esta seção"
+            )
+        )
+
+    def set_collapsed(self, collapsed):
+        collapsed = bool(collapsed)
+        if collapsed == self._collapsed:
+            return
+        self._collapsed = collapsed
+        if collapsed:
+            self._expanded_maximum_height = self.maximumHeight()
+            # QObject.children() is direct-only in both PySide2 and PySide6;
+            # using it avoids a binding-specific findChildren enum overload.
+            children = tuple(
+                child
+                for child in self.children()
+                if isinstance(child, QtWidgets.QWidget)
+            )
+            self._collapsed_child_state = {
+                child: child.isHidden()
+                for child in children
+                if child is not self._collapse_button
+            }
+            for child in self._collapsed_child_state:
+                child.hide()
+            self.setMaximumHeight(self._header_height())
+            self.setSizePolicy(
+                qt_enum(QtWidgets.QSizePolicy, "Preferred", "Policy"),
+                qt_enum(QtWidgets.QSizePolicy, "Fixed", "Policy"),
+            )
+        else:
+            self.setMaximumHeight(self._expanded_maximum_height)
+            for child, was_hidden in tuple(self._collapsed_child_state.items()):
+                if not was_hidden:
+                    child.show()
+            self._collapsed_child_state.clear()
+            self.setSizePolicy(
+                qt_enum(QtWidgets.QSizePolicy, "Preferred", "Policy"),
+                qt_enum(QtWidgets.QSizePolicy, "Preferred", "Policy"),
+            )
+        self._sync_collapse_button()
+        self.updateGeometry()
+        self.collapsedChanged.emit(collapsed)
+
+    def toggle_collapsed(self):
+        self.set_collapsed(not self._collapsed)
+
+    def resizeEvent(self, event):  # noqa: N802 - Qt virtual name
+        super(CollapsibleGroupBox, self).resizeEvent(event)
+        self._collapse_button.move(
+            max(0, self.width() - self._collapse_button.width() - 6),
+            2,
+        )
+        self._collapse_button.raise_()
+
+
+class LayerPanel(CollapsibleGroupBox):
     message = Signal(str)
 
     def __init__(self, controller, parent=None):
         super(LayerPanel, self).__init__("Camadas", parent)
         self.controller = controller
         self._refreshing = False
+        self._direct_control_update = False
+        self._layer_rows = []
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(6, 8, 6, 6)
         self.tree = QtWidgets.QTreeWidget(self)
@@ -35,7 +144,7 @@ class LayerPanel(QtWidgets.QGroupBox):
         buttons.addWidget(self.add_button)
         buttons.addWidget(self.move_button)
         layout.addLayout(buttons)
-        controller.subscribe_document(lambda _change=None: self.refresh())
+        controller.subscribe_document(self._document_changed)
         controller.selection.subscribe(lambda _ids: self._sync_buttons())
         self.refresh()
 
@@ -43,6 +152,7 @@ class LayerPanel(QtWidgets.QGroupBox):
         self._refreshing = True
         try:
             self.tree.clear()
+            self._layer_rows = []
             layers = sorted(
                 self.controller.document.layers_by_id.values(),
                 key=lambda layer: (layer.order, layer.name.lower(), layer.id),
@@ -107,17 +217,20 @@ class LayerPanel(QtWidgets.QGroupBox):
                 layer_ids = tuple(str(value.id) for value in layer_group)
                 item = QtWidgets.QTreeWidgetItem(self.tree)
                 item.setData(0, role, layer_ids)
-                item.setText(1, layer.name)
+                item.setText(1, translate_text(layer.name))
                 if len(layer_group) > 1:
                     item.setToolTip(
                         1,
-                        "Camada CAM consolidada (%d origens importadas)" % len(layer_group),
+                        translate_text(
+                            "Camada CAM consolidada (%d origens importadas)"
+                            % len(layer_group)
+                        ),
                     )
                 active = QtWidgets.QRadioButton(self.tree)
                 active.setChecked(
                     self.controller.document.active_layer_id in layer_ids
                 )
-                active.setToolTip("Usar para novos vetores")
+                active.setToolTip(translate_text("Usar para novos vetores"))
                 active.toggled.connect(
                     lambda checked, values=layer_ids: self._set_active(values[0])
                     if checked else None
@@ -135,9 +248,43 @@ class LayerPanel(QtWidgets.QGroupBox):
                     lambda checked, values=layer_ids: self._set_locked(values, checked)
                 )
                 self.tree.setItemWidget(item, 3, locked)
+                self._layer_rows.append(
+                    (item, layer_ids, active, visible, locked)
+                )
             self.tree.resizeColumnToContents(0)
             self.tree.resizeColumnToContents(2)
             self.tree.resizeColumnToContents(3)
+        finally:
+            self._refreshing = False
+        self._sync_buttons()
+
+    def _document_changed(self, change_set=None):
+        # Checkbox commands notify synchronously. Reuse their widgets instead
+        # of clearing/recreating the complete tree on every hide/show click.
+        if self._direct_control_update and change_set is not None:
+            self._sync_layer_controls()
+            return
+        self.refresh()
+
+    def _sync_layer_controls(self):
+        layers_by_id = self.controller.document.layers_by_id
+        self._refreshing = True
+        try:
+            for item, layer_ids, active, visible, locked in self._layer_rows:
+                layers = [layers_by_id.get(layer_id) for layer_id in layer_ids]
+                if not layers or any(layer is None for layer in layers):
+                    self.refresh()
+                    return
+                item.setText(1, translate_text(layers[0].name))
+                controls = (
+                    (active, self.controller.document.active_layer_id in layer_ids),
+                    (visible, all(bool(layer.visible) for layer in layers)),
+                    (locked, all(bool(layer.locked) for layer in layers)),
+                )
+                for control, checked in controls:
+                    previous = control.blockSignals(True)
+                    control.setChecked(checked)
+                    control.blockSignals(previous)
         finally:
             self._refreshing = False
         self._sync_buttons()
@@ -159,8 +306,11 @@ class LayerPanel(QtWidgets.QGroupBox):
         if self._refreshing:
             return
         layer_ids = layer_id if isinstance(layer_id, (tuple, list)) else (layer_id,)
-        for value in layer_ids:
-            self.controller.update_layer(value, visible=bool(visible))
+        self._direct_control_update = True
+        try:
+            self.controller.update_layers(layer_ids, visible=bool(visible))
+        finally:
+            self._direct_control_update = False
 
     def _set_locked(self, layer_id, locked):
         if self._refreshing:
@@ -170,8 +320,11 @@ class LayerPanel(QtWidgets.QGroupBox):
             self.message.emit("Ative outra camada antes de bloquear esta.")
             self.refresh()
             return
-        for value in layer_ids:
-            self.controller.update_layer(value, locked=bool(locked))
+        self._direct_control_update = True
+        try:
+            self.controller.update_layers(layer_ids, locked=bool(locked))
+        finally:
+            self._direct_control_update = False
 
     def _add_layer(self):
         self.controller.add_layer()
@@ -185,7 +338,148 @@ class LayerPanel(QtWidgets.QGroupBox):
         self.move_button.setEnabled(bool(self.controller.selection.ids))
 
 
-class ExactPropertiesPanel(QtWidgets.QGroupBox):
+class SheetPanel(CollapsibleGroupBox):
+    """Select one physical/virtual sheet and expose its local XY origin."""
+
+    sheetSelected = Signal(int, object)
+    fitRequested = Signal(object)
+
+    def __init__(self, controller, parent=None):
+        super(SheetPanel, self).__init__("Chapas", parent)
+        self.controller = controller
+        self._refreshing = False
+        self._bounds = ()
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(6, 8, 6, 6)
+        root.setSpacing(4)
+        self.list = QtWidgets.QListWidget(self)
+        self.list.setObjectName("sheetList")
+        self.list.setMinimumHeight(58)
+        self.list.setMaximumHeight(112)
+        self.list.setToolTip(
+            "Selecione a chapa ativa; as coordenadas passam a usar o canto inferior esquerdo dela como X0 Y0."
+        )
+        self.list.itemSelectionChanged.connect(self._selection_changed)
+        root.addWidget(self.list)
+        self.origin_label = QtWidgets.QLabel(
+            "Origem local da chapa: X0  Y0", self
+        )
+        self.origin_label.setWordWrap(True)
+        root.addWidget(self.origin_label)
+        self.fit_button = QtWidgets.QPushButton("Enquadrar chapa", self)
+        self.fit_button.clicked.connect(self._fit_current)
+        root.addWidget(self.fit_button)
+        controller.subscribe_document(lambda _change=None: self.refresh())
+        self.refresh()
+
+    @staticmethod
+    def _normalized_bounds(value):
+        try:
+            min_x, min_y, max_x, max_y = map(float, value)
+        except Exception:
+            return None
+        if max_x <= min_x or max_y <= min_y:
+            return None
+        return (min_x, min_y, max_x, max_y)
+
+    def document_bounds(self):
+        document = self.controller.document
+        metadata_values = tuple(
+            (getattr(document, "metadata", {}) or {}).get(
+                "organization_sheet_bounds", ()
+            )
+            or ()
+        )
+        bounds = tuple(
+            normalized
+            for normalized in (
+                self._normalized_bounds(value) for value in metadata_values
+            )
+            if normalized is not None
+        )
+        if bounds:
+            return bounds
+        work_area = getattr(document, "work_area", None)
+        if work_area is None:
+            return ()
+        return (
+            (
+                float(work_area.min_x),
+                float(work_area.min_y),
+                float(work_area.max_x),
+                float(work_area.max_y),
+            ),
+        )
+
+    def current_index(self):
+        row = self.list.currentRow()
+        return row if 0 <= row < len(self._bounds) else -1
+
+    def current_bounds(self):
+        index = self.current_index()
+        return self._bounds[index] if index >= 0 else None
+
+    def refresh(self):
+        previous = self.current_index()
+        self._bounds = self.document_bounds()
+        self._refreshing = True
+        try:
+            self.list.clear()
+            for index, bounds in enumerate(self._bounds, start=1):
+                width = bounds[2] - bounds[0]
+                height = bounds[3] - bounds[1]
+                item = QtWidgets.QListWidgetItem(
+                    translate_text("Chapa %02d  —  %.1f × %.1f mm")
+                    % (index, width, height),
+                    self.list,
+                )
+                item.setData(
+                    qt_enum(QtCore.Qt, "UserRole", "ItemDataRole"),
+                    index - 1,
+                )
+            if self._bounds:
+                self.list.setCurrentRow(
+                    previous if 0 <= previous < len(self._bounds) else 0
+                )
+        finally:
+            self._refreshing = False
+        self.fit_button.setEnabled(bool(self._bounds))
+        self._emit_current()
+
+    def select_sheet_for_point(self, x, y):
+        x, y = float(x), float(y)
+        for index, bounds in enumerate(self._bounds):
+            if (
+                bounds[0] - 1.0e-9 <= x <= bounds[2] + 1.0e-9
+                and bounds[1] - 1.0e-9 <= y <= bounds[3] + 1.0e-9
+            ):
+                if self.list.currentRow() != index:
+                    self.list.setCurrentRow(index)
+                return index
+        return -1
+
+    def _selection_changed(self):
+        if not self._refreshing:
+            self._emit_current()
+
+    def _emit_current(self):
+        bounds = self.current_bounds()
+        if bounds is None:
+            self.origin_label.setText(translate_text("Nenhuma chapa configurada."))
+            return
+        self.origin_label.setText(
+            translate_text("Origem local: X0 Y0  (global %.1f, %.1f)")
+            % (bounds[0], bounds[1])
+        )
+        self.sheetSelected.emit(self.current_index(), bounds)
+
+    def _fit_current(self):
+        bounds = self.current_bounds()
+        if bounds is not None:
+            self.fitRequested.emit(bounds)
+
+
+class ExactPropertiesPanel(CollapsibleGroupBox):
     message = Signal(str)
 
     def __init__(self, controller, parent=None):
@@ -194,6 +488,7 @@ class ExactPropertiesPanel(QtWidgets.QGroupBox):
         self._bounds = None
         self._syncing = False
         self._dimension_driver = "width"
+        self._coordinate_origin = Vec2(0.0, 0.0)
         form = QtWidgets.QFormLayout(self)
         form.setContentsMargins(6, 8, 6, 6)
         self.x_field = self._field()
@@ -215,6 +510,25 @@ class ExactPropertiesPanel(QtWidgets.QGroupBox):
             "define a outra. Desmarcado permite medidas independentes."
         )
         form.addRow("", self.keep_ratio)
+
+        self.scale_percent_field = self._field(minimum=0.01)
+        self.scale_percent_field.setRange(0.01, 100000.0)
+        self.scale_percent_field.setValue(100.0)
+        self.scale_percent_field.setSuffix(" %")
+        self.scale_percent_field.setToolTip(
+            "Escala toda a seleção de forma uniforme pelo centro. 100% mantém "
+            "o tamanho atual; 50% reduz à metade; 200% dobra."
+        )
+        self.apply_scale_button = QtWidgets.QPushButton("Aplicar escala", self)
+        self.apply_scale_button.setToolTip(
+            "Aplica a porcentagem como uma única alteração com Undo."
+        )
+        self.apply_scale_button.clicked.connect(self.apply_scale)
+        scale_row = QtWidgets.QHBoxLayout()
+        scale_row.setContentsMargins(0, 0, 0, 0)
+        scale_row.addWidget(self.scale_percent_field, 1)
+        scale_row.addWidget(self.apply_scale_button)
+        form.addRow("Escala uniforme (%)", scale_row)
 
         self.primitive_box = QtWidgets.QGroupBox("Propriedades da forma", self)
         primitive_form = QtWidgets.QFormLayout(self.primitive_box)
@@ -328,6 +642,8 @@ class ExactPropertiesPanel(QtWidgets.QGroupBox):
             self.height_field,
             self.keep_ratio,
             self.apply_button,
+            self.scale_percent_field,
+            self.apply_scale_button,
         ):
             widget.setEnabled(enabled)
         if not enabled:
@@ -359,10 +675,11 @@ class ExactPropertiesPanel(QtWidgets.QGroupBox):
         self._syncing = True
         for widget in widgets:
             widget.blockSignals(True)
-        self.x_field.setValue(bounds.min_x)
-        self.y_field.setValue(bounds.min_y)
+        self.x_field.setValue(bounds.min_x - self._coordinate_origin.x)
+        self.y_field.setValue(bounds.min_y - self._coordinate_origin.y)
         self.width_field.setValue(bounds.width)
         self.height_field.setValue(bounds.height)
+        self.scale_percent_field.setValue(100.0)
         self.width_field.setEnabled(bounds.width > 1.0e-12)
         self.height_field.setEnabled(bounds.height > 1.0e-12)
         is_circle = isinstance(primitive, CircleEntity)
@@ -397,6 +714,12 @@ class ExactPropertiesPanel(QtWidgets.QGroupBox):
         self._set_row_visible(self.height_label, self.height_field, visible)
         self.keep_ratio.setVisible(bool(visible))
 
+    def set_coordinate_origin(self, x, y):
+        """Present global document geometry in one sheet-local coordinate frame."""
+
+        self._coordinate_origin = Vec2(float(x), float(y))
+        self.refresh()
+
     def apply(self):
         try:
             entities = [
@@ -411,8 +734,10 @@ class ExactPropertiesPanel(QtWidgets.QGroupBox):
                     replacement,
                     center=replacement.center
                     + Vec2(
-                        self.x_field.value() - replacement_bounds.min_x,
-                        self.y_field.value() - replacement_bounds.min_y,
+                        self.x_field.value() + self._coordinate_origin.x
+                        - replacement_bounds.min_x,
+                        self.y_field.value() + self._coordinate_origin.y
+                        - replacement_bounds.min_y,
                     ),
                 )
                 if replacement != primitive:
@@ -429,8 +754,10 @@ class ExactPropertiesPanel(QtWidgets.QGroupBox):
                     replacement,
                     center=replacement.center
                     + Vec2(
-                        self.x_field.value() - replacement_bounds.min_x,
-                        self.y_field.value() - replacement_bounds.min_y,
+                        self.x_field.value() + self._coordinate_origin.x
+                        - replacement_bounds.min_x,
+                        self.y_field.value() + self._coordinate_origin.y
+                        - replacement_bounds.min_y,
                     ),
                 )
                 if replacement != primitive:
@@ -452,8 +779,8 @@ class ExactPropertiesPanel(QtWidgets.QGroupBox):
                         height = width * bounds.height / bounds.width
                         self.height_field.setValue(height)
                 self.controller.set_selection_bounds(
-                    self.x_field.value(),
-                    self.y_field.value(),
+                    self.x_field.value() + self._coordinate_origin.x,
+                    self.y_field.value() + self._coordinate_origin.y,
                     width,
                     height,
                     preserve_ratio=False,
@@ -462,8 +789,17 @@ class ExactPropertiesPanel(QtWidgets.QGroupBox):
             self.message.emit("Não foi possível aplicar as medidas: %s" % error)
         self.refresh()
 
+    def apply_scale(self):
+        try:
+            self.controller.scale_selection_percent(
+                self.scale_percent_field.value()
+            )
+        except Exception as error:
+            self.message.emit("Não foi possível aplicar a escala: %s" % error)
+        self.refresh()
 
-class TransformPanel(QtWidgets.QGroupBox):
+
+class TransformPanel(CollapsibleGroupBox):
     """Compact production transforms; every button commits one command."""
 
     message = Signal(str)
@@ -623,7 +959,7 @@ class TransformPanel(QtWidgets.QGroupBox):
         self.array_button.setEnabled(count >= 1)
 
 
-class ModifierParametersPanel(QtWidgets.QGroupBox):
+class ModifierParametersPanel(CollapsibleGroupBox):
     """Live parameters consumed by preview-first modifier tools."""
 
     parametersChanged = Signal(object)
@@ -746,7 +1082,7 @@ class ModifierParametersPanel(QtWidgets.QGroupBox):
         self.apply_automatic_button.setEnabled(bool(available))
 
 
-class PiecesPanel(QtWidgets.QGroupBox):
+class PiecesPanel(CollapsibleGroupBox):
     """Piece metadata editor; inner contours are never listed as pieces."""
 
     pieceSelected = Signal(str)
@@ -836,7 +1172,8 @@ class PiecesPanel(QtWidgets.QGroupBox):
                     qt_enum(QtCore.Qt, "UserRole", "ItemDataRole"), piece.id
                 )
                 item.setToolTip(
-                    "1 externo + %d interno(s)" % len(piece.inner_path_ids)
+                    "1 externo + %d interno(s) + %d marcação(ões)"
+                    % (len(piece.inner_path_ids), len(piece.marking_path_ids))
                 )
                 if piece.id == current_id:
                     target_row = row
@@ -887,8 +1224,8 @@ class PiecesPanel(QtWidgets.QGroupBox):
         index = self.rotation_mode.findData(mode)
         self.rotation_mode.setCurrentIndex(max(0, index))
         self.summary_label.setText(
-            "Contorno externo + %d furo(s)/recorte(s) interno(s)."
-            % len(piece.inner_path_ids)
+            "Contorno externo + %d furo(s)/recorte(s) + %d marcação(ões)."
+            % (len(piece.inner_path_ids), len(piece.marking_path_ids))
         )
 
     def apply(self):
@@ -914,9 +1251,11 @@ class PiecesPanel(QtWidgets.QGroupBox):
 
 
 __all__ = [
+    "CollapsibleGroupBox",
     "ExactPropertiesPanel",
     "LayerPanel",
     "ModifierParametersPanel",
     "PiecesPanel",
+    "SheetPanel",
     "TransformPanel",
 ]

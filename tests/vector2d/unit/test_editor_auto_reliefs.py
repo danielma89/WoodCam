@@ -70,6 +70,17 @@ class EditorAutomaticReliefTests(unittest.TestCase):
         controller.undo()
         self.assertEqual(document.entities_by_id, before)
 
+    def test_stale_partial_selection_does_not_limit_classified_job(self):
+        document = VectorDocument.create_default()
+        outer, inner = fixture(document)
+        controller = EditorController(document)
+        controller.selection.replace((inner.id,))
+
+        paths, roles = controller.automatic_relief_scope()
+
+        self.assertEqual({path.id for path in paths}, {outer.id, inner.id})
+        self.assertEqual(roles, {outer.id: "outer", inner.id: "inner"})
+
 
 if __name__ == "__main__":
     unittest.main()

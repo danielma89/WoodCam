@@ -18,16 +18,28 @@ import time
 from array import array
 from pathlib import Path
 
-from presets import DEFAULT_PRESETS, MATERIAL_PRESETS, TOOL_PRESETS
+from presets import (
+    DEFAULT_PRESETS,
+    MATERIAL_PRESETS,
+    TOOL_PRESETS,
+    normalize_work_area_presets,
+)
 from geometry_reader import get_selected_geometry, _extract_geometry_from_object
 from operations import (
     CUT_SIDE_INSIDE,
     CUT_SIDE_ON_LINE,
     CUT_SIDE_OUTSIDE,
     build_contour_cut_stage,
+    build_common_line_cut_job,
+    build_global_cut_plan_moves,
     build_machining_stages,
     build_pocket_stage,
     split_nested_contours,
+    compensated_polygon,
+    external_compensation_detail_loss,
+    generate_depth_steps,
+    _last_xy_from_moves,
+    _orient_contour_for_cut,
     _with_configured_start,
 )
 from gcode_writer import HEADER_TEMPLATE, build_gcode, save_gcode_file
@@ -77,25 +89,44 @@ try:
         VectorDocument,
         WorkArea,
         TransformEntitiesCommand,
+        entity_is_remnant_cut,
         serialize_document,
         validate_document,
         exact_duplicate_entity_groups,
         redundant_open_overline_entity_ids,
     )
     from woodcam_editor.presentation.widget import Editor2DWidget
+    from woodcam_editor.presentation.icons import tool_icon
+    from woodcam_editor.presentation.i18n import register_widget, translate_text
     from woodcam_editor.presentation.workflows import ValidationReportDialog
-    from woodcam_editor.application import CommandExecutionCancelled
-    from woodcam_editor.application import prepare_import_batch
+    from woodcam_editor.geometry.polygon_offset import round_offset_closed_polygon
+    from woodcam_editor.application import (
+        CommandExecutionCancelled,
+        CommonLineContour,
+        GlobalCutPlanError,
+        OwnedContour,
+        build_global_cut_plan,
+        build_common_line_cut_trails,
+        nesting_rotation_angles,
+        plan_common_line_cut,
+        prepare_import_batch,
+    )
     from woodcam_editor.adapters.freecad_store import FreeCADDocumentStore
     from woodcam_editor.adapters.freecad_commands import FreeCADCommandSession
     from woodcam_editor.adapters.woodcam_geometry import (
         GeometryAdapterError,
         document_to_woodcam_geometry,
+        entity_points as vector_entity_points,
     )
     from woodcam_editor.application.document_store import StoredDocumentCorruptError
     from woodcam_editor.application.piece_organizer import (
+        OrganizationSearchCancelled,
         classify_document_pieces,
+        filter_pieces_for_selection,
         organize_pieces,
+        organization_placement_transform,
+        organization_result_score,
+        suggest_rectangular_remnant_cuts,
     )
     from woodcam_editor.importers.sketch import import_sketch
 
@@ -110,6 +141,221 @@ except Exception:
 
 WOODCAM_PARAMETER_PATH = "User parameter:BaseApp/Preferences/WoodCAM2D"
 _USE_ACTIVE_FREECAD_DOCUMENT = object()
+
+
+_ORGANIZATION_SEARCH_STAGES = {
+    "fast": (
+        ("Resposta rápida", (4, 0, 1, 1)),
+    ),
+    "balanced": (
+        ("Resposta rápida", (4, 0, 1, 1)),
+        ("Busca equilibrada", (48, 0, 1, 1)),
+        ("Refino profundo", (192, 0, 1, 1)),
+        ("Refino adicional", (48, 6, 4, 3)),
+    ),
+    "thorough": (
+        ("Resposta rápida", (4, 0, 1, 1)),
+        ("Busca equilibrada", (48, 0, 1, 1)),
+        ("Refino profundo", (192, 0, 1, 1)),
+        ("Refino adicional", (384, 0, 1, 1)),
+        ("Refino máximo", (96, 14, 8, 5)),
+    ),
+}
+
+
+class _OrganizationProgressDialog(QtWidgets.QDialog):
+    """Stable non-modal nesting progress window.
+
+    ``QProgressDialog`` recomputes its native layout whenever ``setLabelText``
+    receives a wider message.  Inside FreeCAD that left an unpainted/black
+    strip beside the controls on some styles.  This small explicit layout has
+    the compatible methods used by the nesting session without that automatic
+    window resizing.
+    """
+
+    canceled = QtCore.Signal()
+
+    def __init__(self, label, cancel_text, minimum, maximum, parent=None):
+        super(_OrganizationProgressDialog, self).__init__(parent)
+        self._cancel_requested = False
+        self._finishing = False
+        self.setObjectName("vectorEditorNestingProgress")
+        self.setWindowTitle(translate_text("Organização progressiva"))
+        self.setFixedWidth(440)
+        self.setAutoFillBackground(True)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+        self._label = QtWidgets.QLabel(str(label), self)
+        self._label.setObjectName("vectorEditorNestingProgressLabel")
+        self._label.setWordWrap(True)
+        line_spacing = QtGui.QFontMetrics(self._label.font()).lineSpacing()
+        self._label.setMinimumHeight(line_spacing * 3 + 6)
+        layout.addWidget(self._label)
+
+        self._bar = QtWidgets.QProgressBar(self)
+        self._bar.setObjectName("vectorEditorNestingProgressBar")
+        self._bar.setRange(int(minimum), int(maximum))
+        layout.addWidget(self._bar)
+
+        self._cancel_button = QtWidgets.QPushButton(str(cancel_text), self)
+        self._cancel_button.setObjectName("vectorEditorNestingCancelButton")
+        self._cancel_button.clicked.connect(self._request_cancel)
+        layout.addWidget(self._cancel_button, 0, QtCore.Qt.AlignHCenter)
+
+    def _request_cancel(self):
+        if self._cancel_requested:
+            return
+        self._cancel_requested = True
+        self._cancel_button.setEnabled(False)
+        self.canceled.emit()
+
+    def closeEvent(self, event):
+        if not self._finishing:
+            self._request_cancel()
+        super(_OrganizationProgressDialog, self).closeEvent(event)
+
+    def finish(self):
+        self._finishing = True
+        self.close()
+
+    def maximum(self):
+        return self._bar.maximum()
+
+    def minimum(self):
+        return self._bar.minimum()
+
+    def value(self):
+        return self._bar.value()
+
+    def setValue(self, value):
+        self._bar.setValue(int(value))
+
+    def setLabelText(self, text):
+        self._label.setText(str(text))
+        # The longest status uses three wrapped lines.  Re-activate the layout
+        # after every update so Qt may grow the height while the fixed width
+        # remains unchanged.
+        current_layout = self.layout()
+        if current_layout is not None:
+            current_layout.invalidate()
+            current_layout.activate()
+        self.adjustSize()
+
+    def labelText(self):
+        return self._label.text()
+
+
+class _OrganizationSearchWorker(QtCore.QObject):
+    """Run pure nesting attempts outside the GUI thread.
+
+    The first stage is always allowed to finish so the operator gets a usable
+    preview. Later stages observe the real deadline and QThread interruption.
+    """
+
+    resultReady = QtCore.Signal(object, object, str, float, int)
+    stageStarted = QtCore.Signal(object, str, int, int)
+    finished = QtCore.Signal(object, str, float, int)
+    failed = QtCore.Signal(object, str)
+
+    def __init__(
+        self,
+        pieces,
+        bounds,
+        spacing,
+        rotations,
+        search_mode,
+        time_budget_seconds,
+        token,
+        toolpath_offset=0.0,
+    ):
+        super(_OrganizationSearchWorker, self).__init__()
+        self._pieces = tuple(pieces)
+        self._bounds = tuple(bounds)
+        self._spacing = float(spacing)
+        self._rotations = dict(rotations)
+        self._search_mode = str(search_mode)
+        self._time_budget_seconds = max(1.0, float(time_budget_seconds))
+        self._token = token
+        self._toolpath_offset = max(0.0, float(toolpath_offset))
+        self._deadline = None
+        self._has_result = False
+
+    def _stop_requested(self):
+        thread = QtCore.QThread.currentThread()
+        if thread.isInterruptionRequested():
+            return True
+        return bool(
+            self._has_result
+            and self._deadline is not None
+            and time.monotonic() >= self._deadline
+        )
+
+    @QtCore.Slot()
+    def run(self):
+        started = time.monotonic()
+        self._deadline = started + self._time_budget_seconds
+        stages = _ORGANIZATION_SEARCH_STAGES.get(
+            self._search_mode,
+            _ORGANIZATION_SEARCH_STAGES["balanced"],
+        )
+        best = None
+        total_layouts = 0
+        completed_stages = 0
+        reason = "completed"
+        try:
+            for index, (label, budget) in enumerate(stages, start=1):
+                if self._stop_requested():
+                    reason = (
+                        "cancelled"
+                        if QtCore.QThread.currentThread().isInterruptionRequested()
+                        else "time"
+                    )
+                    break
+                self.stageStarted.emit(self._token, label, index, len(stages))
+                try:
+                    result = organize_pieces(
+                        self._pieces,
+                        self._bounds,
+                        spacing=self._spacing,
+                        rotations=self._rotations,
+                        search_mode="fast",
+                        search_budget=budget,
+                        stop_requested=self._stop_requested,
+                        toolpath_offset=self._toolpath_offset,
+                    )
+                except OrganizationSearchCancelled:
+                    reason = (
+                        "cancelled"
+                        if QtCore.QThread.currentThread().isInterruptionRequested()
+                        else "time"
+                    )
+                    break
+                completed_stages += 1
+                total_layouts += int(result.evaluated_layouts)
+                result.evaluated_layouts = total_layouts
+                self._has_result = True
+                if best is None or organization_result_score(result) < organization_result_score(best):
+                    best = result
+                    self.resultReady.emit(
+                        self._token,
+                        result,
+                        label,
+                        time.monotonic() - started,
+                        completed_stages,
+                    )
+            else:
+                reason = "exhausted"
+        except Exception as error:
+            reason = "failed"
+            self.failed.emit(self._token, str(error))
+        self.finished.emit(
+            self._token,
+            reason,
+            time.monotonic() - started,
+            completed_stages,
+        )
 
 
 def _trim_transparent_pixmap(pixmap, padding=0):
@@ -214,6 +460,30 @@ OPERATION_MODE_BY_TAB_TITLE = {
     "Acabamento 3D": "finish3d",
 }
 ACTION_TAB_TITLE = "Simulação e Salvar"
+SIMULATION_SPEED_STEPS = (
+    0.10,
+    0.25,
+    0.50,
+    0.75,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    5.0,
+    7.5,
+    10.0,
+    15.0,
+    20.0,
+    30.0,
+    40.0,
+    50.0,
+    60.0,
+    75.0,
+    100.0,
+    125.0,
+    150.0,
+    200.0,
+)
 JOB_TYPE_LABELS = {
     "single_sided": "Face única",
     "double_sided": "Dupla face",
@@ -726,6 +996,19 @@ class OperationDiagram(QtWidgets.QWidget):
         painter.drawText(96, 34, "Z SEGURO")
         painter.setPen(self._pen("#1e3a8a", 1.0))
         painter.drawText(12, 101, "ORIGEM E SEGURANÇA")
+
+
+class SemanticSetupIcon(QtWidgets.QLabel):
+    """Compact licensed SVG icon for a setup section with no live diagram."""
+
+    def __init__(self, icon_name, parent=None):
+        super(SemanticSetupIcon, self).__init__(parent)
+        self.semantic_icon_name = str(icon_name)
+        self.setFixedSize(68, 64)
+        self.setAlignment(QtCore.Qt.AlignCenter)
+        self.setStyleSheet("background: transparent; border: none;")
+        icon = tool_icon(self.semantic_icon_name, 48)
+        self.setPixmap(icon.pixmap(QtCore.QSize(48, 48)))
 
 
 class MiniSetupDiagram(QtWidgets.QWidget):
@@ -1949,8 +2232,129 @@ class SimulationControlDialog(QtWidgets.QDialog):
         self.owner.show_config_dialog()
 
 
+class LeftOperationTabWidget(QtWidgets.QTabWidget):
+    """Operation pages with a compact control above the left tab list.
+
+    The tab bar deliberately ends after its last item.  Keeping the unused
+    area transparent prevents the navigation from looking like part of the
+    current page while still reserving one predictable row for the window
+    attach/detach control.
+    """
+
+    _HEADER_HEIGHT = 38
+
+    def __init__(self, parent=None):
+        super(LeftOperationTabWidget, self).__init__(parent)
+        self._header_action_widget = None
+        self._tab_action_page = None
+        self._tab_action_widget = None
+
+    def setHeaderActionWidget(self, widget):
+        self._header_action_widget = widget
+        if widget is not None:
+            widget.setParent(self)
+            widget.show()
+        self._position_sidebar_elements()
+
+    def headerActionWidget(self):
+        return self._header_action_widget
+
+    def setTabActionWidget(self, page, widget):
+        self._tab_action_page = page
+        self._tab_action_widget = widget
+        if widget is not None:
+            widget.setParent(self)
+            widget.show()
+        tab_bar = self.tabBar()
+        tab_bar._woodcam_action_page = page
+        tab_bar._woodcam_action_width = (
+            widget.width() + 8 if widget is not None else 0
+        )
+        tab_bar.updateGeometry()
+        self._position_sidebar_elements()
+
+    def tabActionWidget(self):
+        return self._tab_action_widget
+
+    def _position_sidebar_elements(self):
+        tab_bar = self.tabBar()
+        tab_geometry = tab_bar.geometry()
+        widget = self._header_action_widget
+        if widget is None:
+            return
+        x_position = max(
+            4,
+            tab_geometry.left()
+            + (tab_geometry.width() - widget.width()) // 2,
+        )
+        y_position = max(4, (self._HEADER_HEIGHT - widget.height()) // 2)
+        widget.move(x_position, y_position)
+        widget.raise_()
+
+        tab_widget = self._tab_action_widget
+        page = self._tab_action_page
+        tab_index = self.indexOf(page) if page is not None else -1
+        if tab_widget is not None and tab_index >= 0:
+            visual_rect = tab_bar.visualTabRect(tab_index)
+            top_left = tab_bar.mapTo(self, visual_rect.topLeft())
+            tab_widget.move(
+                top_left.x() + visual_rect.width() - tab_widget.width() - 5,
+                top_left.y()
+                + max(0, (visual_rect.height() - tab_widget.height()) // 2),
+            )
+            tab_widget.raise_()
+
+    def resizeEvent(self, event):
+        super(LeftOperationTabWidget, self).resizeEvent(event)
+        self._position_sidebar_elements()
+
+    def showEvent(self, event):
+        super(LeftOperationTabWidget, self).showEvent(event)
+        self._position_sidebar_elements()
+
+
 class CompactOperationTabBar(QtWidgets.QTabBar):
-    """Keep icon-only tabs as narrow as their artwork."""
+    """Draw the operation selector at the left with horizontal labels.
+
+    Qt rotates the label of a regular ``West`` tab by 90 degrees.  The CAM
+    operations are navigation, not document tabs, so they remain much easier
+    to scan as a left-hand list.  This class keeps QTabBar as the single source
+    of selection, icons, translated text and keyboard/accessibility state; it
+    only changes its size hints and label painting.
+    """
+
+    _HORIZONTAL_MARGIN = 12
+    _ICON_TEXT_GAP = 8
+    _ROW_HEIGHT = 38
+    _HEADER_HEIGHT = LeftOperationTabWidget._HEADER_HEIGHT
+    _ENABLED_TEXT_COLOR = "#111111"
+
+    def _uses_left_horizontal_layout(self):
+        return self.shape() in (
+            QtWidgets.QTabBar.RoundedWest,
+            QtWidgets.QTabBar.TriangularWest,
+        )
+
+    def _is_header_pointer_event(self, event):
+        if not self._uses_left_horizontal_layout():
+            return False
+        try:
+            position = event.position().toPoint()
+        except AttributeError:  # PySide2 / Qt 5
+            position = event.pos()
+        return position.y() < self._HEADER_HEIGHT
+
+    def mousePressEvent(self, event):
+        if self._is_header_pointer_event(event):
+            event.accept()
+            return
+        super(CompactOperationTabBar, self).mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._is_header_pointer_event(event):
+            event.accept()
+            return
+        super(CompactOperationTabBar, self).mouseReleaseEvent(event)
 
     def _icon_paint_rect(self, index):
         """Return a rect centered in the whole tab, not in Qt's text area."""
@@ -1964,6 +2368,30 @@ class CompactOperationTabBar(QtWidgets.QTabBar):
         )
 
     def tabSizeHint(self, index):
+        if self._uses_left_horizontal_layout():
+            icon_size = self.iconSize()
+            text_width = 0
+            if self.tabText(index):
+                metrics = self.fontMetrics()
+                horizontal_advance = getattr(metrics, "horizontalAdvance", None)
+                if horizontal_advance is not None:
+                    text_width = horizontal_advance(self.tabText(index))
+                else:  # Qt 5 compatibility used by older FreeCAD packages.
+                    text_width = metrics.width(self.tabText(index))
+            content_width = text_width
+            if not self.tabIcon(index).isNull():
+                content_width += icon_size.width()
+                if text_width:
+                    content_width += self._ICON_TEXT_GAP
+            content_width += self._action_width_for_index(index)
+            row_height = max(self._ROW_HEIGHT, icon_size.height() + 12)
+            if index == 0:
+                row_height += self._HEADER_HEIGHT
+            return QtCore.QSize(
+                content_width + (2 * self._HORIZONTAL_MARGIN),
+                row_height,
+            )
+
         size = super(CompactOperationTabBar, self).tabSizeHint(index)
         if self.tabText(index):
             return size
@@ -1975,12 +2403,97 @@ class CompactOperationTabBar(QtWidgets.QTabBar):
             max(size.height(), icon_size.height() + 10),
         )
 
+    def visualTabRect(self, index):
+        """Rect actually painted; tab zero reserves its top for the header."""
+
+        rect = QtCore.QRect(self.tabRect(index))
+        if self._uses_left_horizontal_layout() and index == 0:
+            rect.setTop(rect.top() + self._HEADER_HEIGHT)
+        return rect
+
+    def _action_width_for_index(self, index):
+        page = getattr(self, "_woodcam_action_page", None)
+        owner = self.parentWidget()
+        if page is None or owner is None or not hasattr(owner, "indexOf"):
+            return 0
+        try:
+            if owner.indexOf(page) == int(index):
+                return int(getattr(self, "_woodcam_action_width", 0) or 0)
+        except RuntimeError:
+            pass
+        return 0
+
     def paintEvent(self, event):
-        """Paint icon-only tabs without Qt's invisible text reservation."""
+        """Paint left labels horizontally and compact icon-only top tabs."""
         painter = QtWidgets.QStylePainter(self)
         for index in range(self.count()):
             option = QtWidgets.QStyleOptionTab()
             self.initStyleOption(option, index)
+            if self._uses_left_horizontal_layout():
+                option.rect = self.visualTabRect(index)
+                painter.drawControl(QtWidgets.QStyle.CE_TabBarTabShape, option)
+                label_rect = option.rect.adjusted(
+                    self._HORIZONTAL_MARGIN,
+                    0,
+                    -self._HORIZONTAL_MARGIN
+                    - self._action_width_for_index(index),
+                    0,
+                )
+                icon = self.tabIcon(index)
+                if not icon.isNull():
+                    icon_size = icon.actualSize(self.iconSize())
+                    icon_rect = QtCore.QRect(
+                        label_rect.left(),
+                        label_rect.center().y() - icon_size.height() // 2,
+                        icon_size.width(),
+                        icon_size.height(),
+                    )
+                    mode = (
+                        QtGui.QIcon.Normal
+                        if self.isTabEnabled(index)
+                        else QtGui.QIcon.Disabled
+                    )
+                    state = (
+                        QtGui.QIcon.On
+                        if index == self.currentIndex()
+                        else QtGui.QIcon.Off
+                    )
+                    icon.paint(
+                        painter,
+                        icon_rect,
+                        QtCore.Qt.AlignCenter,
+                        mode,
+                        state,
+                    )
+                    label_rect.setLeft(
+                        icon_rect.right() + 1 + self._ICON_TEXT_GAP
+                    )
+
+                if not self.isTabEnabled(index):
+                    text_color = option.palette.color(
+                        QtGui.QPalette.Disabled,
+                        QtGui.QPalette.WindowText,
+                    )
+                else:
+                    # O tema global do FreeCAD pode definir WindowText como
+                    # branco mesmo sobre a navegação cinza-clara. Isso fazia
+                    # as operações parecerem desabilitadas e reduzia bastante
+                    # o contraste. A barra lateral tem fundo claro próprio,
+                    # portanto seu texto habilitado também deve ser estável e
+                    # independente do tema externo.
+                    text_color = QtGui.QColor(self._ENABLED_TEXT_COLOR)
+                painter.setPen(text_color)
+                text = self.fontMetrics().elidedText(
+                    self.tabText(index),
+                    QtCore.Qt.ElideRight,
+                    max(0, label_rect.width()),
+                )
+                painter.drawText(
+                    label_rect,
+                    QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
+                    text,
+                )
+                continue
             if self.tabText(index):
                 painter.drawControl(QtWidgets.QStyle.CE_TabBarTab, option)
                 continue
@@ -2020,6 +2533,11 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
 
     def __init__(self, parent=None):
         super(WoodCAM2DDialog, self).__init__(parent)
+        self._woodcam_host_parent = parent
+        self._woodcam_window_detached = parent is None
+        self._woodcam_attached_position = None
+        self._woodcam_attached_size = None
+        self._woodcam_detached_size = None
         self.setObjectName("WoodCAM2DDialog")
         self.setWindowTitle("WoodCAM 2D - CNC Marcenaria")
         if parent is not None:
@@ -2041,10 +2559,17 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         except Exception:
             pass
         self.setSizeGripEnabled(False)
-        self.setAutoFillBackground(False)
+        window_palette = self.palette()
+        window_palette.setColor(
+            QtGui.QPalette.Window,
+            QtGui.QColor("#e6ebf0"),
+        )
+        self.setPalette(window_palette)
+        self.setAutoFillBackground(True)
         try:
-            self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
-            self.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+            self.setAttribute(QtCore.Qt.WA_TranslucentBackground, False)
+            self.setAttribute(QtCore.Qt.WA_OpaquePaintEvent, False)
+            self.setAttribute(QtCore.Qt.WA_StyledBackground, False)
         except Exception:
             pass
         self.setMinimumWidth(680)
@@ -2061,8 +2586,14 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         self.operation_diagrams = {}
         self.setup_diagrams = []
         self.cut_tab_positions = []
+        # Posições manuais pertencem ao contorno/operação que as criou. Elas
+        # nunca são uma preferência global reaproveitável em outra chapa.
+        self._cut_tab_positions_scope = None
+        self._cut_tab_positions_operation = None
         self._tab_marker_callback = None
         self._tab_marker_geometry = None
+        self._tab_marker_source = None
+        self._tab_marker_return_tab_index = None
         self.tool_database = self._load_tool_database()
         self.tool_order = self._load_tool_order()
         self._populating_tool_list = False
@@ -2078,6 +2609,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         self._toolpath_view_valid = False
         self._invalidating_toolpath_view = False
         self._editing_operation = None
+        self._persisting_applied_operation_order = False
         self._current_document_key = None
         self._document_tab_indices = {}
         self._drag_start_global = None
@@ -2111,12 +2643,16 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             self._refresh_setup_preview_if_possible
         )
         self._build_ui()
+        # Register after the complete dialog tree exists so the selector in
+        # the embedded Editor 2D can translate the CAM controls as well.
+        register_widget(self)
         self._vector_editor_sync_timer = QtCore.QTimer(self)
         self._vector_editor_sync_timer.setInterval(350)
         self._vector_editor_sync_timer.timeout.connect(
             self._sync_vector_editor_from_freecad_history
         )
-        self._vector_editor_sync_timer.start()
+        # ``showEvent`` starts the poller. A constructed or hidden dialog must
+        # not consume GUI-thread time in the background.
         self._enable_dialog_dragging()
         self.resize(860, 840)
 
@@ -2312,6 +2848,163 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         save_parameters = getattr(FreeCAD, "saveParameter", None)
         if callable(save_parameters):
             save_parameters()
+
+    def _load_work_area_presets(self):
+        try:
+            raw = FreeCAD.ParamGet(WOODCAM_PARAMETER_PATH).GetString(
+                "work_area_presets_json", ""
+            )
+            values = json.loads(raw) if raw else []
+        except Exception:
+            values = []
+        return normalize_work_area_presets(values)
+
+    def _persist_work_area_presets(self, values):
+        normalized = normalize_work_area_presets(values)
+        FreeCAD.ParamGet(WOODCAM_PARAMETER_PATH).SetString(
+            "work_area_presets_json",
+            json.dumps(normalized, ensure_ascii=False, separators=(",", ":")),
+        )
+        self._flush_preferences()
+        return normalized
+
+    def _refresh_work_area_preset_combo(self, select_name=None):
+        combo = getattr(self, "work_area_preset_combo", None)
+        if combo is None:
+            return
+        self._restoring_work_area_presets = True
+        try:
+            combo.clear()
+            combo.addItem(translate_text("Selecionar tamanho salvo…"), None)
+            selected_index = 0
+            for preset in self._load_work_area_presets():
+                depth_text = (
+                    " × %g" % preset["depth"] if preset["depth"] > 0.0 else ""
+                )
+                combo.addItem(
+                    "%s  —  %g × %g%s mm"
+                    % (
+                        preset["name"],
+                        preset["width"],
+                        preset["height"],
+                        depth_text,
+                    ),
+                    dict(preset),
+                )
+                if select_name and preset["name"].casefold() == str(select_name).casefold():
+                    selected_index = combo.count() - 1
+            combo.setCurrentIndex(selected_index)
+            delete_button = getattr(self, "work_area_preset_delete_button", None)
+            if delete_button is not None:
+                delete_button.setEnabled(selected_index > 0)
+        finally:
+            self._restoring_work_area_presets = False
+
+    def _save_current_work_area_preset(self):
+        try:
+            width = self._parse_float("job_width")
+            height = self._parse_float("job_height")
+            depth = self._parse_float("job_depth")
+            candidate = normalize_work_area_presets(
+                [{"name": "Área", "width": width, "height": height, "depth": depth}]
+            )
+            if not candidate:
+                raise ValueError(
+                    "Largura e altura precisam ser maiores que zero; Z não pode ser negativo."
+                )
+            proposed = "%g × %g mm" % (width, height)
+            name, accepted = QtWidgets.QInputDialog.getText(
+                self,
+                translate_text("Salvar tamanho da área"),
+                translate_text("Nome da predefinição"),
+                text=proposed,
+            )
+            name = str(name).strip()
+            if not accepted or not name:
+                return False
+            new_value = {
+                "name": name,
+                "width": width,
+                "height": height,
+                "depth": depth,
+            }
+            values = [
+                value
+                for value in self._load_work_area_presets()
+                if value["name"].casefold() != name.casefold()
+            ]
+            values.append(new_value)
+            self._persist_work_area_presets(values)
+            self._refresh_work_area_preset_combo(name)
+            return True
+        except Exception as error:
+            QtWidgets.QMessageBox.warning(
+                self,
+                translate_text("Tamanho não salvo"),
+                translate_text(str(error)),
+            )
+            return False
+
+    def _apply_work_area_preset(self, index):
+        combo = getattr(self, "work_area_preset_combo", None)
+        if (
+            combo is None
+            or getattr(self, "_restoring_work_area_presets", False)
+            or int(index) <= 0
+        ):
+            delete_button = getattr(self, "work_area_preset_delete_button", None)
+            if delete_button is not None:
+                delete_button.setEnabled(False)
+            return False
+        preset = combo.itemData(int(index))
+        values = normalize_work_area_presets([preset])
+        if not values:
+            return False
+        preset = values[0]
+        for key, value in (
+            ("job_width", preset["width"]),
+            ("job_height", preset["height"]),
+            ("job_depth", preset["depth"]),
+        ):
+            field = self.fields[key]
+            blocker = QtCore.QSignalBlocker(field)
+            field.setText(self._format_value(value))
+            del blocker
+        parameters = FreeCAD.ParamGet(WOODCAM_PARAMETER_PATH)
+        parameters.SetFloat("job_width", preset["width"])
+        parameters.SetFloat("job_height", preset["height"])
+        parameters.SetFloat("job_depth", preset["depth"])
+        self._flush_preferences()
+        self._queue_setup_preview_refresh()
+        self._vector_editor_area_edit_pending = True
+        self._vector_editor_area_edit_binding_token = getattr(
+            self, "_vector_editor_binding_token", None
+        )
+        self._vector_editor_area_edit_document = getattr(
+            self, "_vector_editor_bound_freecad_document", None
+        )
+        self._preview_vector_editor_area_from_setup()
+        self._commit_vector_editor_area_from_setup()
+        self.work_area_preset_delete_button.setEnabled(True)
+        return True
+
+    def _delete_work_area_preset(self):
+        combo = getattr(self, "work_area_preset_combo", None)
+        if combo is None or combo.currentIndex() <= 0:
+            return False
+        preset = combo.currentData()
+        values = normalize_work_area_presets([preset])
+        if not values:
+            return False
+        name = values[0]["name"]
+        remaining = [
+            value
+            for value in self._load_work_area_presets()
+            if value["name"].casefold() != name.casefold()
+        ]
+        self._persist_work_area_presets(remaining)
+        self._refresh_work_area_preset_combo()
+        return True
 
     def _fallback_tool_order(self):
         preset_index = {name: index for index, name in enumerate(TOOL_PRESETS)}
@@ -2616,7 +3309,9 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                 f"'{name}' foi salva no cadastro de fresas.",
             )
         except Exception as error:
-            QtWidgets.QMessageBox.critical(self, "Erro", str(error))
+            QtWidgets.QMessageBox.critical(
+                self, translate_text("Erro"), translate_text(str(error))
+            )
 
     def _remove_tool_from_editor(self):
         name = self.tool_editor_fields["name"].text().strip()
@@ -2744,18 +3439,37 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         outer_layout = QtWidgets.QVBoxLayout(self)
         outer_layout.setSpacing(6)
         outer_layout.setContentsMargins(8, 8, 8, 8)
-        self.setStyleSheet(
-            "QDialog#WoodCAM2DDialog { background: transparent; }"
-            "QTabWidget::pane { background: rgba(245, 245, 245, 232); }"
-        )
         self.drag_handle = DialogDragHandle(self, self)
         outer_layout.addWidget(self.drag_handle)
-        self.operation_tabs = QtWidgets.QTabWidget()
-        self.operation_tabs.setTabBar(
-            CompactOperationTabBar(self.operation_tabs)
+        self.operation_tabs = LeftOperationTabWidget()
+        self.operation_tabs.setObjectName("WoodCAMOperationTabs")
+        self.operation_tabs.setStyleSheet(
+            "QTabWidget#WoodCAMOperationTabs {"
+            "background: transparent;"
+            "}"
+            "QTabWidget#WoodCAMOperationTabs::pane {"
+            "margin-left: 10px;"
+            "border: 1px solid rgba(148, 163, 184, 150);"
+            "border-radius: 4px;"
+            "background: #f4f6f8;"
+            "}"
         )
+        operation_tab_bar = CompactOperationTabBar(self.operation_tabs)
+        operation_tab_bar.setObjectName("WoodCAMOperationTabBar")
+        self.operation_tabs.setTabBar(operation_tab_bar)
+        self.operation_tabs.setTabPosition(QtWidgets.QTabWidget.West)
         self.operation_tabs.setIconSize(QtCore.QSize(20, 20))
+        self.window_mode_button = QtWidgets.QToolButton(self.operation_tabs)
+        self.window_mode_button.setFixedSize(28, 28)
+        self.window_mode_button.setObjectName("woodcamWindowModeButton")
+        self.window_mode_button.setCheckable(True)
+        self.window_mode_button.setAccessibleName(
+            "Alternar painel ou janela do WoodCAM"
+        )
+        self.window_mode_button.clicked.connect(self._toggle_woodcam_window_mode)
+        self.operation_tabs.setHeaderActionWidget(self.window_mode_button)
         self.detach_editor_button = QtWidgets.QToolButton(self.operation_tabs)
+        self.detach_editor_button.setFixedSize(26, 26)
         self.detach_editor_button.setObjectName("detachEditor2DButton")
         self.detach_editor_button.setIcon(
             self.style().standardIcon(QtWidgets.QStyle.SP_TitleBarMaxButton)
@@ -2765,10 +3479,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             "Abrir o mesmo Editor 2D em uma janela própria"
         )
         self.detach_editor_button.clicked.connect(self._detach_vector_editor)
-        self.operation_tabs.setCornerWidget(
-            self.detach_editor_button,
-            QtCore.Qt.TopRightCorner,
-        )
+        self._update_woodcam_window_mode_button()
         outer_layout.addWidget(self.operation_tabs)
 
         cut_tab = QtWidgets.QWidget()
@@ -2833,9 +3544,53 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             "Usar profundidade de cada furo do modelo"
         )
         self.use_model_hole_depths.setChecked(True)
-        hole_depth_layout.addWidget(self.use_model_hole_depths, 2, 1, 1, 2)
+        # Row 2 belongs to the explanatory sentence created by
+        # _make_depth_group. Sharing it made both texts paint on top of each
+        # other in Qt/FreeCAD.
+        hole_depth_layout.addWidget(self.use_model_hole_depths, 3, 1, 1, 2)
         hole_layout.addWidget(hole_depth_group)
         hole_layout.addWidget(self._make_tool_group("holes"))
+
+        counterbore_group, counterbore_layout = self._make_icon_group(
+            "Rebaixo para cabeça do parafuso",
+            "pocket",
+        )
+        self.hole_counterbore_enabled = QtWidgets.QCheckBox(
+            "Criar assento maior na entrada do furo"
+        )
+        self.hole_counterbore_enabled.setToolTip(
+            "Abre um rebaixo cilíndrico raso e de fundo plano para assentar a "
+            "cabeça do parafuso. Use fresa de topo ou de compressão."
+        )
+        counterbore_layout.addWidget(
+            self.hole_counterbore_enabled,
+            0,
+            0,
+            1,
+            3,
+        )
+        self._add_operation_field(
+            counterbore_layout,
+            1,
+            "Diâmetro do rebaixo (mm)",
+            "holes",
+            "hole_counterbore_diameter",
+        )
+        self._add_operation_field(
+            counterbore_layout,
+            2,
+            "Profundidade do rebaixo (mm)",
+            "holes",
+            "hole_counterbore_depth",
+        )
+        counterbore_help = QtWidgets.QLabel(
+            "A profundidade é medida a partir da Profundidade inicial Z. "
+            "O furo principal continua até a profundidade configurada/modelada."
+        )
+        counterbore_help.setWordWrap(True)
+        counterbore_help.setStyleSheet("color: #475569;")
+        counterbore_layout.addWidget(counterbore_help, 3, 0, 1, 3)
+        hole_layout.addWidget(self._compact_group(counterbore_group))
 
         helix_group, helix_layout = self._make_icon_group(
             "Interpolação helicoidal",
@@ -3014,7 +3769,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         rough3d_layout = QtWidgets.QVBoxLayout(rough3d_tab)
         rough3d_layout.setSpacing(8)
         rough_source_group, rough_source_grid = self._make_icon_group(
-            "Modelo 3D para desbaste", "rough3d"
+            "Modelo 3D para desbaste", "icon:model_3d"
         )
         rough_source_note = QtWidgets.QLabel(
             "Selecione um relevo, STL, malha ou sólido 3D na árvore ou na vista. "
@@ -3028,7 +3783,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         rough3d_layout.addWidget(self._compact_group(rough_source_group))
 
         rough_boundary_group, rough_boundary_grid = self._make_icon_group(
-            "Fronteira de usinagem", "rough3d"
+            "Fronteira de usinagem", "icon:machining_boundary"
         )
         self.rough3d_boundary_combo = QtWidgets.QComboBox()
         self.rough3d_boundary_combo.addItems(
@@ -3048,7 +3803,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         rough3d_layout.addWidget(self._compact_group(rough_boundary_group))
 
         rough_strategy_group, rough_strategy_grid = self._make_icon_group(
-            "Estratégia de desbaste", "rough3d"
+            "Estratégia de desbaste", "icon:rough_strategy"
         )
         self.rough3d_strategy_combo = QtWidgets.QComboBox()
         self.rough3d_strategy_combo.addItems(["Níveis Z", "Varredura 3D"])
@@ -3088,7 +3843,9 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         rough3d_layout.addWidget(self._make_tool_group("rough3d"))
         rough3d_layout.addWidget(self._make_ramp_group("rough3d"))
         self.operation_names["rough3d"] = QtWidgets.QLineEdit("Desbaste 3D 1")
-        rough_name_group, rough_name_grid = self._make_icon_group("Nome", "rough3d")
+        rough_name_group, rough_name_grid = self._make_icon_group(
+            "Nome", "icon:operation_name"
+        )
         rough_name_grid.addWidget(QtWidgets.QLabel("Nome do percurso"), 0, 0)
         rough_name_grid.addWidget(self.operation_names["rough3d"], 0, 1, 1, 2)
         rough3d_layout.addWidget(self._compact_group(rough_name_group))
@@ -3099,7 +3856,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         finish3d_layout = QtWidgets.QVBoxLayout(finish3d_tab)
         finish3d_layout.setSpacing(8)
         finish_source_group, finish_source_grid = self._make_icon_group(
-            "Modelo 3D para acabamento", "finish3d"
+            "Modelo 3D para acabamento", "icon:finish_model_3d"
         )
         finish_source_note = QtWidgets.QLabel(
             "Selecione o mesmo relevo, STL, malha ou sólido usado no desbaste. "
@@ -3113,7 +3870,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         finish3d_layout.addWidget(self._compact_group(finish_source_group))
 
         finish_boundary_group, finish_boundary_grid = self._make_icon_group(
-            "Fronteira de usinagem", "finish3d"
+            "Fronteira de usinagem", "icon:machining_boundary"
         )
         self.finish3d_boundary_combo = QtWidgets.QComboBox()
         self.finish3d_boundary_combo.addItems(
@@ -3133,7 +3890,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         finish3d_layout.addWidget(self._compact_group(finish_boundary_group))
 
         finish_strategy_group, finish_strategy_grid = self._make_icon_group(
-            "Estratégia de acabamento", "finish3d"
+            "Estratégia de acabamento", "icon:finish_strategy"
         )
         self.finish3d_strategy_combo = QtWidgets.QComboBox()
         self.finish3d_strategy_combo.addItems(["Raster", "Offset concêntrico"])
@@ -3170,7 +3927,9 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         if self.operation_tool_combos["finish3d"].findText("Topo esférico 6 mm") >= 0:
             self.operation_tool_combos["finish3d"].setCurrentText("Topo esférico 6 mm")
         self.operation_names["finish3d"] = QtWidgets.QLineEdit("Acabamento 3D 1")
-        finish_name_group, finish_name_grid = self._make_icon_group("Nome", "finish3d")
+        finish_name_group, finish_name_grid = self._make_icon_group(
+            "Nome", "icon:operation_name"
+        )
         finish_name_grid.addWidget(QtWidgets.QLabel("Nome do percurso"), 0, 0)
         finish_name_grid.addWidget(self.operation_names["finish3d"], 0, 1, 1, 2)
         finish3d_layout.addWidget(self._compact_group(finish_name_group))
@@ -3222,6 +3981,45 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             "Altura Z (mm; 0 = usar Material)",
             "job_depth",
         )
+        preset_label = QtWidgets.QLabel("Tamanhos salvos", job_size_group)
+        self.work_area_preset_combo = QtWidgets.QComboBox(job_size_group)
+        self.work_area_preset_combo.setObjectName("workAreaPresetCombo")
+        self.work_area_preset_combo.setMinimumWidth(210)
+        self.work_area_preset_combo.setToolTip(
+            "Escolha uma área usada com frequência. A predefinição preenche "
+            "X, Y e Z sem alterar origem, material ou geometria das peças."
+        )
+        self.work_area_preset_save_button = QtWidgets.QToolButton(job_size_group)
+        self.work_area_preset_save_button.setObjectName("workAreaPresetSave")
+        self.work_area_preset_save_button.setText("Salvar tamanho atual…")
+        self.work_area_preset_save_button.setIcon(tool_icon("save", 20))
+        self.work_area_preset_save_button.setIconSize(QtCore.QSize(18, 18))
+        self.work_area_preset_save_button.setToolButtonStyle(
+            QtCore.Qt.ToolButtonTextBesideIcon
+        )
+        self.work_area_preset_save_button.setToolTip(
+            "Salvar os valores atuais de Largura X, Altura Y e Altura Z para reutilizar."
+        )
+        self.work_area_preset_delete_button = QtWidgets.QToolButton(job_size_group)
+        self.work_area_preset_delete_button.setObjectName("workAreaPresetDelete")
+        self.work_area_preset_delete_button.setAccessibleName(
+            "Excluir tamanho salvo"
+        )
+        self.work_area_preset_delete_button.setIcon(tool_icon("delete", 20))
+        self.work_area_preset_delete_button.setIconSize(QtCore.QSize(18, 18))
+        self.work_area_preset_delete_button.setToolTip(
+            "Excluir a predefinição selecionada; não altera a área atual."
+        )
+        preset_buttons = QtWidgets.QHBoxLayout()
+        preset_buttons.setContentsMargins(0, 0, 0, 0)
+        preset_buttons.setSpacing(4)
+        preset_buttons.addWidget(self.work_area_preset_save_button)
+        preset_buttons.addWidget(self.work_area_preset_delete_button)
+        preset_buttons.addStretch(1)
+        job_size_grid.addWidget(preset_label, 0, 3)
+        job_size_grid.addWidget(self.work_area_preset_combo, 0, 4, 1, 2)
+        job_size_grid.addLayout(preset_buttons, 1, 4, 1, 2)
+        job_size_grid.setColumnStretch(5, 1)
         job_layout.addWidget(self._compact_group(job_size_group))
 
         job_z_zero_group, job_z_zero_grid = self._make_icon_group(
@@ -3642,6 +4440,12 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         self._vector_editor_detached_placeholder.hide()
         editor_layout.addWidget(self._vector_editor_detached_placeholder, 1)
         self._add_scroll_tab(editor_tab, "Editor 2D", "editor2d")
+        editor_index = self._tab_index("Editor 2D")
+        if editor_index is not None:
+            self.operation_tabs.setTabActionWidget(
+                editor_tab,
+                self.detach_editor_button,
+            )
 
         vector_tab = QtWidgets.QWidget()
         vector_layout = QtWidgets.QVBoxLayout(vector_tab)
@@ -3704,7 +4508,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             "Simulação",
             "simulation",
         )
-        self._add_field(simulation_grid, 0, "Velocidade da simulação (x)", "simulation_speed_multiplier")
+        self._add_simulation_speed_control(simulation_grid, 0)
         simulation_note = QtWidgets.QLabel(
             "Selecione percursos já aplicados abaixo para simular mesmo sem manter os vetores originais selecionados."
         )
@@ -3714,15 +4518,52 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         self.applied_toolpath_list.setSelectionMode(
             QtWidgets.QAbstractItemView.ExtendedSelection
         )
+        self.applied_toolpath_list.setDragEnabled(True)
+        self.applied_toolpath_list.setAcceptDrops(True)
+        self.applied_toolpath_list.setDropIndicatorShown(True)
+        self.applied_toolpath_list.setDragDropMode(
+            QtWidgets.QAbstractItemView.InternalMove
+        )
+        self.applied_toolpath_list.setDefaultDropAction(QtCore.Qt.MoveAction)
+        self.applied_toolpath_list.setToolTip(
+            "Selecione os percursos que deseja simular ou exportar. "
+            "Arraste para definir a ordem real do G-code."
+        )
         self.applied_toolpath_list.setMinimumHeight(96)
         simulation_grid.addWidget(QtWidgets.QLabel("Percursos aplicados"), 2, 0)
         simulation_grid.addWidget(self.applied_toolpath_list, 2, 1, 1, 2)
-        self.simulation_time_label = QtWidgets.QLabel("Tempo estimado: —")
-        self.simulation_time_label.setStyleSheet("color: #475569; font-weight: bold;")
-        simulation_grid.addWidget(self.simulation_time_label, 3, 1, 1, 2)
+        operation_manager_layout = QtWidgets.QHBoxLayout()
+        operation_manager_layout.setContentsMargins(0, 0, 0, 0)
+        self.rename_applied_button = QtWidgets.QPushButton("Renomear")
+        self.rename_applied_button.setToolTip("Renomear a operação selecionada")
+        self.rename_applied_button.clicked.connect(self._rename_selected_applied_operation)
+        operation_manager_layout.addWidget(self.rename_applied_button)
+        self.edit_applied_button = QtWidgets.QPushButton("Editar")
+        self.edit_applied_button.setToolTip(
+            "Abrir os parâmetros da operação selecionada sem recalcular o percurso"
+        )
+        self.edit_applied_button.clicked.connect(self._edit_selected_applied_operation)
+        operation_manager_layout.addWidget(self.edit_applied_button)
+        self.delete_applied_button = QtWidgets.QPushButton("Excluir")
+        self.delete_applied_button.setToolTip(
+            "Excluir as operações selecionadas; o Undo do FreeCAD pode restaurá-las"
+        )
+        trash_pixmap = getattr(
+            QtWidgets.QStyle,
+            "SP_TrashIcon",
+            QtWidgets.QStyle.SP_DialogDiscardButton,
+        )
+        self.delete_applied_button.setIcon(self.style().standardIcon(trash_pixmap))
+        self.delete_applied_button.clicked.connect(self._delete_selected_applied_operations)
+        operation_manager_layout.addWidget(self.delete_applied_button)
+        operation_manager_layout.addStretch(1)
         refresh_applied_button = QtWidgets.QPushButton("Atualizar lista")
         refresh_applied_button.clicked.connect(self._refresh_applied_operation_list)
-        simulation_grid.addWidget(refresh_applied_button, 4, 1, 1, 2)
+        operation_manager_layout.addWidget(refresh_applied_button)
+        simulation_grid.addLayout(operation_manager_layout, 3, 1, 1, 2)
+        self.simulation_time_label = QtWidgets.QLabel("Tempo estimado: —")
+        self.simulation_time_label.setStyleSheet("color: #475569; font-weight: bold;")
+        simulation_grid.addWidget(self.simulation_time_label, 4, 1, 1, 2)
         sim_save_layout.addWidget(self._compact_group(simulation_group))
 
         export_group, export_grid = self._make_icon_group(
@@ -3730,11 +4571,30 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             "export",
         )
         self.output_path = QtWidgets.QLineEdit(DEFAULT_PRESETS["output_path"])
+        # Editing only the destination filename is not a toolpath change and
+        # must never strand the export action disabled. Re-evaluate the action
+        # row immediately; previously changing tabs happened to do this later.
+        self.output_path.textChanged.connect(
+            lambda _text: self._update_tab_actions(
+                self.operation_tabs.currentIndex()
+            )
+        )
         export_grid.addWidget(QtWidgets.QLabel("Arquivo G-code"), 0, 0)
         export_grid.addWidget(self.output_path, 0, 1)
-        browse_button = QtWidgets.QPushButton("Escolher...")
-        browse_button.clicked.connect(self._select_output_path)
-        export_grid.addWidget(browse_button, 0, 2)
+        self.browse_output_button = QtWidgets.QPushButton("Escolher...")
+        folder_pixmap = getattr(
+            QtWidgets.QStyle,
+            "SP_DirOpenIcon",
+            QtWidgets.QStyle.SP_DirIcon,
+        )
+        self.browse_output_button.setIcon(
+            self.style().standardIcon(folder_pixmap)
+        )
+        self.browse_output_button.setToolTip(
+            "Escolher a pasta e o nome do arquivo G-code"
+        )
+        self.browse_output_button.clicked.connect(self._select_output_path)
+        export_grid.addWidget(self.browse_output_button, 0, 2)
         self.export_mode_combo = QtWidgets.QComboBox()
         self.export_mode_combo.addItems(
             [
@@ -3745,10 +4605,20 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         export_grid.addWidget(QtWidgets.QLabel("Quando houver vários percursos"), 1, 0)
         export_grid.addWidget(self.export_mode_combo, 1, 1, 1, 2)
         export_note = QtWidgets.QLabel(
-            "Arquivos separados recebem sufixo automaticamente; arquivo único concatena os percursos selecionados."
+            "Arquivos separados recebem sufixo automaticamente; arquivo único "
+            "concatena os percursos na ordem exibida. Sem seleção, todos são exportados."
         )
         export_note.setWordWrap(True)
         export_grid.addWidget(export_note, 2, 1, 1, 2)
+        self.generate_button = QtWidgets.QPushButton("Gerar G-code")
+        self.generate_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogSaveButton)
+        )
+        self.generate_button.setToolTip(
+            "Gerar o G-code dos percursos selecionados; sem seleção, gerar todos na ordem exibida"
+        )
+        self.generate_button.clicked.connect(self.generate_gcode)
+        export_grid.addWidget(self.generate_button, 3, 1, 1, 2)
         sim_save_layout.addWidget(self._compact_group(export_group))
 
         action_note_group, action_note_grid = self._make_icon_group(
@@ -3758,8 +4628,8 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         action_note = QtWidgets.QLabel(
             "1. Configure Trabalho e Material.  2. Abra Corte, Furo, Preenchimento, "
             "Desbaste 3D ou Acabamento 3D.  "
-            "3. Use Aplicar para guardar a operação na árvore, ou Pré-visualizar/Simular/"
-            "Gerar G-code pelos botões abaixo."
+            "3. Use Aplicar para guardar a operação na árvore, Pré-visualizar/Simular "
+            "pelos botões abaixo e exporte o G-code nesta página."
         )
         action_note.setWordWrap(True)
         action_note_grid.addWidget(action_note, 0, 0, 1, 3)
@@ -3789,6 +4659,18 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         )
         self.apply_button.clicked.connect(self.apply_current_operation)
         button_layout.addWidget(self.apply_button)
+        self.cancel_operation_edit_button = QtWidgets.QPushButton("Cancelar edição")
+        self.cancel_operation_edit_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogCancelButton)
+        )
+        self.cancel_operation_edit_button.setToolTip(
+            "Sair da edição sem alterar o percurso aplicado."
+        )
+        self.cancel_operation_edit_button.clicked.connect(
+            self._cancel_operation_editing
+        )
+        self.cancel_operation_edit_button.setVisible(False)
+        button_layout.addWidget(self.cancel_operation_edit_button)
         self.preview_button = QtWidgets.QPushButton("Pré-visualizar")
         self.preview_button.clicked.connect(self.preview_toolpath)
         button_layout.addWidget(self.preview_button)
@@ -3835,9 +4717,6 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         self.stop_sim_button.setVisible(False)
         self.stop_sim_button.clicked.connect(self.stop_simulation)
         button_layout.addWidget(self.stop_sim_button)
-        self.generate_button = QtWidgets.QPushButton("Gerar G-code")
-        self.generate_button.clicked.connect(self.generate_gcode)
-        button_layout.addWidget(self.generate_button)
         close_button = QtWidgets.QPushButton("Ocultar")
         close_button.clicked.connect(self.reject)
         button_layout.addWidget(close_button)
@@ -3872,6 +4751,9 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             self.operation_diagrams["pocket"].update
         )
         self.use_model_hole_depths.toggled.connect(self._update_operation_controls)
+        self.hole_counterbore_enabled.toggled.connect(
+            self._update_operation_controls
+        )
         self.use_helical_drilling.toggled.connect(self._update_operation_controls)
         self.peck_enabled.toggled.connect(self._update_operation_controls)
         self.dwell_enabled.toggled.connect(self._update_operation_controls)
@@ -3934,7 +4816,20 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         self.applied_toolpath_list.itemSelectionChanged.connect(
             self._on_applied_toolpath_selection_changed
         )
+        self.applied_toolpath_list.model().rowsMoved.connect(
+            self._persist_applied_operation_order_from_list
+        )
         self.operation_tabs.currentChanged.connect(self._update_tab_actions)
+        self.work_area_preset_combo.currentIndexChanged.connect(
+            self._apply_work_area_preset
+        )
+        self.work_area_preset_save_button.clicked.connect(
+            self._save_current_work_area_preset
+        )
+        self.work_area_preset_delete_button.clicked.connect(
+            self._delete_work_area_preset
+        )
+        self._refresh_work_area_preset_combo()
         self._load_job_preferences()
         self._load_operation_preferences()
         self._connect_exact_toolpath_invalidation()
@@ -4188,6 +5083,9 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         widget.traceBitmapRequested.connect(self._vector_editor_trace_bitmap)
         widget.createReliefRequested.connect(self._vector_editor_create_image_relief)
         widget.exportRequested.connect(self._vector_editor_export_file)
+        widget.printTechDrawRequested.connect(
+            self._vector_editor_send_to_techdraw
+        )
         widget.documentChanged.connect(self._vector_editor_document_changed)
         self._configure_vector_editor_preferences(widget)
         return {
@@ -4305,7 +5203,19 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             self._vector_validation_dialog = None
         self._remember_vector_editor_feature_fingerprint()
         if hasattr(self, "applied_toolpath_list"):
-            self._refresh_applied_operation_list()
+            geometry_changed = _change_set is None or any(
+                bool(getattr(_change_set, name, ()))
+                for name in ("added", "changed", "removed")
+            )
+            if _change_set is None:
+                # Host Undo/Redo may make an old applied operation valid again.
+                # Re-evaluate its small SettingsJSON, but never decompress the
+                # persisted movement payload merely because a vector changed.
+                self._refresh_applied_operation_list(
+                    update_simulation_time=False
+                )
+            elif geometry_changed:
+                self._mark_applied_operations_stale_after_vector_change()
 
     def _remember_vector_editor_feature_fingerprint(self):
         try:
@@ -4488,7 +5398,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         widget = getattr(self, "vector_editor_widget", None)
         if widget is None:
             return
-        widget.mode_label.setText(str(message))
+        widget.mode_label.setText(translate_text(message))
         widget.mode_label.setStyleSheet(
             "color: %s; font-weight: %s;" % (
                 "#b91c1c" if error else "#334155",
@@ -4506,9 +5416,9 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         the synchronous calculation starts.
         """
 
-        dialog = QtWidgets.QProgressDialog(str(label), None, 0, 0, self)
+        dialog = QtWidgets.QProgressDialog(translate_text(label), None, 0, 0, self)
         dialog.setObjectName("vectorEditorBusyDialog")
-        dialog.setWindowTitle("WoodCAM Editor 2D")
+        dialog.setWindowTitle(translate_text("WoodCAM Editor 2D"))
         dialog.setAutoClose(False)
         dialog.setAutoReset(False)
         dialog.setMinimumDuration(0)
@@ -5004,7 +5914,13 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         role_by_id = {}
         for entity_id, entity in ids.items():
             role = str((getattr(entity, "metadata", {}) or {}).get("import_role", "") or "")
-            if role in {"cut_external", "cut_internal", "drill"}:
+            if role in {
+                "cut_external",
+                "cut_internal",
+                "drill",
+                "pocket_region",
+                "pocket_island",
+            }:
                 if role == "drill" and not circle_is_drill(entity):
                     role = "cut_internal"
                 role_by_id[entity_id] = role
@@ -5041,6 +5957,8 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             "cut_external": ("Corte externo", "cut", "#f97316"),
             "cut_internal": ("Corte interno", "pocket", "#f59e0b"),
             "drill": ("Furos", "drill", "#2563eb"),
+            "pocket_region": ("Rebaixos importados", "pocket", "#0f766e"),
+            "pocket_island": ("Ilhas de rebaixo", "pocket", "#0d9488"),
         }
         layers = dict(getattr(result, "layers", {}) or {})
         remapped = []
@@ -5608,7 +6526,11 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                     widget.document,
                     file_path,
                     entity_ids=entity_ids,
-                    visible_only=True,
+                    # Uma seleção explícita representa o objeto inteiro,
+                    # inclusive filhos em camadas temporariamente ocultas.
+                    # Sem seleção, permanece o contrato de exportar somente
+                    # as camadas visíveis.
+                    visible_only=entity_ids is None,
                 )
             elif suffix == ".svg":
                 from woodcam_editor.exporters.svg import export_svg
@@ -5616,7 +6538,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                     widget.document,
                     file_path,
                     entity_ids=entity_ids,
-                    visible_only=True,
+                    visible_only=entity_ids is None,
                 )
             else:
                 raise ValueError("Formato não reconhecido; use a extensão .dxf ou .svg.")
@@ -5630,6 +6552,92 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         except Exception as error:
             self._set_vector_editor_status(
                 "Arquivo não exportado: %s" % error,
+                error=True,
+            )
+
+    def _vector_editor_send_to_techdraw(self):
+        """Create printable TechDraw pages without adding CAM geometry."""
+        widget = getattr(self, "vector_editor_widget", None)
+        if widget is None:
+            return
+        sheet_bounds = tuple(widget.sheet_bounds)
+        if not sheet_bounds:
+            self._set_vector_editor_status(
+                translate_text(
+                    "Configure a área de Trabalho antes de criar a impressão."
+                ),
+                error=True,
+            )
+            return
+        try:
+            from woodcam_editor.presentation.print_dialog import PrintSetupDialog
+            from woodcam_editor.adapters.techdraw_print import (
+                create_techdraw_print_pages,
+            )
+
+            toolpath_components = widget.visible_toolpath_components
+            dialog = PrintSetupDialog(
+                sheet_bounds,
+                active_sheet_index=max(0, int(widget.active_sheet_index)),
+                toolpath_available=bool(toolpath_components),
+                parent=self,
+            )
+            execute = getattr(dialog, "exec", None) or getattr(dialog, "exec_")
+            if execute() != QtWidgets.QDialog.Accepted:
+                return
+            options = dialog.options()
+            if options.all_sheets:
+                selected_bounds = sheet_bounds
+                sheet_indices = tuple(range(len(sheet_bounds)))
+            else:
+                current = max(
+                    0,
+                    min(int(widget.active_sheet_index), len(sheet_bounds) - 1),
+                )
+                selected_bounds = (sheet_bounds[current],)
+                sheet_indices = (current,)
+
+            host_document = getattr(
+                self, "_vector_editor_bound_freecad_document", None
+            )
+            if host_document is None or host_document is not FreeCAD.ActiveDocument:
+                raise RuntimeError(
+                    "O documento ativo mudou; abra novamente o Editor antes de imprimir."
+                )
+            result = create_techdraw_print_pages(
+                host_document,
+                widget.document,
+                selected_bounds,
+                sheet_indices=sheet_indices,
+                paper_name=options.paper_name,
+                scale_mode=options.scale_mode,
+                custom_scale_percent=options.custom_scale_percent,
+                include_sheet_fill=options.include_sheet_fill,
+                toolpath_components=(
+                    toolpath_components if options.include_toolpath else None
+                ),
+            )
+            try:
+                FreeCADGui.activateWorkbench("TechDrawWorkbench")
+                if result.pages:
+                    result.pages[0].ViewObject.show()
+            except Exception:
+                # The pages are already valid in the document.  Headless
+                # FreeCADCmd and unusual GUI builds may not expose a workbench
+                # activation API, so failure to switch views is non-fatal.
+                pass
+            self._set_vector_editor_status(
+                translate_text(
+                    "%d página(s) criada(s) no TechDraw; desenho e CAM preservados."
+                )
+                % len(result.pages)
+            )
+        except Exception as error:
+            self._set_vector_editor_status(
+                translate_text(
+                    "Não foi possível criar a impressão no TechDraw: %s"
+                )
+                % error,
                 error=True,
             )
 
@@ -6027,15 +7035,69 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                 error=True,
             )
 
-    def _vector_editor_join_open_paths(self):
+    def _vector_editor_nearby_open_path_ids(self, seed_ids, tolerance):
+        """Expand selected open fragments through endpoint-only proximity."""
+
+        widget = getattr(self, "vector_editor_widget", None)
+        if widget is None:
+            return ()
+        document = widget.document
+        seeds = tuple(
+            entity_id
+            for entity_id in dict.fromkeys(seed_ids)
+            if isinstance(document.get_entity(entity_id), PathEntity)
+            and not document.get_entity(entity_id).closed
+        )
+        if not seeds:
+            return ()
+        connected = set(seeds)
+        candidates = tuple(
+            entity
+            for entity in document.entities_by_id.values()
+            if isinstance(entity, PathEntity) and not entity.closed
+        )
+
+        def endpoints(path):
+            return (path.start, path.end)
+
+        changed = True
+        while changed:
+            changed = False
+            connected_paths = tuple(
+                document.get_entity(entity_id)
+                for entity_id in connected
+            )
+            for candidate in candidates:
+                if candidate.id in connected:
+                    continue
+                if not any(
+                    candidate.layer_id == current.layer_id
+                    and any(
+                        first.distance_to(second) <= tolerance
+                        for first in endpoints(candidate)
+                        for second in endpoints(current)
+                    )
+                    for current in connected_paths
+                ):
+                    continue
+                connected.add(candidate.id)
+                changed = True
+        order = {entity_id: index for index, entity_id in enumerate(document.entities_by_id)}
+        return tuple(sorted(connected, key=lambda entity_id: order[entity_id]))
+
+    def _vector_editor_join_open_paths(self, path_ids=None):
         """Preview Aspire-style joining for every selected compatible path."""
 
         widget = getattr(self, "vector_editor_widget", None)
         if widget is None:
             return
         try:
-            source_ids = widget.controller.expand_group_children(
-                widget.selected_entity_ids
+            source_ids = (
+                tuple(path_ids)
+                if path_ids is not None
+                else widget.controller.expand_group_children(
+                    widget.selected_entity_ids
+                )
             )
             path_ids = tuple(
                 entity_id
@@ -6066,26 +7128,32 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             preview_command.apply(preview_document)
             preview_entities = tuple(
                 preview_document.get_entity(entity_id)
-                for entity_id, _removed_id, _gap in preview_command.joined_pairs
+                for entity_id in preview_command.result_path_ids
             )
             preview_entities = tuple(entity for entity in preview_entities if entity is not None)
             gaps = tuple(gap for _first_id, _second_id, gap in preview_command.joined_pairs)
+            closed_count = len(preview_command.closed_path_ids)
 
             def apply_join_all(ids=path_ids, join_tolerance=tolerance):
                 command = JoinOpenPathsWithinToleranceCommand(ids, join_tolerance)
                 widget.controller.execute(command)
-                surviving = tuple(first_id for first_id, _second_id, _gap in command.joined_pairs)
-                widget.controller.selection.replace(surviving)
+                widget.controller.selection.replace(command.result_path_ids)
                 self._set_vector_editor_status(
-                    "%d união(ões) aplicada(s), maior lacuna %.4g mm; Ctrl+Z desfaz."
-                    % (len(command.joined_pairs), max(gap for _first, _second, gap in command.joined_pairs))
+                    "%d união(ões) aplicada(s), %d contorno(s) fechado(s), "
+                    "maior lacuna %.4g mm; Ctrl+Z desfaz."
+                    % (
+                        len(command.joined_pairs),
+                        len(command.closed_path_ids),
+                        max(gap for _first, _second, gap in command.joined_pairs),
+                    )
                 )
 
             widget.begin_workflow_preview(
                 preview_entities,
-                "Prévia: %d união(ões) dentro de %.4g mm; maior lacuna %.4g mm. "
+                "Prévia: %d união(ões) e %d fechamento(s) dentro de %.4g mm; "
+                "maior lacuna %.4g mm. "
                 "Vetores fora da tolerância foram preservados."
-                % (len(gaps), tolerance, max(gaps)),
+                % (len(gaps), closed_count, tolerance, max(gaps)),
                 apply_join_all,
                 apply_label="Aplicar união de vetores",
             )
@@ -6100,8 +7168,15 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         if widget is None:
             return
         try:
-            ids = tuple(widget.selected_entity_ids)
-            paths = [widget.controller.get_entity(entity_id) for entity_id in ids]
+            ids = widget.controller.expand_group_children(
+                widget.selected_entity_ids
+            )
+            paths = [
+                widget.controller.get_entity(entity_id)
+                for entity_id in ids
+                if isinstance(widget.controller.get_entity(entity_id), PathEntity)
+                and not widget.controller.get_entity(entity_id).closed
+            ]
             locked_paths = [
                 path.id
                 for path in paths
@@ -6117,88 +7192,48 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                     "Desbloqueie a camada antes de reparar: %s"
                     % ", ".join(locked_paths)
                 )
+            if not paths:
+                raise ValueError("Selecione ao menos um caminho aberto.")
+            tolerance = self._vector_editor_join_tolerance()
+            nearby_ids = self._vector_editor_nearby_open_path_ids(
+                (path.id for path in paths),
+                tolerance,
+            )
+            if len(nearby_ids) >= 2:
+                self._vector_editor_join_open_paths(nearby_ids)
+                return
             if len(paths) == 1:
                 path = paths[0]
-                if not isinstance(path, PathEntity) or path.closed:
-                    raise ValueError("Selecione um único caminho aberto para fechá-lo.")
+                close_mode = (
+                    "midpoint"
+                    if path.start.distance_to(path.end) <= tolerance
+                    else "line"
+                )
+                close_label = (
+                    "aproximando as duas pontas"
+                    if close_mode == "midpoint"
+                    else "com uma linha reta"
+                )
                 preview_document = widget.document.clone()
-                ClosePathCommand(path.id, mode="line").apply(preview_document)
+                ClosePathCommand(path.id, mode=close_mode).apply(preview_document)
                 preview_entity = preview_document.get_entity(path.id)
 
-                def apply_close(path_id=path.id):
+                def apply_close(path_id=path.id, mode=close_mode, label=close_label):
                     widget.controller.execute(
-                        ClosePathCommand(path_id, mode="line")
+                        ClosePathCommand(path_id, mode=mode)
                     )
                     widget.controller.selection.select_only(path_id)
                     self._set_vector_editor_status(
-                        "Caminho fechado por uma linha; Ctrl+Z desfaz."
+                        "Caminho fechado %s; Ctrl+Z desfaz." % label
                     )
 
                 widget.begin_workflow_preview(
                     (preview_entity,),
-                    "Prévia: fechar o caminho selecionado com uma linha reta.",
+                    "Prévia: fechar o caminho selecionado %s." % close_label,
                     apply_close,
                     apply_label="Aplicar fechamento",
                 )
                 return
-            if len(paths) != 2 or any(
-                not isinstance(path, PathEntity) or path.closed for path in paths
-            ):
-                raise ValueError(
-                    "Selecione um caminho aberto para fechar ou dois caminhos abertos para unir."
-                )
-            first, second = paths
-            candidates = []
-            for first_name, first_point in (("start", first.start), ("end", first.end)):
-                for second_name, second_point in (("start", second.start), ("end", second.end)):
-                    candidates.append(
-                        (first_point.distance_to(second_point), first_name, second_name)
-                    )
-            distance, first_name, second_name = min(candidates)
-            tolerance = self._vector_editor_join_tolerance()
-            if distance > tolerance:
-                raise ValueError(
-                    "As pontas mais próximas estão a %.4g mm; aumente a tolerância "
-                    "conscientemente ou aproxime-as com edição de nós." % distance
-                )
-            preview_document = widget.document.clone()
-            JoinPathsCommand(
-                first.id,
-                second.id,
-                first_name,
-                second_name,
-                tolerance,
-            ).apply(preview_document)
-            preview_entity = preview_document.get_entity(first.id)
-
-            def apply_join(
-                first_id=first.id,
-                second_id=second.id,
-                first_end=first_name,
-                second_end=second_name,
-                join_tolerance=tolerance,
-                gap=distance,
-            ):
-                widget.controller.execute(
-                    JoinPathsCommand(
-                        first_id,
-                        second_id,
-                        first_end,
-                        second_end,
-                        join_tolerance,
-                    )
-                )
-                widget.controller.selection.select_only(first_id)
-                self._set_vector_editor_status(
-                    "Caminhos unidos (lacuna %.4g mm); Ctrl+Z desfaz." % gap
-                )
-
-            widget.begin_workflow_preview(
-                (preview_entity,),
-                "Prévia: unir os dois caminhos; lacuna %.4g mm." % distance,
-                apply_join,
-                apply_label="Aplicar união",
-            )
         except Exception as error:
             self._set_vector_editor_status("Fechamento/união não executado: %s" % error, error=True)
 
@@ -6248,8 +7283,19 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                         outer_path_id=classified.outer_id,
                         inner_path_ids=classified.descendant_ids,
                         thickness=default_thickness,
+                        metadata={
+                            "pocket_path_ids": list(classified.feature_ids),
+                            "marking_path_ids": list(classified.marking_ids),
+                        },
                     )
                 else:
+                    piece_metadata = dict(previous.metadata or {})
+                    piece_metadata["pocket_path_ids"] = list(
+                        classified.feature_ids
+                    )
+                    piece_metadata["marking_path_ids"] = list(
+                        classified.marking_ids
+                    )
                     piece = replace(
                         previous,
                         inner_path_ids=classified.descendant_ids,
@@ -6258,6 +7304,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                             if previous.thickness > 0.0
                             else default_thickness
                         ),
+                        metadata=piece_metadata,
                         stale=False,
                     )
                 pieces.append(piece)
@@ -6267,7 +7314,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             widget.controller.execute(ReplacePiecesCommand(pieces))
             self._set_vector_editor_status(
                 "Reconhecidas %d peça(s) sem criar novos vetores; contornos "
-                "internos ficaram vinculados como furos/recortes%s."
+                "internos e marcações abertas ficaram vinculados às peças%s."
                 % (
                     len(pieces),
                     "; %d caminho(s) aberto(s) não entraram nas peças"
@@ -6287,31 +7334,218 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             self._close_vector_editor_busy_dialog(busy)
 
     def _vector_editor_request_organize(self, search_mode="balanced"):
-        """Ask for job-specific clearance, then calculate a preview."""
+        """Ask for job clearance and a real progressive-search time budget."""
         widget = getattr(self, "vector_editor_widget", None)
         if widget is None:
             return
-        spacing, accepted = QtWidgets.QInputDialog.getDouble(
-            self,
-            "Espaçamento entre peças",
-            "Folga mínima entre peças para o nesting (mm):",
-            float(widget.nesting_spacing.value()),
-            0.0,
-            1000.0,
-            2,
+        try:
+            cut_contract = self._vector_editor_nesting_cut_contract()
+        except ValueError as error:
+            self._set_vector_editor_status(
+                "Organização não executada: %s" % error,
+                error=True,
+            )
+            return
+        defaults = {"fast": 4, "balanced": 20, "thorough": 60}
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(translate_text("Organização progressiva"))
+        layout = QtWidgets.QVBoxLayout(dialog)
+        explanation = QtWidgets.QLabel(
+            translate_text(
+                "O WoodCAM mostrará a primeira solução rapidamente e continuará "
+                "testando encaixes melhores até o tempo-alvo."
+            ),
+            dialog,
         )
-        if not accepted:
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+        form = QtWidgets.QFormLayout()
+        spacing_field = QtWidgets.QDoubleSpinBox(dialog)
+        spacing_field.setRange(0.0, 1000.0)
+        spacing_field.setDecimals(2)
+        spacing_field.setSuffix(" mm")
+        spacing_field.setValue(
+            float(
+                cut_contract["recommended_spacing"]
+                if cut_contract is not None
+                else widget.nesting_spacing.value()
+            )
+        )
+        if cut_contract is not None and cut_contract["mode"] == "preserve_dimensions":
+            spacing_field.setMinimum(float(cut_contract["effective_diameter"]))
+        time_field = QtWidgets.QSpinBox(dialog)
+        time_field.setRange(2, 300)
+        time_field.setSuffix(" s")
+        time_field.setValue(defaults.get(str(search_mode), 20))
+        remnant_cut_check = QtWidgets.QCheckBox(
+            translate_text(
+                "Criar linhas de corte para separar retalhos retangulares"
+            ),
+            dialog,
+        )
+        remnant_cut_check.setChecked(True)
+        remnant_cut_check.setToolTip(
+            translate_text(
+                "As linhas aparecem na prévia e viram vetores selecionáveis. "
+                "Para usinar, selecione-as e crie uma operação Corte; nada "
+                "entra no G-code automaticamente."
+            )
+        )
+        remnant_size_field = QtWidgets.QDoubleSpinBox(dialog)
+        remnant_size_field.setRange(20.0, 2000.0)
+        remnant_size_field.setDecimals(0)
+        remnant_size_field.setSuffix(" mm")
+        remnant_size_field.setValue(100.0)
+        remnant_size_field.setToolTip(
+            translate_text(
+                "Ignora sobras cujo menor lado seja inferior a este tamanho."
+            )
+        )
+        remnant_size_field.setEnabled(remnant_cut_check.isChecked())
+        remnant_cut_check.toggled.connect(remnant_size_field.setEnabled)
+        form.addRow(translate_text("Folga mínima entre peças"), spacing_field)
+        form.addRow(translate_text("Tempo-alvo de busca"), time_field)
+        form.addRow("", remnant_cut_check)
+        form.addRow(
+            translate_text("Menor lado do retalho guardável"),
+            remnant_size_field,
+        )
+        layout.addLayout(form)
+        if cut_contract is not None:
+            contract_info = QtWidgets.QLabel(
+                translate_text(cut_contract["message"]), dialog
+            )
+            contract_info.setWordWrap(True)
+            contract_info.setStyleSheet("color: #475569;")
+            layout.addWidget(contract_info)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            parent=dialog,
+        )
+        buttons.button(QtWidgets.QDialogButtonBox.Ok).setText(translate_text("OK"))
+        buttons.button(QtWidgets.QDialogButtonBox.Cancel).setText(
+            translate_text("Cancelar")
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        execute_dialog = getattr(dialog, "exec", None) or dialog.exec_
+        if execute_dialog() != QtWidgets.QDialog.Accepted:
             return
-        self._vector_editor_organize_pieces(search_mode, spacing=float(spacing))
+        self._vector_editor_organize_pieces(
+            search_mode,
+            spacing=float(spacing_field.value()),
+            time_budget_seconds=int(time_field.value()),
+            create_remnant_cuts=bool(remnant_cut_check.isChecked()),
+            remnant_minimum_short_side=float(remnant_size_field.value()),
+        )
 
-    def _vector_editor_organize_pieces(self, search_mode="balanced", spacing=None):
+    def _vector_editor_nesting_cut_contract(self):
+        """Return the safe nesting clearance implied by the current cut."""
+
+        if not (
+            getattr(self, "cut_common_line_enabled", None) is not None
+            and self.cut_common_line_enabled.isChecked()
+        ):
+            return None
+        cut_side = self.CUT_SIDE_BY_INDEX[self.operation_combo.currentIndex()]
+        if cut_side != CUT_SIDE_OUTSIDE:
+            return None
+        mode_data = (
+            self.cut_common_line_mode_combo.currentData()
+            if getattr(self, "cut_common_line_mode_combo", None) is not None
+            else "preserve_dimensions"
+        )
+        mode = str(mode_data or "preserve_dimensions")
+        tool_diameter = self._parse_operation_float("cut", "tool_diameter")
+        allowance = self._parse_operation_float("cut", "cut_allowance_offset")
+        effective_diameter = tool_diameter + allowance * 2.0
+        if not math.isfinite(effective_diameter) or effective_diameter <= 1.0e-6:
+            raise ValueError(
+                "A fresa e o sobre-metal configurados deixam o diâmetro "
+                "efetivo do corte inválido."
+            )
+        if mode == "preserve_dimensions":
+            return {
+                "mode": mode,
+                "effective_diameter": effective_diameter,
+                "recommended_spacing": effective_diameter,
+                "message": translate_text(
+                    "Linha comum preservando medidas: a folga não pode ser "
+                    "menor que o Ø efetivo de %.2f mm. O valor recomendado "
+                    "faz os percursos externos vizinhos coincidirem."
+                ) % effective_diameter,
+            }
+        return {
+            "mode": "on_vector",
+            "effective_diameter": effective_diameter,
+            "recommended_spacing": 0.0,
+            "message": translate_text(
+                "Linha comum sobre o vetor: use 0 mm para encostar as bordas. "
+                "Uma folga intermediária entre 0 e %.2f mm não comporta a fresa."
+            ) % effective_diameter,
+        }
+
+    def _vector_editor_safe_nesting_spacing(self, requested_spacing):
+        """Normalize unsafe cutter/part gaps without weakening user clearance."""
+
+        requested = max(0.0, float(requested_spacing))
+        contract = self._vector_editor_nesting_cut_contract()
+        if contract is None:
+            return requested, ""
+        effective_diameter = float(contract["effective_diameter"])
+        if contract["mode"] == "preserve_dimensions":
+            adjusted = max(requested, effective_diameter)
+        elif 1.0e-6 < requested < effective_diameter - 1.0e-6:
+            adjusted = effective_diameter
+        else:
+            adjusted = requested
+        if abs(adjusted - requested) <= 1.0e-6:
+            return adjusted, ""
+        return adjusted, translate_text(
+            "A folga foi ajustada de %.2f para %.2f mm para comportar o "
+            "percurso externo da fresa."
+        ) % (requested, adjusted)
+
+    def _vector_editor_organize_pieces(
+        self,
+        search_mode="balanced",
+        spacing=None,
+        time_budget_seconds=None,
+        create_remnant_cuts=True,
+        remnant_minimum_short_side=100.0,
+    ):
+        """Start a non-blocking, progressively improving nesting preview."""
+
         widget = getattr(self, "vector_editor_widget", None)
         if widget is None:
+            return
+        active_session = getattr(self, "_vector_editor_nesting_session", None)
+        if active_session is not None:
+            self._cancel_vector_editor_nesting_search(keep_preview=False)
+            self._set_vector_editor_status(
+                "Interrompendo a busca anterior; inicie novamente quando ela encerrar."
+            )
             return
         if spacing is None:
             spacing = float(widget.nesting_spacing.value())
+        if time_budget_seconds is None:
+            time_budget_seconds = {
+                "fast": 4,
+                "balanced": 20,
+                "thorough": 60,
+            }.get(str(search_mode), 20)
+        try:
+            spacing, spacing_note = self._vector_editor_safe_nesting_spacing(spacing)
+            nesting_contract = self._vector_editor_nesting_cut_contract()
+        except ValueError as error:
+            self._set_vector_editor_status(
+                "Organização não executada: %s" % error,
+                error=True,
+            )
+            return
         widget.nesting_spacing.setValue(float(spacing))
-        busy = self._vector_editor_busy_dialog("Calculando organização das peças… aguarde.")
+
         try:
             stored_area = widget.document.work_area
             bounds = (
@@ -6329,20 +7563,56 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             if bounds is None:
                 raise ValueError("Defina largura e altura na aba Trabalho.")
             classification = classify_document_pieces(widget.document)
-            if classification.open_entity_ids:
+            selected_entity_ids = tuple(
+                widget.controller.expand_group_children(
+                    widget.controller.selection.ids
+                )
+            )
+            scoped_pieces = filter_pieces_for_selection(
+                classification.pieces,
+                selected_entity_ids,
+            )
+            selection_scoped = bool(selected_entity_ids)
+            selected_open_ids = set(classification.open_entity_ids).intersection(
+                selected_entity_ids
+            )
+            if selection_scoped and not scoped_pieces:
+                if selected_open_ids:
+                    raise ValueError(
+                        "A seleção contém somente caminho(s) aberto(s); "
+                        "selecione ao menos uma peça fechada."
+                    )
+                raise ValueError(
+                    "A seleção não contém nenhuma peça fechada reconhecível."
+                )
+            if selected_open_ids:
+                raise ValueError(
+                    "A seleção contém %d caminho(s) aberto(s); "
+                    "corrija-os ou retire-os da seleção."
+                    % len(selected_open_ids)
+                )
+            if not selection_scoped and classification.open_entity_ids:
                 raise ValueError(
                     "Há %d caminho(s) aberto(s); organize somente após corrigi-los."
                     % len(classification.open_entity_ids)
                 )
-            if not classification.pieces:
+            if not scoped_pieces:
                 raise ValueError("Nenhuma peça fechada foi encontrada.")
             locked_pieces = []
-            for classified_piece in classification.pieces:
+            for classified_piece in scoped_pieces:
                 entity_ids = (
                     classified_piece.outer_id,
-                ) + tuple(classified_piece.descendant_ids)
+                ) + tuple(classified_piece.descendant_ids) + tuple(
+                    classified_piece.feature_ids
+                ) + tuple(
+                    classified_piece.marking_ids
+                )
                 if any(
-                    bool(widget.document.layers_by_id[widget.document.get_entity(entity_id).layer_id].locked)
+                    bool(
+                        widget.document.layers_by_id[
+                            widget.document.get_entity(entity_id).layer_id
+                        ].locked
+                    )
                     for entity_id in entity_ids
                 ):
                     locked_pieces.append(classified_piece.piece_id)
@@ -6355,110 +7625,586 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                 piece.outer_path_id: piece
                 for piece in widget.document.pieces_by_id.values()
             }
-            rotations = {
-                piece.piece_id: tuple(
-                    metadata_by_outer.get(piece.outer_id).rotations_allowed
-                    if piece.outer_id in metadata_by_outer
-                    else (0.0, 90.0)
+            rotations = {}
+            for piece in scoped_pieces:
+                metadata = metadata_by_outer.get(piece.outer_id)
+                rotations[piece.piece_id] = (
+                    nesting_rotation_angles(
+                        metadata,
+                        outer_points=piece.outer_points,
+                    )
+                    if metadata is not None
+                    else nesting_rotation_angles(
+                        None,
+                        outer_points=piece.outer_points,
+                    )
                 )
-                for piece in classification.pieces
-            }
-            result = organize_pieces(
-                classification.pieces,
-                bounds,
-                spacing=float(spacing),
-                rotations=rotations,
-                search_mode=search_mode,
+        except Exception as error:
+            self._set_vector_editor_status(
+                "Organização não executada: %s" % error,
+                error=True,
             )
+            return
+
+        time_budget_seconds = max(2, min(300, int(time_budget_seconds)))
+        progress_maximum = time_budget_seconds * 10
+        progress = _OrganizationProgressDialog(
+            translate_text("Preparando a primeira solução…"),
+            translate_text("Parar e manter a melhor prévia"),
+            0,
+            progress_maximum,
+            self,
+        )
+        non_modal = getattr(QtCore.Qt, "NonModal", None)
+        if non_modal is None:
+            non_modal = getattr(
+                getattr(QtCore.Qt, "WindowModality", object),
+                "NonModal",
+                None,
+            )
+        if non_modal is not None:
+            progress.setWindowModality(non_modal)
+        progress.show()
+
+        token = object()
+        thread = QtCore.QThread(self)
+        worker = _OrganizationSearchWorker(
+            scoped_pieces,
+            bounds,
+            spacing,
+            rotations,
+            search_mode,
+            time_budget_seconds,
+            token,
+            toolpath_offset=(
+                float(nesting_contract["effective_diameter"])
+                * 0.5
+                if nesting_contract is not None
+                and nesting_contract["mode"] == "preserve_dimensions"
+                else 0.0
+            ),
+        )
+        worker.moveToThread(thread)
+        session = {
+            "token": token,
+            "widget": widget,
+            "classification": classification,
+            "pieces": scoped_pieces,
+            "selection_scoped": selection_scoped,
+            "document_revision": int(widget.document.revision),
+            "extra_quantity": sum(
+                max(0, piece.quantity - 1)
+                for piece in widget.document.pieces_by_id.values()
+                if any(
+                    classified.outer_id == piece.outer_path_id
+                    for classified in scoped_pieces
+                )
+            ),
+            "time_budget": float(time_budget_seconds),
+            "started": time.monotonic(),
+            "progress": progress,
+            "thread": thread,
+            "worker": worker,
+            "best": None,
+            "stage_label": "Preparando a primeira solução",
+            "stage_index": 0,
+            "stage_total": len(
+                _ORGANIZATION_SEARCH_STAGES.get(
+                    str(search_mode),
+                    _ORGANIZATION_SEARCH_STAGES["balanced"],
+                )
+            ),
+            "accept_results": True,
+            "failed_message": "",
+            "spacing_note": spacing_note,
+            "spacing": float(spacing),
+            "remnant_cut_clearance": max(
+                1.0,
+                (
+                    float(nesting_contract["effective_diameter"]) * 0.5
+                    if nesting_contract is not None
+                    else float(spacing) * 0.5
+                ),
+            ),
+            "create_remnant_cuts": bool(create_remnant_cuts),
+            "remnant_minimum_short_side": max(
+                0.0, float(remnant_minimum_short_side)
+            ),
+            "applied": False,
+        }
+        self._vector_editor_nesting_session = session
+        threads = getattr(self, "_vector_editor_nesting_threads", None)
+        if threads is None:
+            threads = []
+            self._vector_editor_nesting_threads = threads
+        threads.append(thread)
+
+        timer = QtCore.QTimer(self)
+        timer.setInterval(100)
+        session["timer"] = timer
+        timer.timeout.connect(
+            lambda current_token=token: self._vector_editor_nesting_tick(
+                current_token
+            )
+        )
+        progress.canceled.connect(
+            lambda current_token=token: self._cancel_vector_editor_nesting_search(
+                current_token,
+                keep_preview=True,
+            )
+        )
+        thread.started.connect(worker.run)
+        worker.stageStarted.connect(self._vector_editor_nesting_stage_started)
+        worker.resultReady.connect(self._vector_editor_nesting_result_ready)
+        worker.failed.connect(self._vector_editor_nesting_failed)
+        worker.finished.connect(self._vector_editor_nesting_finished)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(
+            lambda current_thread=thread: self._release_vector_editor_nesting_thread(
+                current_thread
+            )
+        )
+        timer.start()
+        thread.start()
+        self._set_vector_editor_status(
+            "%s%s"
+            % (
+                (spacing_note + " ") if spacing_note else "",
+                "Buscando encaixes: a primeira solução aparecerá assim que ficar pronta.",
+            )
+        )
+
+    def _active_vector_editor_nesting_session(self, token):
+        session = getattr(self, "_vector_editor_nesting_session", None)
+        if session is None or session.get("token") is not token:
+            return None
+        return session
+
+    def _vector_editor_nesting_tick(self, token):
+        session = self._active_vector_editor_nesting_session(token)
+        if session is None:
+            return
+        if session["widget"].document.revision != session["document_revision"]:
+            self._cancel_vector_editor_nesting_search(token, keep_preview=False)
+            self._set_vector_editor_status(
+                "Busca de organização cancelada porque o documento mudou.",
+                error=True,
+            )
+            return
+        elapsed = max(0.0, time.monotonic() - session["started"])
+        budget = session["time_budget"]
+        progress = session["progress"]
+        progress.setValue(min(progress.maximum(), int(elapsed * 10.0)))
+        remaining = max(0.0, budget - elapsed)
+        best = session.get("best")
+        best_text = (
+            translate_text("sem solução completa ainda")
+            if best is None
+            else translate_text("%d peça(s), %d chapa(s), %.1f%%")
+            % (
+                len(best.placements),
+                len(best.sheet_bounds),
+                best.utilization_percent,
+            )
+        )
+        if remaining > 0.0:
+            time_text = translate_text("%.1f s restantes") % remaining
+        else:
+            time_text = translate_text(
+                "tempo-alvo atingido; encerrando a tentativa atual"
+            )
+        progress.setLabelText(
+            translate_text("Tentativa %d/%d — %s\n%s • melhor: %s")
+            % (
+                session["stage_index"],
+                session["stage_total"],
+                translate_text(session["stage_label"]),
+                time_text,
+                best_text,
+            )
+        )
+
+    @QtCore.Slot(object, str, int, int)
+    def _vector_editor_nesting_stage_started(self, token, label, index, total):
+        session = self._active_vector_editor_nesting_session(token)
+        if session is None:
+            return
+        session["stage_label"] = str(label)
+        session["stage_index"] = int(index)
+        session["stage_total"] = int(total)
+        self._vector_editor_nesting_tick(token)
+
+    @QtCore.Slot(object, object, str, float, int)
+    def _vector_editor_nesting_result_ready(
+        self,
+        token,
+        result,
+        label,
+        elapsed,
+        attempt,
+    ):
+        session = self._active_vector_editor_nesting_session(token)
+        if session is None or not session.get("accept_results", False):
+            return
+        if session["widget"].document.revision != session["document_revision"]:
+            self._cancel_vector_editor_nesting_search(token, keep_preview=False)
+            return
+        session["best"] = result
+        session["stage_label"] = str(label)
+        self._vector_editor_present_organization_result(
+            session,
+            result,
+            is_searching=True,
+        )
+        self._set_vector_editor_status(
+            translate_text(
+                "Solução %d pronta em %.1f s; continuando a busca por encaixe melhor."
+            )
+            % (int(attempt), float(elapsed))
+        )
+        self._vector_editor_nesting_tick(token)
+
+    @QtCore.Slot(object, str)
+    def _vector_editor_nesting_failed(self, token, message):
+        session = self._active_vector_editor_nesting_session(token)
+        if session is not None:
+            session["failed_message"] = str(message)
+
+    @QtCore.Slot(object, str, float, int)
+    def _vector_editor_nesting_finished(self, token, reason, elapsed, stages):
+        session = self._active_vector_editor_nesting_session(token)
+        if session is None:
+            return
+        session["timer"].stop()
+        progress = session["progress"]
+        progress.setValue(progress.maximum())
+        progress.finish()
+        progress.deleteLater()
+        best = session.get("best")
+        applied = bool(session.get("applied"))
+        keep_preview = bool(session.get("keep_preview", True))
+        if not applied and best is not None and keep_preview:
+            self._vector_editor_present_organization_result(
+                session,
+                best,
+                is_searching=False,
+            )
+        if not applied:
+            if not keep_preview:
+                self._set_vector_editor_status(
+                    "Busca de organização interrompida; a prévia foi descartada."
+                )
+            elif best is None:
+                message = session.get("failed_message") or (
+                    "Busca interrompida antes de produzir a primeira solução."
+                    if reason == "cancelled"
+                    else "Nenhuma solução de organização foi produzida."
+                )
+                self._set_vector_editor_status(
+                    "Organização não executada: %s" % message,
+                    error=True,
+                )
+            else:
+                reason_text = {
+                    "time": "tempo-alvo atingido",
+                    "cancelled": "busca interrompida pelo operador",
+                    "exhausted": "todas as tentativas planejadas concluídas",
+                    "completed": "busca concluída",
+                }.get(str(reason), "busca concluída")
+                self._set_vector_editor_status(
+                    translate_text(
+                        "%s em %.1f s e %d etapa(s); a melhor prévia permanece pronta para aplicar."
+                    )
+                    % (
+                        translate_text(reason_text).capitalize(),
+                        float(elapsed),
+                        int(stages),
+                    )
+                )
+        self._vector_editor_nesting_session = None
+
+    def _cancel_vector_editor_nesting_search(
+        self,
+        token=None,
+        keep_preview=True,
+    ):
+        session = getattr(self, "_vector_editor_nesting_session", None)
+        if session is None or (token is not None and session.get("token") is not token):
+            return False
+        session["accept_results"] = False
+        session["keep_preview"] = bool(keep_preview)
+        timer = session.get("timer")
+        if timer is not None:
+            timer.stop()
+        thread = session.get("thread")
+        if thread is not None:
+            thread.requestInterruption()
+        progress = session.get("progress")
+        if progress is not None:
+            progress.setLabelText(
+                translate_text("Interrompendo a tentativa atual…")
+            )
+        if not keep_preview:
+            session["widget"].cancel_workflow_preview()
+        return True
+
+    def _release_vector_editor_nesting_thread(self, thread):
+        threads = getattr(self, "_vector_editor_nesting_threads", [])
+        if thread in threads:
+            threads.remove(thread)
+
+    def _vector_editor_present_organization_result(
+        self,
+        session,
+        result,
+        is_searching,
+    ):
+        """Project one immutable candidate and prepare its single Undo."""
+
+        widget = session["widget"]
+        classification = session["classification"]
+        scoped_pieces = tuple(session.get("pieces", classification.pieces))
+        extra_quantity = session["extra_quantity"]
+        try:
             replacements = []
             preview_entities = []
             classified_by_id = {
-                piece.piece_id: piece for piece in classification.pieces
+                piece.piece_id: piece for piece in scoped_pieces
             }
             for placement in result.placements:
                 classified = classified_by_id[placement.piece_id]
-                angle = float(placement.rotation_degrees or 0.0)
-                if abs(angle) <= 1e-9:
-                    transform = Affine2D.translation(
-                        Vec2(placement.dx, placement.dy)
-                    )
-                else:
-                    min_x, min_y, max_x, max_y = classified.bounds
-                    center = Vec2((min_x + max_x) * 0.5, (min_y + max_y) * 0.5)
-                    rotation = Affine2D.rotation(math.radians(angle), center)
-                    rotated_corners = tuple(
-                        rotation.apply_to_point(Vec2(x_value, y_value))
-                        for x_value, y_value in (
-                            (min_x, min_y),
-                            (max_x, min_y),
-                            (max_x, max_y),
-                            (min_x, max_y),
-                        )
-                    )
-                    rotated_min_x = min(point.x for point in rotated_corners)
-                    rotated_min_y = min(point.y for point in rotated_corners)
-                    translation = Affine2D.translation(
-                        placement.placed_bounds[0] - rotated_min_x,
-                        placement.placed_bounds[1] - rotated_min_y,
-                    )
-                    transform = translation @ rotation
+                transform = organization_placement_transform(
+                    classified,
+                    placement,
+                )
                 for entity_id in placement.entity_ids:
                     source_entity = widget.document.get_entity(entity_id)
                     transformed_entity = source_entity.transformed(transform)
                     preview_entities.append(transformed_entity)
                     if not transform.is_identity(1e-9):
                         replacements.append(transformed_entity)
-            if not replacements:
-                raise ValueError(
-                    "As peças que cabem já estão nas posições calculadas."
+            remnant_cuts = (
+                suggest_rectangular_remnant_cuts(
+                    result,
+                    minimum_short_side=session.get(
+                        "remnant_minimum_short_side", 100.0
+                    ),
+                    clearance=float(session.get("remnant_cut_clearance", 1.0)),
                 )
+                if session.get("create_remnant_cuts", True)
+                else ()
+            )
+            old_remnant_entities = {
+                entity_id: entity
+                for entity_id, entity in widget.document.entities_by_id.items()
+                if entity_is_remnant_cut(entity)
+            }
+
+            def remnant_signature(sheet_index, start, end):
+                return (
+                    int(sheet_index),
+                    *(round(float(value), 7) for value in tuple(start) + tuple(end)),
+                )
+
+            old_remnants_by_signature = {}
+            for entity in old_remnant_entities.values():
+                values = dict(getattr(entity, "metadata", {}) or {})
+                try:
+                    signature = remnant_signature(
+                        values.get("sheet_index", 0),
+                        values["cut_start"],
+                        values["cut_end"],
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+                old_remnants_by_signature[signature] = entity
+
+            serialized_remnant_cuts = []
+            new_remnant_entities = []
+            reused_remnant_ids = set()
+            for cut in remnant_cuts:
+                signature = remnant_signature(cut.sheet_index, cut.start, cut.end)
+                old_entity = old_remnants_by_signature.get(signature)
+                entity_metadata = {
+                    "woodcam_role": "remnant_cut",
+                    "remnant_id": str(cut.remnant_id or ""),
+                    "show_remnant_label": bool(cut.show_label),
+                    "sheet_index": int(cut.sheet_index),
+                    "cut_start": list(cut.start),
+                    "cut_end": list(cut.end),
+                    "remnant_bounds": list(cut.remnant_bounds),
+                    "remnant_area_mm2": float(cut.area),
+                }
+                remnant_entity = PathEntity.from_points(
+                    (
+                        old_entity.layer_id
+                        if old_entity is not None
+                        else widget.document.active_layer_id
+                    ),
+                    (Vec2(*cut.start), Vec2(*cut.end)),
+                    id=(old_entity.id if old_entity is not None else None),
+                    metadata=entity_metadata,
+                )
+                if old_entity is None:
+                    new_remnant_entities.append(remnant_entity)
+                else:
+                    reused_remnant_ids.add(old_entity.id)
+                    if remnant_entity != old_entity:
+                        replacements.append(remnant_entity)
+                serialized_remnant_cuts.append(
+                    {
+                        "entity_id": remnant_entity.id,
+                        "remnant_id": str(cut.remnant_id or ""),
+                        "show_label": bool(cut.show_label),
+                        "sheet_index": int(cut.sheet_index),
+                        "start": list(cut.start),
+                        "end": list(cut.end),
+                        "remnant_bounds": list(cut.remnant_bounds),
+                        "area": float(cut.area),
+                    }
+                )
+            stale_remnant_ids = tuple(
+                sorted(set(old_remnant_entities) - reused_remnant_ids)
+            )
+            serialized_sheet_bounds = [
+                list(value) for value in result.sheet_bounds
+            ]
+            metadata = getattr(widget.document, "metadata", {}) or {}
+            metadata_changed = (
+                metadata.get("organization_sheet_bounds")
+                != serialized_sheet_bounds
+                or metadata.get("organization_remnant_cuts")
+                != serialized_remnant_cuts
+            )
+            if (
+                not replacements
+                and not metadata_changed
+                and not stale_remnant_ids
+                and not new_remnant_entities
+            ):
+                self._set_vector_editor_status(
+                    translate_text(
+                        "A melhor solução atual coincide com as posições existentes%s."
+                    )
+                    % (
+                        translate_text("; a busca continua")
+                        if is_searching else ""
+                    )
+                )
+                return False
             # All vectors move in one replacement command.  The prior version
             # built one TransformEntitiesCommand per piece; applying a cabinet
             # layout then repeatedly rebuilt the scene and appeared frozen.
-            commands = [ReplaceEntitiesCommand(replacements)]
+            commands = []
+            if stale_remnant_ids:
+                commands.append(DeleteEntitiesCommand(stale_remnant_ids))
+            if replacements:
+                commands.append(ReplaceEntitiesCommand(replacements))
+            if new_remnant_entities:
+                commands.append(AddEntitiesCommand(new_remnant_entities))
             commands.append(
                 SetDocumentMetadataCommand(
                     "organization_sheet_bounds",
-                    [list(value) for value in result.sheet_bounds],
+                    serialized_sheet_bounds,
+                )
+            )
+            commands.append(
+                SetDocumentMetadataCommand(
+                    "organization_remnant_cuts",
+                    serialized_remnant_cuts,
                 )
             )
             if widget.document.pieces_by_id:
                 from dataclasses import replace
-                commands.append(
-                    ReplacePiecesCommand(
-                        replace(piece, stale=False)
-                        for piece in widget.document.pieces_by_id.values()
+                classified_by_outer = {
+                    value.outer_id: value for value in scoped_pieces
+                }
+                updated_pieces = []
+                for piece in widget.document.pieces_by_id.values():
+                    classified = classified_by_outer.get(piece.outer_path_id)
+                    if classified is None:
+                        updated_pieces.append(piece)
+                        continue
+                    metadata = dict(piece.metadata or {})
+                    metadata["pocket_path_ids"] = list(classified.feature_ids)
+                    metadata["marking_path_ids"] = list(classified.marking_ids)
+                    updated_pieces.append(
+                        replace(
+                            piece,
+                            inner_path_ids=classified.descendant_ids,
+                            metadata=metadata,
+                            stale=False,
+                        )
                     )
+                commands.append(
+                    ReplacePiecesCommand(updated_pieces)
                 )
             organize_command = CompositeCommand(
                 commands,
                 label="Organizar peças 2D",
             )
-            extra_quantity = sum(
-                max(0, piece.quantity - 1)
-                for piece in widget.document.pieces_by_id.values()
-            )
-            summary = (
+            remnant_summary = ""
+            if remnant_cuts:
+                labeled_remnants = tuple(
+                    cut for cut in remnant_cuts if cut.show_label
+                )
+                remnant_summary = translate_text(
+                    "; %d retalho(s) retangular(es) sugerido(s), %.2f m² no total"
+                ) % (
+                    len(labeled_remnants),
+                    sum(cut.area for cut in labeled_remnants) / 1_000_000.0,
+                )
+            summary = translate_text(
                 "Prévia do nesting inteligente: magenta = destino, azul = posição atual. "
                 "%d peça(s) em %d chapa(s); %d não couberam. Eficiência %.1f%%; "
-                "%s venceu entre %d layouts%s."
-                % (
+                "%s venceu entre %d layouts%s%s."
+            ) % (
                     len(result.placements),
                     len(result.sheet_bounds),
                     len(result.unplaced_piece_ids),
                     result.utilization_percent,
-                    result.strategy or "encaixe",
+                    translate_text(result.strategy or "encaixe"),
                     result.evaluated_layouts,
-                    "; %d ocorrência(s) extra serão replicadas pelo PanelNest"
-                    % extra_quantity if extra_quantity else "",
-                )
+                    translate_text(
+                        "; %d ocorrência(s) extra serão replicadas pelo PanelNest"
+                    ) % extra_quantity if extra_quantity else "",
+                    translate_text("; busca continua em segundo plano")
+                    if is_searching else translate_text("; busca concluída"),
             )
+            if remnant_summary:
+                summary = summary.rstrip(".") + remnant_summary + "."
 
             def apply_organization():
+                if widget.document.revision != session["document_revision"]:
+                    self._set_vector_editor_status(
+                        "A prévia de organização ficou desatualizada; execute a busca novamente.",
+                        error=True,
+                    )
+                    return
+                session["applied"] = True
+                self._cancel_vector_editor_nesting_search(
+                    session.get("token"),
+                    keep_preview=True,
+                )
                 widget.controller.execute(organize_command)
+                # Creating the last primitive leaves only that entity selected.
+                # If nesting keeps this stale selection, the Editor→CAM bridge
+                # silently sends one organized piece instead of the complete
+                # layout.  The applied organization is the operator's explicit
+                # scope, so select every moved piece as a transient UI state.
+                organized_entity_ids = tuple(
+                    entity_id
+                    for placement in result.placements
+                    for entity_id in placement.entity_ids
+                )
+                widget.controller.selection.replace(organized_entity_ids)
                 if result.unplaced_piece_ids:
                     self._set_vector_editor_status(
-                        "Organizadas %d em %d chapa(s); %d peça(s) não cabem nem em uma chapa vazia."
+                        translate_text(
+                            "Organizadas %d em %d chapa(s); %d peça(s) não cabem nem em uma chapa vazia."
+                        )
                         % (
                             len(result.placements),
                             len(result.sheet_bounds),
@@ -6468,11 +8214,16 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                     )
                 else:
                     self._set_vector_editor_status(
-                        "Organizadas %d peça(s) em %d chapa(s), sempre com seus furos/recortes%s."
+                        translate_text(
+                            "Organizadas %d peça(s) em %d chapa(s), sempre com seus "
+                            "furos, recortes e marcações%s."
+                        )
                         % (
                             len(result.placements),
                             len(result.sheet_bounds),
-                            "; quantidades extras seguem para o PanelNest"
+                            translate_text(
+                                "; quantidades extras seguem para o PanelNest"
+                            )
                             if extra_quantity else "",
                         )
                     )
@@ -6481,13 +8232,14 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                 preview_entities,
                 summary,
                 apply_organization,
-                apply_label="Aplicar organização",
+                apply_label=translate_text("Aplicar organização"),
                 sheet_bounds=result.sheet_bounds,
+                remnant_cuts=serialized_remnant_cuts,
             )
+            return True
         except Exception as error:
             self._set_vector_editor_status("Organização não executada: %s" % error, error=True)
-        finally:
-            self._close_vector_editor_busy_dialog(busy)
+            return False
 
     def _vector_editor_send_panelnest(self):
         """Materializa peças completas, incluindo todos os recortes, para PanelNest."""
@@ -6567,42 +8319,305 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             % ("Editor 2D" if self._use_vector_editor_for_cam else "seleção do FreeCAD")
         )
 
-    def _vector_editor_geometry_for_cam(self):
+    def _vector_editor_geometry_for_cam(self, operation_mode=None):
         widget = getattr(self, "vector_editor_widget", None)
         if widget is None or not widget.document.entities_by_id:
             raise ValueError("O Editor 2D ainda não possui vetores.")
-        report = validate_document(
-            widget.document,
-            join_tolerance=self._vector_editor_join_tolerance(),
-        )
-        if report.blockers:
-            raise GeometryAdapterError(report.blockers[0].message)
+        operation_mode = str(operation_mode or "")
+        # Um círculo pequeno é naturalmente um furo nas operações de Furo e
+        # Corte. Em Preenchimento, porém, o próprio círculo selecionado é a
+        # área fechada a esvaziar; classificá-lo como furo deixava a operação
+        # sem contorno externo apesar de o diagnóstico vetorial estar correto.
+        classify_small_circles_as_holes = operation_mode != "pocket"
+        sheet_context = self._active_vector_editor_sheet_context()
+        sheet_entity_ids = None
+        if sheet_context is not None:
+            _sheet_index, sheet_bounds = sheet_context
+            sheet_entity_ids = {
+                entity_id
+                for entity_id, entity in widget.document.entities_by_id.items()
+                if self._entity_is_inside_sheet(entity, sheet_bounds)
+            }
         selected = tuple(widget.selected_entity_ids)
         if selected:
             # Clicking an imported board selects its persistent GroupEntity.
-            # CAM consumes leaf contours, never the relationship object itself;
-            # expanding here also keeps outer contours and their holes
-            # together for the normal nesting/containment pass.
+            # CAM consumes leaf contours, never the relationship object itself.
             selected = widget.controller.expand_group_children(selected)
+            selected_entities = {
+                entity_id: widget.document.get_entity(entity_id)
+                for entity_id in selected
+            }
+            if operation_mode == "pocket":
+                pocket_region_ids = {
+                    entity_id
+                    for entity_id, entity in selected_entities.items()
+                    if str(
+                        (getattr(entity, "metadata", {}) or {}).get(
+                            "import_role", ""
+                        )
+                        or ""
+                    )
+                    == "pocket_region"
+                }
+                if pocket_region_ids:
+                    selected = tuple(
+                        entity_id
+                        for entity_id, entity in widget.document.entities_by_id.items()
+                        if entity_id in pocket_region_ids
+                        or str(
+                            (getattr(entity, "metadata", {}) or {}).get(
+                                "pocket_region_id", ""
+                            )
+                            or ""
+                        )
+                        in pocket_region_ids
+                    )
+            elif operation_mode in {"cut", "holes"}:
+                selected = tuple(
+                    entity_id
+                    for entity_id, entity in selected_entities.items()
+                    if str(
+                        (getattr(entity, "metadata", {}) or {}).get(
+                            "import_role", ""
+                        )
+                        or ""
+                    )
+                    not in {"pocket_region", "pocket_island"}
+                )
             if not selected:
                 raise GeometryAdapterError(
-                    "A seleção não contém vetores CAM; escolha uma peça ou contorno fechado."
+                    "A seleção não contém vetores compatíveis com esta operação CAM."
                 )
+        if sheet_entity_ids is not None:
+            selected = tuple(
+                entity_id for entity_id in selected
+                if entity_id in sheet_entity_ids
+            )
+            if widget.selected_entity_ids and not selected:
+                raise GeometryAdapterError(
+                    "A seleção não contém vetores compatíveis na chapa ativa."
+                )
+        if selected:
+            remnant_entities = tuple(
+                widget.document.get_entity(entity_id)
+                for entity_id in selected
+                if entity_is_remnant_cut(widget.document.get_entity(entity_id))
+            )
+            if remnant_entities:
+                if len(remnant_entities) == len(selected):
+                    if operation_mode not in {"", "cut"}:
+                        raise GeometryAdapterError(
+                            "Linhas de separação de retalho são usinadas somente pela operação Corte."
+                        )
+                    remnant_paths = []
+                    for entity in remnant_entities:
+                        points = vector_entity_points(entity, deflection=0.01)
+                        if len(points) < 2:
+                            raise GeometryAdapterError(
+                                "A linha de separação selecionada não possui extensão válida."
+                            )
+                        remnant_paths.append(points)
+                    return {
+                        "contours": [],
+                        "holes": [],
+                        "remnant_cuts": remnant_paths,
+                        "remnant_cut_entity_ids": [
+                            entity.id for entity in remnant_entities
+                        ],
+                    }
+                # Ctrl+A and a window around the complete layout naturally
+                # include the orange stock-separation helpers.  They are an
+                # opt-in centerline operation, so a mixed selection must keep
+                # the ordinary part contours usable without silently adding
+                # those open cuts to the job.  Selecting only the orange lines
+                # still takes the dedicated branch above.
+                selected = tuple(
+                    entity_id
+                    for entity_id in selected
+                    if not entity_is_remnant_cut(
+                        widget.document.get_entity(entity_id)
+                    )
+                )
+        report = validate_document(
+            widget.document,
+            join_tolerance=self._vector_editor_join_tolerance(),
+            entity_ids=(
+                selected
+                or (
+                    tuple(sorted(sheet_entity_ids))
+                    if sheet_entity_ids is not None
+                    else None
+                )
+            ),
+        )
+        blockers = sorted(
+            report.errors,
+            key=lambda issue: (0 if issue.code == "DUPLICATE_ENTITY" else 1),
+        )
+        if getattr(self, "_ignore_contour_intersections_for_build", False):
+            blockers = [
+                issue for issue in blockers
+                if issue.code != "CONTOUR_INTERSECTION"
+            ]
+        if blockers:
+            raise GeometryAdapterError(blockers[0].message)
+        if selected:
             return document_to_woodcam_geometry(
                 widget.document,
                 entity_ids=selected,
+                classify_small_circles_as_holes=classify_small_circles_as_holes,
             )
         if widget.document.pieces_by_id:
+            piece_ids = tuple(widget.document.pieces_by_id)
+            if sheet_entity_ids is not None:
+                piece_ids = tuple(
+                    piece_id
+                    for piece_id, piece in widget.document.pieces_by_id.items()
+                    if piece.outer_path_id in sheet_entity_ids
+                )
+                if not piece_ids:
+                    raise GeometryAdapterError(
+                        "A chapa ativa não contém nenhuma Peça 2D reconhecida."
+                    )
             return document_to_woodcam_geometry(
                 widget.document,
-                piece_ids=tuple(widget.document.pieces_by_id),
+                piece_ids=piece_ids,
+                classify_small_circles_as_holes=classify_small_circles_as_holes,
             )
-        return document_to_woodcam_geometry(widget.document)
+        if sheet_entity_ids is not None:
+            if not sheet_entity_ids:
+                raise GeometryAdapterError(
+                    "A chapa ativa não contém vetores para esta operação CAM."
+                )
+            return document_to_woodcam_geometry(
+                widget.document,
+                entity_ids=tuple(sorted(sheet_entity_ids)),
+                classify_small_circles_as_holes=classify_small_circles_as_holes,
+            )
+        return document_to_woodcam_geometry(
+            widget.document,
+            classify_small_circles_as_holes=classify_small_circles_as_holes,
+        )
 
-    def _active_geometry(self):
+    def _active_geometry(self, operation_mode=None):
+        # A remnant separation line exists only in VectorDocument. Requiring
+        # the global CAM-source toggle as well made Apply fall through to the
+        # FreeCAD selection reader and ask for a Sketch/face, even though the
+        # operator had explicitly selected the orange line in the Editor.
+        if str(operation_mode or "") == "cut":
+            widget = getattr(self, "vector_editor_widget", None)
+            if widget is not None and widget.selected_entity_ids:
+                selected = widget.controller.expand_group_children(
+                    widget.selected_entity_ids
+                )
+                if selected and all(
+                    entity_is_remnant_cut(widget.document.get_entity(entity_id))
+                    for entity_id in selected
+                ):
+                    self._use_vector_editor_for_cam = True
+                    widget.use_cam_action.setChecked(True)
         if self._use_vector_editor_for_cam:
-            return self._vector_editor_geometry_for_cam()
+            return self._vector_editor_geometry_for_cam(operation_mode)
         return get_selected_geometry()
+
+    def _active_vector_editor_sheet_context(self):
+        """Return the explicit organized sheet selected in the 2D Editor.
+
+        ``work_area`` alone is still the ordinary document coordinate space.
+        A local machine datum is introduced only when the organizer persisted
+        physical sheet bounds; this preserves the established single-sheet
+        Editor/FreeCAD behaviour while giving every organized sheet its own
+        X0/Y0.
+        """
+
+        if not self._use_vector_editor_for_cam:
+            return None
+        widget = getattr(self, "vector_editor_widget", None)
+        document = getattr(widget, "document", None)
+        sheet_panel = getattr(widget, "sheet_panel", None)
+        if document is None or sheet_panel is None:
+            return None
+        configured = tuple(
+            (getattr(document, "metadata", {}) or {}).get(
+                "organization_sheet_bounds", ()
+            )
+            or ()
+        )
+        if not configured:
+            return None
+        try:
+            index = int(sheet_panel.current_index())
+            bounds = tuple(map(float, sheet_panel.current_bounds()))
+        except (TypeError, ValueError):
+            return None
+        if index < 0 or len(bounds) != 4:
+            return None
+        min_x, min_y, max_x, max_y = bounds
+        if max_x <= min_x or max_y <= min_y:
+            return None
+        return index, (min_x, min_y, max_x, max_y)
+
+    @staticmethod
+    def _entity_is_inside_sheet(entity, bounds, tolerance=1.0e-6):
+        if isinstance(entity, GroupEntity) or not hasattr(entity, "bounds"):
+            return False
+        try:
+            entity_bounds = entity.bounds()
+            min_x, min_y, max_x, max_y = map(float, bounds)
+            return (
+                float(entity_bounds.min_x) >= min_x - tolerance
+                and float(entity_bounds.min_y) >= min_y - tolerance
+                and float(entity_bounds.max_x) <= max_x + tolerance
+                and float(entity_bounds.max_y) <= max_y + tolerance
+            )
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _geometry_for_sheet(geometry, bounds, tolerance=1.0e-6):
+        """Filter a CAM copy to one sheet without mutating VectorDocument."""
+
+        min_x, min_y, max_x, max_y = map(float, bounds)
+
+        def point_inside(point):
+            try:
+                x_value, y_value = float(point[0]), float(point[1])
+            except (IndexError, TypeError, ValueError):
+                return False
+            return (
+                min_x - tolerance <= x_value <= max_x + tolerance
+                and min_y - tolerance <= y_value <= max_y + tolerance
+            )
+
+        contours = [
+            contour
+            for contour in list((geometry or {}).get("contours", ()) or ())
+            if contour and all(point_inside(point) for point in contour)
+        ]
+        holes = []
+        for hole in list((geometry or {}).get("holes", ()) or ()):
+            points = list(hole.get("points", ()) or ())
+            if points:
+                if all(point_inside(point) for point in points):
+                    holes.append(hole)
+                continue
+            try:
+                center_x = float(hole.get("x", 0.0))
+                center_y = float(hole.get("y", 0.0))
+                radius = abs(float(hole.get("diameter_mm", 0.0) or 0.0)) * 0.5
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if (
+                center_x - radius >= min_x - tolerance
+                and center_y - radius >= min_y - tolerance
+                and center_x + radius <= max_x + tolerance
+                and center_y + radius <= max_y + tolerance
+            ):
+                holes.append(hole)
+        scoped = dict(geometry or {})
+        scoped["contours"] = contours
+        scoped["holes"] = holes
+        return scoped
 
     def _selected_freecad_geometry_is_absolute(self):
         """Informa se a seleção 2D já está no XY final de usinagem.
@@ -7087,7 +9102,10 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         layout = QtWidgets.QHBoxLayout(group)
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(10)
-        diagram = MiniSetupDiagram(diagram_kind, state_provider, group)
+        if str(diagram_kind).startswith("icon:"):
+            diagram = SemanticSetupIcon(str(diagram_kind).split(":", 1)[1], group)
+        else:
+            diagram = MiniSetupDiagram(diagram_kind, state_provider, group)
         self.setup_diagrams.append(diagram)
         if diagram_key:
             self.operation_diagrams[diagram_key] = diagram
@@ -7112,7 +9130,10 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             icon = self._load_diagram_icon(icon_kind)
             if icon is None or icon.isNull():
                 icon = self._temporary_tab_icon(icon_kind)
-            display_title = title if title in {"Trabalho", "Material"} else ""
+            # A barra mantém a mesma estrutura em qualquer idioma: todas as
+            # operações exibem ícone e nome. O QTabWidget já fornece rolagem
+            # horizontal quando a largura disponível não comporta as abas.
+            display_title = title
             index = self.operation_tabs.addTab(content, icon, display_title)
             self.operation_tabs.setTabToolTip(index, title)
             try:
@@ -7128,7 +9149,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         icon = self._load_diagram_icon(icon_kind)
         if icon is None or icon.isNull():
             icon = self._temporary_tab_icon(icon_kind)
-        display_title = title if title in {"Trabalho", "Material"} else ""
+        display_title = title
         index = self.operation_tabs.addTab(scroll, icon, display_title)
         self.operation_tabs.setTabToolTip(index, title)
         try:
@@ -7392,6 +9413,126 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         if key is not None and key == self._current_document_key and index >= 0:
             self._document_tab_indices[key] = int(index)
 
+    @staticmethod
+    def _independent_woodcam_window_flags():
+        return (
+            QtCore.Qt.Window
+            | QtCore.Qt.WindowTitleHint
+            | QtCore.Qt.WindowSystemMenuHint
+            | QtCore.Qt.WindowMinimizeButtonHint
+            | QtCore.Qt.WindowMaximizeButtonHint
+            | QtCore.Qt.WindowCloseButtonHint
+        )
+
+    def _set_window_mode_button_tooltip(self, source_text):
+        button = self.window_mode_button
+        # Preserve the Portuguese source explicitly.  This tooltip changes at
+        # runtime, including when the UI is already in English.
+        button.setProperty("woodcam_source_toolTip", str(source_text))
+        button.setToolTip(translate_text(source_text))
+
+    def _update_woodcam_window_mode_button(self):
+        button = getattr(self, "window_mode_button", None)
+        if button is None:
+            return
+        detached = bool(self._woodcam_window_detached)
+        blocker = QtCore.QSignalBlocker(button)
+        button.setChecked(detached)
+        del blocker
+        if detached:
+            button.setIcon(
+                self.style().standardIcon(QtWidgets.QStyle.SP_TitleBarNormalButton)
+            )
+            if self._woodcam_host_parent is None:
+                button.setEnabled(False)
+                self._set_window_mode_button_tooltip(
+                    "O WoodCAM já está em uma janela independente"
+                )
+            else:
+                button.setEnabled(True)
+                self._set_window_mode_button_tooltip(
+                    "Prender o WoodCAM novamente ao FreeCAD"
+                )
+        else:
+            button.setEnabled(self._woodcam_host_parent is not None)
+            button.setIcon(
+                self.style().standardIcon(QtWidgets.QStyle.SP_TitleBarMaxButton)
+            )
+            self._set_window_mode_button_tooltip(
+                "Soltar o WoodCAM em uma janela independente"
+            )
+
+    def _toggle_woodcam_window_mode(self, _checked=False):
+        """Alternate this same dialog between FreeCAD child and native window."""
+
+        if self._woodcam_window_detached:
+            self._attach_woodcam_to_freecad()
+        else:
+            self._detach_woodcam_from_freecad()
+
+    def _detach_woodcam_from_freecad(self):
+        host = self._woodcam_host_parent
+        if host is None or self._woodcam_window_detached:
+            self._update_woodcam_window_mode_button()
+            return
+        try:
+            host.objectName()
+        except RuntimeError:
+            self._woodcam_host_parent = None
+            self._update_woodcam_window_mode_button()
+            return
+
+        self._woodcam_attached_position = QtCore.QPoint(self.pos())
+        self._woodcam_attached_size = QtCore.QSize(self.size())
+        self.hide()
+        self.setParent(None, self._independent_woodcam_window_flags())
+        if self._woodcam_detached_size is not None:
+            self.resize(self._woodcam_detached_size)
+        self._woodcam_window_detached = True
+        self._update_woodcam_window_mode_button()
+        # On Wayland/Niri the compositor owns top-level placement.  Calling
+        # move() here is both ineffective and the cause of several shells
+        # treating the window as a transient surface instead of an ordinary
+        # independent window.
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _attach_woodcam_to_freecad(self):
+        host = self._woodcam_host_parent
+        if host is None or not self._woodcam_window_detached:
+            self._update_woodcam_window_mode_button()
+            return
+        try:
+            host.objectName()
+        except RuntimeError:
+            self._woodcam_host_parent = None
+            self._update_woodcam_window_mode_button()
+            return
+
+        self._woodcam_detached_size = QtCore.QSize(self.size())
+        self.hide()
+        self.setParent(host, QtCore.Qt.Widget)
+        if self._woodcam_attached_size is not None:
+            self.resize(self._woodcam_attached_size)
+        target = self._woodcam_attached_position
+        if target is None:
+            target = QtCore.QPoint(
+                max(0, (host.width() - self.width()) // 2),
+                max(0, (host.height() - self.height()) // 2),
+            )
+        max_x = max(0, host.width() - self.width())
+        max_y = max(0, host.height() - self.height())
+        self.move(
+            max(0, min(int(target.x()), max_x)),
+            max(0, min(int(target.y()), max_y)),
+        )
+        self._woodcam_window_detached = False
+        self._positioned_once = True
+        self._update_woodcam_window_mode_button()
+        self.show()
+        self.raise_()
+
     def _detach_vector_editor(self):
         """Move o Editor 2D real para uma janela nativa, sem copiar estado."""
 
@@ -7425,6 +9566,9 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         widget.setParent(window)
         layout.addWidget(widget, 1)
         widget.show()
+        # Keep the detached title and its embedded toolbar synchronized with
+        # the language selected in the main WoodCAM window.
+        register_widget(window)
         window.finished.connect(self._reattach_vector_editor)
         self._detached_editor_window = window
         self.detach_editor_button.setIcon(
@@ -7462,13 +9606,39 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                 "Abrir o mesmo Editor 2D em uma janela própria"
             )
             window.deleteLater()
+            if not self.isVisible():
+                timer = getattr(self, "_vector_editor_sync_timer", None)
+                if timer is not None:
+                    timer.stop()
         finally:
             self._reattaching_vector_editor = False
 
     def reject(self):
+        self._cancel_vector_editor_nesting_search(keep_preview=False)
         self.hide()
 
+    def hideEvent(self, event):
+        """Suspend background polling while no WoodCAM editor is visible."""
+
+        timer = getattr(self, "_vector_editor_sync_timer", None)
+        detached = getattr(self, "_detached_editor_window", None)
+        detached_visible = bool(
+            detached is not None and detached.isVisible()
+        )
+        if timer is not None and not detached_visible:
+            timer.stop()
+        super(WoodCAM2DDialog, self).hideEvent(event)
+
+    def showEvent(self, event):
+        """Resume one history synchronizer when the existing dialog returns."""
+
+        super(WoodCAM2DDialog, self).showEvent(event)
+        timer = getattr(self, "_vector_editor_sync_timer", None)
+        if timer is not None and not timer.isActive():
+            timer.start()
+
     def closeEvent(self, event):
+        self._cancel_vector_editor_nesting_search(keep_preview=False)
         event.ignore()
         self.hide()
 
@@ -7510,6 +9680,9 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
     def _update_operation_controls(self, _checked=None):
         hole_fields = self.operation_fields["holes"]
         hole_fields["cut_depth"].setEnabled(not self.use_model_hole_depths.isChecked())
+        counterbore_enabled = self.hole_counterbore_enabled.isChecked()
+        hole_fields["hole_counterbore_diameter"].setEnabled(counterbore_enabled)
+        hole_fields["hole_counterbore_depth"].setEnabled(counterbore_enabled)
         hole_fields["helix_pitch"].setEnabled(self.use_helical_drilling.isChecked())
         hole_fields["helix_stepover_percent"].setEnabled(
             self.use_helical_drilling.isChecked()
@@ -7589,6 +9762,125 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
     def _add_field(self, grid, row, label_text, name):
         return self._add_field_at(grid, row, label_text, name)
 
+    @staticmethod
+    def _format_simulation_speed(value):
+        value = float(value)
+        if value < 1.0:
+            text = "%.2g" % value
+            return text.replace(".", ",") + "x"
+        if abs(value - round(value)) <= 1.0e-9:
+            return "%dx" % int(round(value))
+        return ("%g" % value).replace(".", ",") + "x"
+
+    @staticmethod
+    def _simulation_speed_step_index(value):
+        target = max(0.001, float(value))
+        return min(
+            range(len(SIMULATION_SPEED_STEPS)),
+            key=lambda index: abs(
+                math.log(SIMULATION_SPEED_STEPS[index]) - math.log(target)
+            ),
+        )
+
+    def _add_simulation_speed_control(self, grid, row):
+        """Create the live playback slider while preserving settings storage."""
+
+        name = "simulation_speed_multiplier"
+        default_value = self._default_field_value(name)
+        stored_field = QtWidgets.QLineEdit(self._format_value(default_value), self)
+        stored_field.setObjectName("simulationSpeedStoredValue")
+        stored_field.hide()
+        self.fields[name] = stored_field
+        self.field_labels[name] = "Velocidade da simulação"
+
+        label = QtWidgets.QLabel("Velocidade da simulação")
+        slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        slider.setObjectName("simulationSpeedSlider")
+        slider.setRange(0, len(SIMULATION_SPEED_STEPS) - 1)
+        slider.setSingleStep(1)
+        slider.setPageStep(3)
+        slider.setTickInterval(1)
+        slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
+        slider.setToolTip(
+            "Arraste durante a simulação: a velocidade muda imediatamente, "
+            "sem reiniciar nem saltar o percurso. Faixa de 0,1x a 200x."
+        )
+        value_label = QtWidgets.QLabel()
+        value_label.setObjectName("simulationSpeedValue")
+        value_label.setAlignment(QtCore.Qt.AlignCenter)
+        value_label.setMinimumWidth(52)
+        value_label.setStyleSheet(
+            "color: #0f4c81; background: #eff6ff; border: 1px solid #93c5fd; "
+            "border-radius: 4px; padding: 2px 5px; font-weight: bold;"
+        )
+        grid.addWidget(label, row, 0)
+        grid.addWidget(slider, row, 1)
+        grid.addWidget(value_label, row, 2)
+        self.simulation_speed_slider = slider
+        self.simulation_speed_value_label = value_label
+
+        slider.valueChanged.connect(self._simulation_speed_slider_changed)
+        stored_field.textChanged.connect(
+            self._sync_simulation_speed_slider_from_field
+        )
+        slider.setValue(self._simulation_speed_step_index(default_value))
+        self._simulation_speed_slider_changed(slider.value())
+
+    def _current_simulation_speed(self):
+        slider = getattr(self, "simulation_speed_slider", None)
+        if slider is not None:
+            return float(SIMULATION_SPEED_STEPS[slider.value()])
+        try:
+            return max(
+                0.001,
+                float(
+                    self.fields["simulation_speed_multiplier"]
+                    .text()
+                    .strip()
+                    .replace(",", ".")
+                ),
+            )
+        except (KeyError, TypeError, ValueError):
+            return 1.0
+
+    def _sync_simulation_speed_slider_from_field(self, text):
+        slider = getattr(self, "simulation_speed_slider", None)
+        if slider is None:
+            return
+        try:
+            value = float(str(text).strip().replace(",", "."))
+        except (TypeError, ValueError):
+            return
+        index = self._simulation_speed_step_index(value)
+        if slider.value() != index:
+            slider.setValue(index)
+
+    def _simulation_speed_slider_changed(self, index):
+        index = max(0, min(len(SIMULATION_SPEED_STEPS) - 1, int(index)))
+        value = float(SIMULATION_SPEED_STEPS[index])
+        label = getattr(self, "simulation_speed_value_label", None)
+        if label is not None:
+            label.setText(self._format_simulation_speed(value))
+        field = self.fields.get("simulation_speed_multiplier")
+        if field is not None:
+            text = self._format_value(value)
+            if field.text() != text:
+                field.setText(text)
+        try:
+            preferences = FreeCAD.ParamGet(WOODCAM_PARAMETER_PATH)
+            preferences.SetFloat("simulation_speed_multiplier", value)
+            FreeCAD.saveParameter()
+        except Exception:
+            pass
+        state = getattr(self, "simulation_state", None)
+        if state is not None:
+            self._set_simulation_clock_speed(
+                state,
+                value,
+                time.monotonic(),
+            )
+            state["settings"]["simulation_speed_multiplier"] = value
+
     def _add_operation_field(self, grid, row, label_text, mode, name, default_key=None):
         default_value = DEFAULT_PRESETS[default_key or name]
         edit = QtWidgets.QLineEdit(self._format_value(default_value))
@@ -7604,19 +9896,34 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         self._add_operation_field(
             grid,
             0,
-            "Cota inicial (mm)",
+            "Profundidade inicial Z (mm)",
             mode,
             "start_depth",
             "operation_start_depth",
         )
-        self._add_operation_field(
+        self.operation_fields[mode]["start_depth"].setToolTip(
+            "Profundidade que já foi usinada, medida desde a face original do "
+            "material. O percurso começa nessa cota. Não é diâmetro e não "
+            "cria rebaixo."
+        )
+        final_depth_field = self._add_operation_field(
             grid,
             1,
-            "Profundidade de corte (mm)",
+            "Profundidade final Z (mm)",
             mode,
             "cut_depth",
             cut_depth_default_key or "operation_cut_depth",
         )
+        final_depth_field.setToolTip(
+            "Cota final absoluta medida desde a face original do material. "
+            "Ex.: início 6 mm e final 7 mm usinam somente o 1 mm restante."
+        )
+        explanation = QtWidgets.QLabel(
+            "Ex.: início 6 mm → final 7 mm = usinar 1 mm restante."
+        )
+        explanation.setWordWrap(True)
+        explanation.setStyleSheet("color: #475569;")
+        grid.addWidget(explanation, 2, 1, 1, 2)
         return self._compact_group(group)
 
     def _make_tool_group(self, mode, show_passes=True):
@@ -7680,8 +9987,10 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             edit.setVisible(False)
             self.operation_fields.setdefault(mode, {})[field_name] = edit
             self.operation_field_labels.setdefault(mode, {})[field_name] = label
-        if "cut_depth" in self.operation_fields.get(mode, {}):
-            self.operation_fields[mode]["cut_depth"].textChanged.connect(
+        for depth_field_name in ("start_depth", "cut_depth"):
+            if depth_field_name not in self.operation_fields.get(mode, {}):
+                continue
+            self.operation_fields[mode][depth_field_name].textChanged.connect(
                 lambda _text, operation_mode=mode: self._clear_pass_schedule(
                     operation_mode
                 )
@@ -7710,23 +10019,53 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
     def _operation_depth_and_stepdown(self, mode):
         fields = self.operation_fields.get(mode, {})
         try:
-            depth = float(fields["cut_depth"].text().strip().replace(",", "."))
+            start_depth = float(
+                fields["start_depth"].text().strip().replace(",", ".")
+            )
+            final_depth = float(
+                fields["cut_depth"].text().strip().replace(",", ".")
+            )
             stepdown = float(fields["stepdown"].text().strip().replace(",", "."))
         except (KeyError, ValueError):
             return 0.0, 0.0
-        return max(0.0, depth), max(0.0, stepdown)
+        remaining_depth = max(0.0, final_depth - max(0.0, start_depth))
+        return remaining_depth, max(0.0, stepdown)
+
+    def _operation_depth_range(self, mode):
+        fields = self.operation_fields.get(mode, {})
+        try:
+            start_depth = max(
+                0.0,
+                float(fields["start_depth"].text().strip().replace(",", ".")),
+            )
+            final_depth = max(
+                0.0,
+                float(fields["cut_depth"].text().strip().replace(",", ".")),
+            )
+            stepdown = max(
+                0.0,
+                float(fields["stepdown"].text().strip().replace(",", ".")),
+            )
+        except (KeyError, ValueError):
+            return 0.0, 0.0, 0.0, 0.0
+        return start_depth, final_depth, max(0.0, final_depth - start_depth), stepdown
 
     def _update_passes_label(self, mode):
         label = self.operation_pass_labels.get(mode)
         if label is None:
             return
-        depth, stepdown = self._operation_depth_and_stepdown(mode)
+        start_depth, final_depth, depth, stepdown = self._operation_depth_range(mode)
+        if final_depth <= start_depth and final_depth > 0.0:
+            label.setText("Final deve ser maior que o início")
+            return
         if depth <= 0.0 or stepdown <= 0.0:
             label.setText("—")
             return
         schedule = self._pass_schedules.get(mode)
         passes = len(schedule) if schedule else max(1, int(math.ceil(depth / stepdown)))
-        label.setText(f"{passes} passagem" + ("" if passes == 1 else "s"))
+        label.setText(
+            "1 passagem" if passes == 1 else f"{passes} passagens"
+        )
 
     def _clear_pass_schedule(self, mode):
         self._pass_schedules.pop(mode, None)
@@ -7736,19 +10075,22 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         fields = self.operation_fields.get(mode, {})
         if "cut_depth" not in fields or "stepdown" not in fields:
             return
-        depth, stepdown = self._operation_depth_and_stepdown(mode)
+        start_depth, final_depth, depth, stepdown = self._operation_depth_range(mode)
         if depth <= 0.0:
             QtWidgets.QMessageBox.warning(
                 self,
                 "Editar passagens",
-                "Informe a profundidade de corte antes de editar as passagens.",
+                "A profundidade final precisa ser maior que a profundidade inicial.",
             )
             return
         current_passes = max(1, int(math.ceil(depth / stepdown))) if stepdown > 0 else 1
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle("Editar passagens")
         layout = QtWidgets.QGridLayout(dialog)
-        info = QtWidgets.QLabel(f"Profundidade total do corte: {depth:g} mm")
+        info = QtWidgets.QLabel(
+            f"Intervalo em Z: {start_depth:g} → {final_depth:g} mm "
+            f"({depth:g} mm restantes)"
+        )
         layout.addWidget(info, 0, 0, 1, 3)
         visual_row = QtWidgets.QHBoxLayout()
         visual_row.setContentsMargins(0, 0, 0, 0)
@@ -7781,7 +10123,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             if count > 1:
                 amounts[-1] = max(0.001, depth - sum(amounts[:-1]))
             list_widget.clear()
-            cumulative = 0.0
+            cumulative = start_depth
             for index, pass_amount in enumerate(amounts):
                 cumulative += pass_amount
                 suffix = " (ajustada automaticamente)" if index == count - 1 else ""
@@ -7894,11 +10236,95 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             "material (corte menor); negativo remove material extra. "
             "Use 0 para seguir o desenho."
         )
+        self.cut_common_line_enabled = QtWidgets.QCheckBox(
+            "Aproveitar fronteiras por linha comum"
+        )
+        self.cut_common_line_enabled.setObjectName("cutCommonLineEnabled")
+        self.cut_common_line_enabled.setToolTip(
+            "Corta uma fronteira reta compartilhada somente uma vez. O WoodCAM "
+            "comprova a coincidência geométrica antes de gerar o percurso; "
+            "cruzamentos e sobreposições de área continuam bloqueados."
+        )
+        grid.addWidget(self.cut_common_line_enabled, 3, 0, 1, 4)
+        grid.addWidget(QtWidgets.QLabel("Geometria compartilhada"), 4, 0)
+        self.cut_common_line_mode_combo = QtWidgets.QComboBox()
+        self.cut_common_line_mode_combo.setObjectName("cutCommonLineMode")
+        self.cut_common_line_mode_combo.addItem(
+            "Preservar medidas — folga = Ø efetivo",
+            "preserve_dimensions",
+        )
+        self.cut_common_line_mode_combo.addItem(
+            "Bordas coincidentes — vetor = centro da fresa",
+            "on_vector",
+        )
+        self.cut_common_line_mode_combo.setToolTip(
+            "Preservar medidas compara os percursos já compensados e exige entre "
+            "as peças uma folga igual ao diâmetro efetivo. Bordas coincidentes "
+            "corta sobre os vetores em comum e, portanto, altera cada medida em "
+            "meio diâmetro de fresa."
+        )
+        grid.addWidget(self.cut_common_line_mode_combo, 4, 1, 1, 3)
+        self.cut_common_line_tolerance_field = self._add_operation_field(
+            grid,
+            5,
+            "Tolerância da linha comum (mm)",
+            "cut",
+            "common_line_tolerance",
+        )
+        self.cut_common_line_tolerance_field.setToolTip(
+            "Desvio máximo para considerar duas linhas-centro coincidentes. "
+            "Use uma tolerância pequena; ela não autoriza cruzamentos."
+        )
+        self.cut_common_line_info = QtWidgets.QLabel(
+            "Linhas comuns: internos primeiro; fronteira compartilhada uma vez; "
+            "StockTabs e SharedTabs são distribuídas juntas, em regiões "
+            "opostas e longe das quinas; uma SharedTab pode segurar duas "
+            "peças, mas a rede continua ancorada ao stock."
+        )
+        self.cut_common_line_info.setWordWrap(True)
+        self.cut_common_line_info.setStyleSheet("color: #475569;")
+        grid.addWidget(self.cut_common_line_info, 6, 0, 1, 4)
+        grid.addWidget(QtWidgets.QLabel("Ordem das profundidades"), 7, 0)
+        self.cut_depth_strategy_combo = QtWidgets.QComboBox()
+        self.cut_depth_strategy_combo.setObjectName("cutDepthStrategy")
+        self.cut_depth_strategy_combo.addItem(
+            "Última passada no final (ex.: 2 + última geral)",
+            "hybrid_piece_bidirectional",
+        )
+        self.cut_depth_strategy_combo.addItem(
+            "Todas as passadas direto por peça (ex.: 3 direto)",
+            "piece_bidirectional",
+        )
+        self.cut_depth_strategy_combo.addItem("Chapa inteira por profundidade", "global_by_depth")
+        self.cut_depth_strategy_combo.addItem("Híbrido — estabilidade", "hybrid_stability")
+        self.cut_depth_strategy_combo.setToolTip(
+            "Estas estratégias pertencem exclusivamente ao corte por Linha comum. "
+            "Com Linha comum desligada, o WoodCAM usa sempre o corte CAM padrão "
+            "por peça. Chapa inteira conclui cada Z em todas as peças. Híbrido "
+            "prioriza a retenção ao atingir a chapa. 'Última passada no final' "
+            "faz N-1 passadas por peça e só depois a última em toda a chapa. "
+            "'Todas direto' conclui todas as profundidades da peça antes de "
+            "seguir para a próxima."
+        )
+        grid.addWidget(self.cut_depth_strategy_combo, 7, 1, 1, 3)
         info = QtWidgets.QLabel(
             "Contornos internos e furos selecionados são cortados por dentro e antes do contorno externo."
         )
         info.setWordWrap(True)
-        grid.addWidget(info, 3, 0, 1, 4)
+        grid.addWidget(info, 8, 0, 1, 4)
+
+        def update_common_line_fields(checked):
+            enabled = bool(checked)
+            self.cut_common_line_mode_combo.setEnabled(enabled)
+            self.cut_common_line_tolerance_field.setEnabled(enabled)
+            self.cut_common_line_info.setVisible(enabled)
+            # GlobalCutPlan/SharedEdge são uma estratégia de Linha comum. O
+            # corte CAM padrão não pode ser substituído só porque uma opção de
+            # profundidade ficou persistida de uma sessão anterior.
+            self.cut_depth_strategy_combo.setEnabled(enabled)
+
+        self.cut_common_line_enabled.toggled.connect(update_common_line_fields)
+        update_common_line_fields(self.cut_common_line_enabled.isChecked())
         self._sync_cut_side_buttons()
         return self._compact_group(group)
 
@@ -7912,9 +10338,12 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             "Última passada e cantos",
             "tolerance",
         )
-        self.cut_separate_last_pass = QtWidgets.QCheckBox("Fazer última passada separada")
+        self.cut_separate_last_pass = QtWidgets.QCheckBox(
+            "Passada de acabamento com sobre-metal"
+        )
         self.cut_separate_last_pass.setToolTip(
-            "Executa primeiro um corte com sobre-metal e depois uma passada final na medida."
+            "Deixa material na lateral durante o desbaste e faz outra volta na "
+            "medida. Esta opção não controla a ordem das profundidades da Linha comum."
         )
         grid.addWidget(self.cut_separate_last_pass, 0, 0, 1, 3)
         allowance = self._add_operation_field(
@@ -7968,43 +10397,264 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         grid.addWidget(self.cut_tabs_enabled, 0, 0, 1, 3)
         self.cut_tabs_auto_enabled = QtWidgets.QCheckBox("Distribuir automaticamente")
         self.cut_tabs_auto_enabled.setChecked(True)
+        self.cut_tabs_auto_enabled.setToolTip(
+            "O WoodCAM distribui as tabs ao redor de cada peça e aumenta a "
+            "quantidade somente quando o tamanho exigir."
+        )
         grid.addWidget(self.cut_tabs_auto_enabled, 1, 0, 1, 3)
+        self.cut_tabs_best_fixation = QtWidgets.QCheckBox("Melhor fixação")
+        self.cut_tabs_best_fixation.setChecked(
+            bool(DEFAULT_PRESETS.get("tab_best_fixation", True))
+        )
+        self.cut_tabs_best_fixation.setToolTip(
+            "Analisa cada peça, evita cantos e exige ao menos quatro regiões "
+            "afastadas e mecanicamente equilibradas. Peças maiores recebem "
+            "tabs adicionais para limitar o trecho de perímetro sem retenção. "
+            "Na Linha comum estas regras de segurança são obrigatórias."
+        )
+        grid.addWidget(self.cut_tabs_best_fixation, 2, 0, 1, 3)
         tab_fields = []
         for row, (label, field_name) in enumerate(
             (
                 ("Comprimento (mm)", "tab_length"),
-                ("Espessura (mm)", "tab_thickness"),
-                ("Quantidade automática", "tab_count"),
+                ("Altura intacta no MDF (mm)", "tab_thickness"),
+                ("Mínimo automático por peça", "tab_count"),
             ),
-            start=2,
+            start=3,
         ):
             field = self._add_operation_field(grid, row, label, "cut", field_name)
             tab_fields.append(field)
+            if field_name == "tab_thickness":
+                field.setToolTip(
+                    "Espessura original de MDF que fica totalmente intacta na "
+                    "ponte. O sobrecorte no spoilboard não reduz este valor."
+                )
+            elif field_name == "tab_count":
+                field.setToolTip(
+                    "Quantidade mínima desejada por peça. O WoodCAM preserva "
+                    "pelo menos 4 e acrescenta somente o necessário em peças "
+                    "maiores; tabs altas permitem um espaçamento maior."
+                )
         self.cut_tabs_3d = QtWidgets.QCheckBox("Tabs 3D")
         self.cut_tabs_3d.setToolTip("Sobe e desce em rampa ao longo da tab, sem movimentos verticais bruscos.")
-        grid.addWidget(self.cut_tabs_3d, 5, 0, 1, 3)
+        grid.addWidget(self.cut_tabs_3d, 6, 0, 1, 3)
         self.cut_tabs_manual_enabled = QtWidgets.QCheckBox("Posicionar manualmente")
         self.cut_tabs_manual_enabled.setToolTip(
             "Ativa a marcação de tabs clicando diretamente no contorno da vista 2D."
         )
-        grid.addWidget(self.cut_tabs_manual_enabled, 6, 0, 1, 3)
+        grid.addWidget(self.cut_tabs_manual_enabled, 7, 0, 1, 3)
         edit_button = QtWidgets.QPushButton("Posicionar tabs...")
         self.cut_tabs_edit_button = edit_button
         edit_button.clicked.connect(self._edit_tabs_settings)
-        grid.addWidget(edit_button, 7, 1, 1, 2)
-
-        def update_tab_fields(checked):
-            for field in tab_fields:
-                field.setEnabled(bool(checked))
-            self.cut_tabs_auto_enabled.setEnabled(bool(checked))
-            self.cut_tabs_manual_enabled.setEnabled(bool(checked))
-            self.cut_tabs_3d.setEnabled(bool(checked))
-            edit_button.setEnabled(
-                bool(checked) and self.cut_tabs_manual_enabled.isChecked()
+        grid.addWidget(edit_button, 8, 1, 1, 2)
+        self.cut_tab_release_checkbox = QtWidgets.QCheckBox(
+            "Remover tabs automaticamente ao final"
+        )
+        self.cut_tab_release_checkbox.setObjectName("cutTabReleaseAutomatically")
+        self.cut_tab_release_checkbox.setToolTip(
+            "Depois de concluir todas as passadas, visita somente as tabs: "
+            "mergulha, corta a ponte, sobe imediatamente e usa rápido até a "
+            "próxima. Ao marcar, Linha comum é ativada automaticamente."
+        )
+        grid.addWidget(self.cut_tab_release_checkbox, 9, 0, 1, 3)
+        self.cut_tab_release_supervision_combo = QtWidgets.QComboBox()
+        self.cut_tab_release_supervision_combo.setObjectName(
+            "cutTabReleaseSupervision"
+        )
+        self.cut_tab_release_supervision_combo.addItem(
+            "Pausa única antes de todas", "all_tabs"
+        )
+        self.cut_tab_release_supervision_combo.addItem(
+            "Pausa antes de cada peça", "per_piece"
+        )
+        self.cut_tab_release_supervision_combo.addItem(
+            "Pausa antes de cada tab", "per_tab"
+        )
+        supervision_index = self.cut_tab_release_supervision_combo.findData(
+            DEFAULT_PRESETS.get("tab_release_supervision", "per_piece")
+        )
+        if supervision_index >= 0:
+            self.cut_tab_release_supervision_combo.setCurrentIndex(
+                supervision_index
+            )
+        self.cut_tab_release_supervision_combo.setToolTip(
+            "Define quando o programa retrai, para o spindle e executa M0 "
+            "antes da liberação definitiva das peças."
+        )
+        grid.addWidget(self.cut_tab_release_supervision_combo, 10, 0, 1, 3)
+        self.cut_loose_waste_fixation_combo = QtWidgets.QComboBox()
+        self.cut_loose_waste_fixation_combo.setObjectName(
+            "cutLooseWasteFixation"
+        )
+        self.cut_loose_waste_fixation_combo.addItem(
+            "Restos soltos: desativado", "disabled"
+        )
+        self.cut_loose_waste_fixation_combo.addItem(
+            "Restos soltos: tabs", "tabs"
+        )
+        self.cut_loose_waste_fixation_combo.addItem(
+            "Restos soltos: parafusos", "screws"
+        )
+        self.cut_loose_waste_fixation_combo.setToolTip(
+            "Escolha tabs ou parafusos para prender desperdícios que poderiam "
+            "se soltar. O plano de Linha comum é ativado automaticamente."
+        )
+        grid.addWidget(self.cut_loose_waste_fixation_combo, 11, 0, 1, 3)
+        self.cut_screw_fields = []
+        for row, label, field_name in (
+            (12, "Diâmetro piloto; 0 = fresa (mm)", "screw_pilot_diameter"),
+            (13, "Profundidade piloto; 0 = automática (mm)", "screw_pilot_depth"),
+            (14, "Diâmetro da cabeça/arruela (mm)", "screw_head_diameter"),
+            (15, "Margem ao redor do parafuso (mm)", "screw_safety_margin"),
+            (16, "Altura da cabeça acima do MDF (mm)", "screw_head_height"),
+        ):
+            self.cut_screw_fields.append(
+                self._add_operation_field(grid, row, label, "cut", field_name)
             )
 
+        # Compatibilidade com SettingsJSON e preferências gravadas pelas
+        # versões que expunham um combo "Depois do corte". A escolha oficial
+        # agora é a caixa visível acima.
+        self.cut_tab_release_combo = QtWidgets.QComboBox()
+        self.cut_tab_release_combo.setObjectName("cutTabReleaseMode")
+        self.cut_tab_release_combo.addItem("Manter tabs", "keep_tabs")
+        self.cut_tab_release_combo.addItem(
+            "Liberar automaticamente — plunge/sweep", "automatic_release"
+        )
+        self.cut_tab_release_combo.setToolTip(
+            "Recurso do plano de Linha comum: a liberação automática só começa "
+            "depois de todo o corte principal. Cada tab recebe um mergulho "
+            "vertical, sweep mínimo quando necessário e retração imediata."
+        )
+        self.cut_tab_release_combo.setVisible(False)
+
+        def release_checkbox_toggled(checked):
+            mode = "automatic_release" if checked else "keep_tabs"
+            index = self.cut_tab_release_combo.findData(mode)
+            if index >= 0 and index != self.cut_tab_release_combo.currentIndex():
+                self.cut_tab_release_combo.setCurrentIndex(index)
+
+        def release_combo_changed(_index):
+            checked = self.cut_tab_release_combo.currentData() == "automatic_release"
+            if checked != self.cut_tab_release_checkbox.isChecked():
+                self.cut_tab_release_checkbox.blockSignals(True)
+                self.cut_tab_release_checkbox.setChecked(checked)
+                self.cut_tab_release_checkbox.blockSignals(False)
+
+        def release_checkbox_clicked(checked):
+            if checked and not self.cut_common_line_enabled.isChecked():
+                self.cut_common_line_enabled.setChecked(True)
+
+        self.cut_tab_release_checkbox.toggled.connect(release_checkbox_toggled)
+        self.cut_tab_release_checkbox.clicked.connect(release_checkbox_clicked)
+        self.cut_tab_release_combo.currentIndexChanged.connect(release_combo_changed)
+
+        def update_tab_fields(_checked=False):
+            tabs_enabled = self.cut_tabs_enabled.isChecked()
+            common_line_enabled = self.cut_common_line_enabled.isChecked()
+            if not tabs_enabled and self._tab_marker_callback is not None:
+                self._finish_tab_marker_mode()
+            if not tabs_enabled:
+                widget = getattr(self, "vector_editor_widget", None)
+                if widget is not None:
+                    widget.clear_tab_markers()
+                try:
+                    marker_group = FreeCAD.ActiveDocument.getObject(
+                        "WoodCAM2D_TabMarkers"
+                    )
+                    if marker_group is not None:
+                        marker_group.ViewObject.Visibility = False
+                except Exception:
+                    pass
+            waste_fixation_enabled = (
+                self.cut_loose_waste_fixation_combo.currentData() != "disabled"
+                if hasattr(self, "cut_loose_waste_fixation_combo")
+                else False
+            )
+            for index, field in enumerate(tab_fields):
+                field.setEnabled(
+                    tabs_enabled
+                    or (index == 0 and common_line_enabled and waste_fixation_enabled)
+                )
+            self.cut_tabs_auto_enabled.setEnabled(tabs_enabled)
+            self.cut_tabs_best_fixation.setEnabled(
+                tabs_enabled
+                and self.cut_tabs_auto_enabled.isChecked()
+                and not common_line_enabled
+            )
+            self.cut_tabs_manual_enabled.setEnabled(tabs_enabled)
+            self.cut_tabs_3d.setEnabled(tabs_enabled)
+            self.cut_tab_release_checkbox.setEnabled(
+                tabs_enabled
+            )
+            self.cut_tab_release_combo.setEnabled(
+                tabs_enabled and common_line_enabled
+            )
+            self.cut_tab_release_supervision_combo.setEnabled(
+                tabs_enabled
+                and common_line_enabled
+                and self.cut_tab_release_checkbox.isChecked()
+            )
+            screw_mode = (
+                self.cut_loose_waste_fixation_combo.currentData() == "screws"
+            )
+            self.cut_loose_waste_fixation_combo.setEnabled(True)
+            for field in self.cut_screw_fields:
+                field.setEnabled(common_line_enabled and screw_mode)
+            edit_button.setEnabled(
+                tabs_enabled and self.cut_tabs_manual_enabled.isChecked()
+            )
+
+        def manual_mode_toggled(checked):
+            if checked and self.cut_tabs_auto_enabled.isChecked():
+                self.cut_tabs_auto_enabled.setChecked(False)
+            if not checked and self._tab_marker_callback is not None:
+                self._finish_tab_marker_mode()
+            update_tab_fields()
+
+        def automatic_mode_toggled(checked):
+            if checked and self.cut_tabs_manual_enabled.isChecked():
+                self.cut_tabs_manual_enabled.setChecked(False)
+            update_tab_fields()
+
+        def waste_fixation_changed(_index):
+            update_tab_fields()
+
+        def waste_fixation_activated(_index):
+            if (
+                self.cut_loose_waste_fixation_combo.currentData() != "disabled"
+                and not self.cut_common_line_enabled.isChecked()
+            ):
+                self.cut_common_line_enabled.setChecked(True)
+
+        def common_line_toggled(checked):
+            if not checked:
+                if self.cut_tab_release_checkbox.isChecked():
+                    self.cut_tab_release_checkbox.setChecked(False)
+                disabled_index = self.cut_loose_waste_fixation_combo.findData(
+                    "disabled"
+                )
+                if (
+                    disabled_index >= 0
+                    and self.cut_loose_waste_fixation_combo.currentIndex()
+                    != disabled_index
+                ):
+                    self.cut_loose_waste_fixation_combo.setCurrentIndex(
+                        disabled_index
+                    )
+            update_tab_fields()
+
         self.cut_tabs_enabled.toggled.connect(update_tab_fields)
-        self.cut_tabs_manual_enabled.toggled.connect(update_tab_fields)
+        self.cut_tab_release_checkbox.toggled.connect(update_tab_fields)
+        self.cut_tabs_manual_enabled.toggled.connect(manual_mode_toggled)
+        self.cut_tabs_auto_enabled.toggled.connect(automatic_mode_toggled)
+        self.cut_common_line_enabled.toggled.connect(common_line_toggled)
+        self.cut_loose_waste_fixation_combo.currentIndexChanged.connect(
+            waste_fixation_changed
+        )
+        self.cut_loose_waste_fixation_combo.activated.connect(
+            waste_fixation_activated
+        )
         update_tab_fields(self.cut_tabs_enabled.isChecked())
         return self._compact_group(group)
 
@@ -8015,8 +10665,11 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         self._start_tab_marker_mode()
 
     def _start_tab_marker_mode(self):
+        widget = getattr(self, "vector_editor_widget", None)
+        use_editor = bool(self._use_vector_editor_for_cam and widget is not None)
         try:
-            geometry = get_selected_geometry()
+            self._restore_editing_source_if_needed()
+            geometry = self._active_geometry("cut")
         except Exception as error:
             QtWidgets.QMessageBox.warning(self, "Posicionar tabs", str(error))
             return
@@ -8025,26 +10678,126 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                 self, "Posicionar tabs", "Selecione um contorno fechado antes de posicionar tabs."
             )
             return
+        geometry_scope = self._tab_geometry_scope(geometry)
+        editing_name = str(
+            getattr(getattr(self, "_editing_operation", None), "Name", "") or ""
+        )
+        positions_operation = str(
+            getattr(self, "_cut_tab_positions_operation", "") or ""
+        )
+        loaded_from_editing_operation = bool(
+            positions_operation and positions_operation == editing_name
+        )
+        if (
+            not loaded_from_editing_operation
+            and getattr(self, "_cut_tab_positions_scope", None) != geometry_scope
+        ):
+            self.cut_tab_positions = []
+        elif not all(
+            isinstance(position, dict) and "x" in position and "y" in position
+            for position in self.cut_tab_positions
+        ):
+            self.cut_tab_positions = []
+        self._cut_tab_positions_scope = geometry_scope
+        self._cut_tab_positions_operation = None
+        self._tab_marker_geometry = geometry
+        if use_editor:
+            self._tab_marker_source = "editor2d"
+            self._tab_marker_callback = True
+            self._tab_marker_return_tab_index = self.operation_tabs.currentIndex()
+            # Uma prévia CAM anterior não faz parte da marcação. Em especial,
+            # rápidos magenta entre peças confundiam a leitura do contorno e
+            # pareciam ligações criadas pelas tabs.
+            widget.clear_cut_toolpath_preview()
+            widget.show_tab_markers(self.cut_tab_positions)
+            widget.begin_point_capture(
+                self._on_editor_tab_marker_event,
+                cancel_callback=self._on_editor_tab_marker_cancelled,
+                status=(
+                    "Tabs manuais — clique perto do contorno para adicionar; "
+                    "clique numa marca para remover; botão direito ou Esc conclui."
+                ),
+            )
+            detached = getattr(self, "_detached_editor_window", None)
+            if detached is not None:
+                detached.show()
+                detached.raise_()
+                detached.activateWindow()
+            else:
+                editor_index = self._tab_index("Editor 2D")
+                if editor_index is not None:
+                    self.operation_tabs.setCurrentIndex(editor_index)
+            self.cut_tabs_edit_button.setText("Concluir posicionamento")
+            return
+
         active_view = FreeCADGui.activeDocument().activeView() if FreeCADGui.activeDocument() else None
         if active_view is None:
+            self._tab_marker_geometry = None
             return
-        if not any(isinstance(position, dict) for position in self.cut_tab_positions):
-            self.cut_tab_positions = []
-        self._tab_marker_geometry = geometry
+        self._tab_marker_source = "freecad"
         self._tab_marker_callback = active_view.addEventCallback(
             "SoMouseButtonEvent", self._on_tab_marker_event
         )
         self.cut_tabs_edit_button.setText("Concluir posicionamento")
 
     def _finish_tab_marker_mode(self):
-        active_view = FreeCADGui.activeDocument().activeView() if FreeCADGui.activeDocument() else None
-        if active_view is not None and self._tab_marker_callback is not None:
-            active_view.removeEventCallback("SoMouseButtonEvent", self._tab_marker_callback)
+        source = self._tab_marker_source
+        if source == "editor2d":
+            widget = getattr(self, "vector_editor_widget", None)
+            if widget is not None:
+                widget.finish_point_capture(cancelled=False)
+        elif source == "freecad":
+            active_view = FreeCADGui.activeDocument().activeView() if FreeCADGui.activeDocument() else None
+            if active_view is not None and self._tab_marker_callback is not None:
+                active_view.removeEventCallback("SoMouseButtonEvent", self._tab_marker_callback)
         self._tab_marker_callback = None
         self._tab_marker_geometry = None
+        self._tab_marker_source = None
         self.cut_tabs_edit_button.setText("Posicionar tabs...")
 
+        return_index = self._tab_marker_return_tab_index
+        self._tab_marker_return_tab_index = None
+        if source == "editor2d" and return_index is not None:
+            if 0 <= int(return_index) < self.operation_tabs.count():
+                self.operation_tabs.setCurrentIndex(int(return_index))
+
+    def _on_editor_tab_marker_cancelled(self):
+        """Complete host cleanup after Esc/right-click ends canvas capture."""
+        if self._tab_marker_source != "editor2d":
+            return
+        self._tab_marker_callback = None
+        self._tab_marker_geometry = None
+        self._tab_marker_source = None
+        self.cut_tabs_edit_button.setText("Posicionar tabs...")
+        return_index = self._tab_marker_return_tab_index
+        self._tab_marker_return_tab_index = None
+        if return_index is not None and 0 <= int(return_index) < self.operation_tabs.count():
+            self.operation_tabs.setCurrentIndex(int(return_index))
+
+    @staticmethod
+    def _tab_point_xy(point):
+        x_value = point.x() if callable(getattr(point, "x", None)) else point.x
+        y_value = point.y() if callable(getattr(point, "y", None)) else point.y
+        return float(x_value), float(y_value)
+
+    @staticmethod
+    def _tab_geometry_scope(geometry):
+        """Identidade imutável dos contornos que aceitam as tabs atuais."""
+        contours = []
+        for contour in tuple((geometry or {}).get("contours", ()) or ()):
+            points = []
+            for point in tuple(contour or ()):
+                try:
+                    points.append(
+                        (round(float(point[0]), 6), round(float(point[1]), 6))
+                    )
+                except (IndexError, TypeError, ValueError):
+                    continue
+            contours.append(tuple(points))
+        return tuple(contours)
+
     def _nearest_tab_point(self, point, geometry):
+        point_x, point_y = self._tab_point_xy(point)
         best = None
         for contour in geometry.get("contours", []):
             points = list(contour or [])
@@ -8056,13 +10809,62 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                 length_squared = dx * dx + dy * dy
                 if length_squared <= 1e-9:
                     continue
-                ratio = ((point.x - float(start[0])) * dx + (point.y - float(start[1])) * dy) / length_squared
+                ratio = ((point_x - float(start[0])) * dx + (point_y - float(start[1])) * dy) / length_squared
                 ratio = max(0.0, min(1.0, ratio))
                 candidate = (float(start[0]) + dx * ratio, float(start[1]) + dy * ratio)
-                distance_squared = (point.x - candidate[0]) ** 2 + (point.y - candidate[1]) ** 2
+                distance_squared = (point_x - candidate[0]) ** 2 + (point_y - candidate[1]) ** 2
                 if best is None or distance_squared < best[0]:
                     best = (distance_squared, candidate)
         return best[1] if best is not None else None
+
+    def _on_editor_tab_marker_event(self, event):
+        widget = getattr(self, "vector_editor_widget", None)
+        if widget is None or self._tab_marker_geometry is None:
+            return
+
+        # Clicking an existing target toggles it off, which keeps removal
+        # possible without violating the global right-click-to-cancel rule.
+        for index, position in enumerate(tuple(self.cut_tab_positions)):
+            if not isinstance(position, dict):
+                continue
+            marker_screen = widget.view.mapFromScene(
+                QtCore.QPointF(float(position["x"]), float(position["y"]))
+            )
+            if math.hypot(
+                float(marker_screen.x() - event.screen_pos.x()),
+                float(marker_screen.y() - event.screen_pos.y()),
+            ) <= 10.0:
+                del self.cut_tab_positions[index]
+                self._invalidate_exact_toolpath_view()
+                widget.show_tab_markers(self.cut_tab_positions)
+                widget.set_operation_status(
+                    "Tab removida. Restam %d; botão direito ou Esc conclui."
+                    % len(self.cut_tab_positions)
+                )
+                self._save_operation_preferences()
+                return
+
+        nearest = self._nearest_tab_point(event.scene_pos, self._tab_marker_geometry)
+        if nearest is None:
+            return
+        nearest_screen = widget.view.mapFromScene(QtCore.QPointF(*nearest))
+        screen_distance = math.hypot(
+            float(nearest_screen.x() - event.screen_pos.x()),
+            float(nearest_screen.y() - event.screen_pos.y()),
+        )
+        if screen_distance > 12.0:
+            widget.set_operation_status(
+                "Nenhuma tab criada: clique mais perto da linha do contorno."
+            )
+            return
+        self.cut_tab_positions.append({"x": nearest[0], "y": nearest[1]})
+        self._invalidate_exact_toolpath_view()
+        widget.show_tab_markers(self.cut_tab_positions)
+        widget.set_operation_status(
+            "%d tab(s) manual(is). Clique numa marca para remover; botão direito ou Esc conclui."
+            % len(self.cut_tab_positions)
+        )
+        self._save_operation_preferences()
 
     def _event_world_point(self, event):
         try:
@@ -8085,6 +10887,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         if nearest is None:
             return
         self.cut_tab_positions.append({"x": nearest[0], "y": nearest[1]})
+        self._invalidate_exact_toolpath_view()
         self._render_tab_markers()
 
     def _render_tab_markers(self):
@@ -8095,6 +10898,10 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         if group is None:
             group = doc.addObject("App::DocumentObjectGroup", "WoodCAM2D_TabMarkers")
             group.Label = "WoodCAM 2D — Tabs"
+        try:
+            group.ViewObject.Visibility = True
+        except Exception:
+            pass
         for obj in list(getattr(group, "Group", []) or []):
             doc.removeObject(obj.Name)
         for index, position in enumerate(self.cut_tab_positions, start=1):
@@ -8440,7 +11247,11 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             # validação comum e representa o envelope máximo disponível.
             settings["start_depth"] = 0.0
             settings["cut_depth"] = float(settings["material_thickness"])
-        settings["final_depth"] = settings["start_depth"] + settings["cut_depth"]
+        # Desde 27/08/2026 o campo visível é uma cota Z final absoluta. O
+        # marcador permite abrir operações antigas, cujo ``cut_depth`` era um
+        # incremento relativo, sem alterar silenciosamente sua profundidade.
+        settings["depth_input_mode"] = "absolute_final"
+        settings["final_depth"] = settings["cut_depth"]
         settings["outer_cut_side"] = self.CUT_SIDE_BY_INDEX[
             self.operation_combo.currentIndex()
         ]
@@ -8481,6 +11292,9 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             )
             settings["finish3d_reverse"] = self.finish3d_reverse_check.isChecked()
         settings["use_helical_drilling"] = self.use_helical_drilling.isChecked()
+        settings["hole_counterbore_enabled"] = (
+            self.hole_counterbore_enabled.isChecked()
+        )
         settings["cut_climb"] = bool(
             getattr(self, "cut_direction_climb", None) is None
             or self.cut_direction_climb.isChecked()
@@ -8489,6 +11303,30 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             getattr(self, "cut_separate_last_pass", None) is not None
             and self.cut_separate_last_pass.isChecked()
         )
+        settings["common_line_enabled"] = bool(
+            getattr(self, "cut_common_line_enabled", None) is not None
+            and self.cut_common_line_enabled.isChecked()
+        )
+        common_line_mode = (
+            self.cut_common_line_mode_combo.currentData()
+            if getattr(self, "cut_common_line_mode_combo", None) is not None
+            else "preserve_dimensions"
+        )
+        settings["common_line_mode"] = str(
+            common_line_mode or "preserve_dimensions"
+        )
+        depth_strategy = (
+            self.cut_depth_strategy_combo.currentData()
+            if getattr(self, "cut_depth_strategy_combo", None) is not None
+            else "per_piece"
+        )
+        settings["cut_depth_strategy"] = str(
+            depth_strategy or DEFAULT_PRESETS["cut_depth_strategy"]
+        )
+        if not settings["common_line_enabled"]:
+            # Contrato de compatibilidade: sem Linha comum, nem uma seleção
+            # antiga do combo pode desviar o corte para o GlobalCutPlan.
+            settings["cut_depth_strategy"] = "per_piece"
         settings["cut_tabs_enabled"] = bool(
             getattr(self, "cut_tabs_enabled", None) is not None
             and self.cut_tabs_enabled.isChecked()
@@ -8498,10 +11336,45 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             settings["tab_positions"] = []
         if hasattr(self, "cut_tabs_auto_enabled") and not self.cut_tabs_auto_enabled.isChecked():
             settings["tab_count"] = 0
+        if not settings["cut_tabs_enabled"]:
+            # An inactive feature must be inactive in the persisted CAM
+            # contract too. Keeping a previous count/marker here made an old
+            # preview look as if the unchecked control were being ignored and
+            # could revive manual tabs when the operation was edited later.
+            settings["tab_positions"] = []
+            settings["tab_count"] = 0
+        settings["tab_best_fixation"] = bool(
+            getattr(self, "cut_tabs_best_fixation", None) is not None
+            and self.cut_tabs_best_fixation.isChecked()
+            and settings.get("tab_count", 0)
+            and not settings.get("tab_positions")
+        )
         settings["tabs_3d"] = bool(
             getattr(self, "cut_tabs_3d", None) is not None
             and self.cut_tabs_3d.isChecked()
         )
+        settings["tab_height_reference"] = "material_top"
+        settings["tab_surface_clearance"] = float(
+            DEFAULT_PRESETS.get("tab_surface_clearance", 0.2)
+        )
+        tab_release_mode = (
+            "automatic_release"
+            if getattr(self, "cut_tab_release_checkbox", None) is not None
+            and self.cut_tab_release_checkbox.isChecked()
+            else "keep_tabs"
+        )
+        settings["tab_release_mode"] = str(tab_release_mode or "keep_tabs")
+        settings["tab_release_supervision"] = str(
+            self.cut_tab_release_supervision_combo.currentData()
+            or DEFAULT_PRESETS.get("tab_release_supervision", "per_piece")
+        )
+        settings["loose_waste_fixation"] = str(
+            self.cut_loose_waste_fixation_combo.currentData() or "disabled"
+        )
+        if not settings["common_line_enabled"]:
+            settings["loose_waste_fixation"] = "disabled"
+        if not settings["cut_tabs_enabled"] or not settings["common_line_enabled"]:
+            settings["tab_release_mode"] = "keep_tabs"
         settings["corner_slowdown_enabled"] = (
             self.corner_slowdown_enabled.isChecked()
         )
@@ -8843,6 +11716,11 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                     "peck_retract_mode",
                     "hole_order_combo",
                     "cut_order_combo",
+                    "cut_common_line_mode_combo",
+                    "cut_depth_strategy_combo",
+                    "cut_tab_release_combo",
+                    "cut_tab_release_supervision_combo",
+                    "cut_loose_waste_fixation_combo",
                     "rough3d_boundary_combo",
                     "rough3d_strategy_combo",
                     "rough3d_profile_combo",
@@ -8858,15 +11736,19 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                 for name in (
                     "return_to_start",
                     "use_model_hole_depths",
+                    "hole_counterbore_enabled",
                     "use_helical_drilling",
                     "peck_enabled",
                     "dwell_enabled",
                     "cut_separate_last_pass",
+                    "cut_common_line_enabled",
                     "corner_slowdown_enabled",
                     "cut_tabs_enabled",
                     "cut_tabs_auto_enabled",
+                    "cut_tabs_best_fixation",
                     "cut_tabs_3d",
                     "cut_tabs_manual_enabled",
+                    "cut_tab_release_checkbox",
                     "cut_smart_entry_check",
                     "cut_direction_climb",
                     "cut_direction_conventional",
@@ -8892,7 +11774,6 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                 ),
                 0,
             ),
-            "tab_positions": list(self.cut_tab_positions),
             "pass_schedules": self._pass_schedules,
         }
 
@@ -8953,9 +11834,6 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                 field = self.operation_names.get(mode)
                 if field is not None:
                     field.setText(str(value))
-            positions = saved.get("tab_positions")
-            if isinstance(positions, list):
-                self.cut_tab_positions = positions
             schedules = saved.get("pass_schedules")
             if isinstance(schedules, dict):
                 self._pass_schedules = {
@@ -8963,6 +11841,20 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                     for mode, values in schedules.items()
                     if isinstance(values, list)
                 }
+            # Preferências de versões anteriores podiam guardar recursos do
+            # plano global ativos com Linha comum desligada. Essa combinação
+            # deixava os controles marcados e inacessíveis ao reabrir o
+            # diálogo. Normalize somente o estado histórico restaurado; uma
+            # ação nova do operador ativa Linha comum automaticamente.
+            if not self.cut_common_line_enabled.isChecked():
+                self.cut_tab_release_checkbox.setChecked(False)
+                disabled_index = self.cut_loose_waste_fixation_combo.findData(
+                    "disabled"
+                )
+                if disabled_index >= 0:
+                    self.cut_loose_waste_fixation_combo.setCurrentIndex(
+                        disabled_index
+                    )
         finally:
             self._restoring_operation_preferences = False
 
@@ -8978,6 +11870,10 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             "operation_combo", "pocket_strategy_combo", "pocket_direction_combo",
             "pocket_profile_combo", "peck_retract_mode", "hole_order_combo",
             "cut_order_combo", "rough3d_boundary_combo", "rough3d_strategy_combo",
+            "cut_common_line_mode_combo",
+            "cut_depth_strategy_combo", "cut_tab_release_combo",
+            "cut_tab_release_supervision_combo",
+            "cut_loose_waste_fixation_combo",
             "rough3d_profile_combo", "rough3d_order_combo", "rough3d_axis_combo",
             "finish3d_boundary_combo", "finish3d_strategy_combo",
         ):
@@ -8985,10 +11881,14 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             if widget is not None:
                 widget.currentIndexChanged.connect(self._save_operation_preferences)
         for name in (
-            "return_to_start", "use_model_hole_depths", "use_helical_drilling",
+            "return_to_start", "use_model_hole_depths", "hole_counterbore_enabled",
+            "use_helical_drilling",
             "peck_enabled", "dwell_enabled", "cut_separate_last_pass",
+            "cut_common_line_enabled",
             "corner_slowdown_enabled", "cut_tabs_enabled", "cut_tabs_auto_enabled",
-            "cut_tabs_3d", "cut_tabs_manual_enabled", "cut_smart_entry_check",
+            "cut_tabs_best_fixation",
+            "cut_tabs_3d", "cut_tabs_manual_enabled", "cut_tab_release_checkbox",
+            "cut_smart_entry_check",
             "cut_direction_climb", "cut_direction_conventional", "cut_start_keep_radio",
             "cut_start_optimize_radio", "cut_start_near_radio",
             "rough3d_reverse_check", "finish3d_reverse_check",
@@ -9037,6 +11937,16 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         return float(offset_x), float(offset_y)
 
     def _datum_reference_bounds(self, settings, geometry=None):
+        active_sheet_bounds = settings.get("_active_sheet_bounds_global")
+        if (
+            settings.get("_geometry_source") == "editor_2d"
+            and isinstance(active_sheet_bounds, (tuple, list))
+            and len(active_sheet_bounds) == 4
+        ):
+            try:
+                return tuple(map(float, active_sheet_bounds))
+            except (TypeError, ValueError):
+                pass
         return self._work_area_bounds_for_preview(settings)
 
     def _xy_origin_offset(self, settings, geometry):
@@ -9107,6 +12017,40 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             stage_name: self._transform_moves_to_machine(settings, moves)
             for stage_name, moves in stages.items()
         }
+
+    @staticmethod
+    def _moves_in_document_xy(settings, moves):
+        """Map sheet-local machine moves back onto global Editor coordinates.
+
+        Persisted moves and G-code remain local to the physical sheet. Only
+        visual projections need the inverse placement so they continue to sit
+        over the source vectors in the side-by-side 2D layout.
+        """
+
+        bounds = settings.get("_active_sheet_bounds_global")
+        if (
+            settings.get("_geometry_source") != "editor_2d"
+            or not isinstance(bounds, (tuple, list))
+            or len(bounds) != 4
+        ):
+            return moves
+        try:
+            placement_x, placement_y = settings.get(
+                "_xy_origin_offset", (0.0, 0.0)
+            )
+            placement_x = float(placement_x or 0.0)
+            placement_y = float(placement_y or 0.0)
+        except (TypeError, ValueError):
+            return moves
+        displayed = []
+        for move in moves:
+            converted = dict(move)
+            if converted.get("x") is not None:
+                converted["x"] = float(converted["x"]) - placement_x
+            if converted.get("y") is not None:
+                converted["y"] = float(converted["y"]) - placement_y
+            displayed.append(converted)
+        return displayed
 
     def _configured_machine_start_xy(self, settings):
         """Retorna o início/retorno no zero da área de Trabalho.
@@ -9396,11 +12340,577 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         )
         return {mode: moves}
 
+    @staticmethod
+    def _common_line_plan_message(plan):
+        details = []
+        for issue in plan.issues:
+            location = ""
+            if issue.points:
+                point = issue.points[0]
+                location = " próximo de X %.2f / Y %.2f" % (point.x, point.y)
+            details.append(issue.message.rstrip(".") + location + ".")
+        return "; ".join(details)
+
+    def _build_common_line_outer_moves(
+        self,
+        outer_contours,
+        settings,
+        effective_tool_diameter,
+        start_xy,
+        return_plan_data=False,
+    ):
+        """Build one edge-disjoint outer network or return ``None``.
+
+        Compensation happens before common-edge detection.  This is the
+        essential distinction between coincident design vectors and
+        dimension-preserving common-line cutting: in the latter, two outside
+        cutter centre-lines coincide only when the part gap equals the
+        effective tool diameter.
+        """
+
+        mode = str(settings.get("common_line_mode", "preserve_dimensions") or "")
+        if mode not in {"preserve_dimensions", "on_vector"}:
+            raise ValueError("O modo de linha comum é inválido.")
+        tolerance = float(
+            settings.get(
+                "common_line_tolerance",
+                DEFAULT_PRESETS.get("common_line_tolerance", 0.02),
+            )
+            or 0.0
+        )
+        if not math.isfinite(tolerance) or tolerance <= 0.0:
+            raise ValueError("A tolerância da linha comum deve ser maior que zero.")
+
+        centre_lines = []
+        local_cleanup_contours = {
+            int(value)
+            for value in (
+                settings.get("_narrow_feature_cleanup_contour_indices", ()) or ()
+            )
+        }
+        for contour_index, contour in enumerate(outer_contours):
+            if mode == "on_vector":
+                points = list(contour)
+            else:
+                if settings["outer_cut_side"] == CUT_SIDE_OUTSIDE:
+                    points = compensated_polygon(
+                        contour,
+                        effective_tool_diameter,
+                        settings["outer_cut_side"],
+                        common_line_join=(
+                            contour_index not in local_cleanup_contours
+                        ),
+                    )
+                else:
+                    points = compensated_polygon(
+                        contour,
+                        effective_tool_diameter,
+                        settings["outer_cut_side"],
+                    )
+            centre_lines.append(points)
+
+        plan = plan_common_line_cut(
+            tuple(
+                CommonLineContour("outer-%04d" % index, points)
+                for index, points in enumerate(centre_lines, start=1)
+            ),
+            tolerance=tolerance,
+        )
+        if not plan.is_valid:
+            raw_plan = None
+            if (
+                mode == "preserve_dimensions"
+                and settings.get("outer_cut_side") == CUT_SIDE_OUTSIDE
+            ):
+                raw_plan = plan_common_line_cut(
+                    tuple(
+                        CommonLineContour("outer-%04d" % index, points)
+                        for index, points in enumerate(outer_contours, start=1)
+                    ),
+                    tolerance=tolerance,
+                )
+            if (
+                raw_plan is not None
+                and raw_plan.is_valid
+                and any(len(issue.contour_ids) >= 2 for issue in plan.issues)
+            ):
+                raise ValueError(
+                    "Linha comum bloqueada: os contornos originais são válidos, "
+                    "mas os percursos externos compensados se cruzam. A folga "
+                    "entre algumas peças é menor que o diâmetro efetivo de "
+                    "%.2f mm. Execute Organizar peças novamente com Linha comum "
+                    "ativa; o organizador ajustará essa folga automaticamente. "
+                    "Detalhes: %s"
+                    % (effective_tool_diameter, self._common_line_plan_message(plan))
+                )
+            raise ValueError(
+                "Linha comum bloqueada porque o layout contém contornos que se "
+                "atravessam, sobrepõem ou ocupam o mesmo trecho físico. Isso não é uma "
+                "junção T válida e não pode ser enviado à CNC. Reorganize as "
+                "peças; o organizador agora faz uma validação vetorial exata "
+                "antes de oferecer a prévia. Detalhes: %s"
+                % self._common_line_plan_message(plan)
+            )
+        owner_index = {
+            "outer-%04d" % index: index - 1
+            for index in range(1, len(outer_contours) + 1)
+        }
+        shared_pairs = {
+            tuple(sorted(owner_index[owner_id] for owner_id in segment.owner_ids))
+            for segment in plan.shared_segments
+        }
+        # The first generic validation defers on-vector spacing until topology
+        # is known. Now allow only proven shared pairs; every other pair still
+        # needs enough room for an actual external kerf.
+        clearance_settings = dict(settings)
+        clearance_settings["common_line_shared_pairs"] = shared_pairs
+        clearance_settings["cut_side"] = settings["outer_cut_side"]
+        validate_selected_contours(outer_contours, clearance_settings)
+        if not plan.has_common_lines and not return_plan_data:
+            return None
+        if (
+            mode == "on_vector"
+            and settings["outer_cut_side"] == CUT_SIDE_OUTSIDE
+            and not settings.get("_common_line_on_vector_confirmed", False)
+        ):
+            raise ValueError(
+                "__WOODCAM_CONFIRM_COMMON_LINE_ON_VECTOR__"
+                "As peças possuem fronteira coincidente, mas o vetor será o "
+                "centro da fresa. Isso não preserva corte externo dimensional: "
+                "cada peça perde aproximadamente meio diâmetro da ferramenta "
+                "na borda comum."
+            )
+        if (
+            settings.get("cut_separate_last_pass")
+            and float(settings.get("cut_last_pass_allowance", 0.0) or 0.0) > 1.0e-7
+        ):
+            raise ValueError(
+                "Linha comum não é compatível com sobre-metal em uma passada "
+                "final separada: as duas peças exigiriam percursos de desbaste "
+                "diferentes dentro do mesmo kerf. Desative a passada separada "
+                "ou zere o sobre-metal."
+            )
+
+        if return_plan_data:
+            return plan, tuple(tuple(point) for point in centre_lines)
+
+        tabs_enabled = bool(settings.get("cut_tabs_enabled", False))
+        trails = build_common_line_cut_trails(
+            plan,
+            tab_count=settings.get("tab_count", 0) if tabs_enabled else 0,
+            tab_length=settings.get("tab_length", 12.0) if tabs_enabled else 0.0,
+            manual_tab_positions=(
+                settings.get("tab_positions", ()) if tabs_enabled else ()
+            ),
+            best_fixation=bool(
+                tabs_enabled and settings.get("tab_best_fixation", False)
+            ),
+        )
+        path_specs = [
+            {
+                "points": [point.to_tuple() for point in trail.points],
+                "edge_tabs": trail.edge_tabs,
+                "edge_shared": trail.edge_shared,
+                "edge_owner_ids": trail.edge_owner_ids,
+                "priority": 0 if all(trail.edge_shared) else 1,
+            }
+            for trail in trails
+        ]
+        # An open edge has no sacrificial lap in which to clean a ramp.  A
+        # vertical entry makes every edge occur exactly once at each depth;
+        # otherwise the ramp cleanup would re-cut a shared boundary.
+        return build_common_line_cut_job(
+            path_specs,
+            settings["final_depth"],
+            settings["stepdown"],
+            0.0,
+            settings["safe_height"],
+            material_thickness=settings["material_thickness"],
+            start_xy=start_xy,
+            start_depth=settings["start_depth"],
+            pass_depths=settings.get("pass_depths"),
+            return_to_start=settings["return_to_start"],
+            tab_thickness=settings.get("tab_thickness", 3.0),
+            tabs_3d=settings.get("tabs_3d", False),
+        )
+
+    @staticmethod
+    def _build_narrow_feature_cleanup_moves(settings, start_xy):
+        """Cut only accepted collapsed details, never the complete contour."""
+
+        specifications = tuple(
+            settings.get("_narrow_feature_cleanup_paths", ()) or ()
+        )
+        paths = [
+            {
+                "points": specification.get("points", ()),
+                "preserve_direction": True,
+            }
+            for specification in specifications
+            if len(specification.get("points", ()) or ()) >= 2
+        ]
+        if not paths:
+            return []
+        moves = build_common_line_cut_job(
+            paths,
+            settings["final_depth"],
+            settings["stepdown"],
+            (
+                settings.get("ramp_length", 0.0)
+                if settings.get("use_ramp", False)
+                else 0.0
+            ),
+            settings["safe_height"],
+            material_thickness=settings["material_thickness"],
+            start_xy=start_xy,
+            start_depth=settings["start_depth"],
+            pass_depths=settings.get("pass_depths"),
+            return_to_start=False,
+        )
+        for move in moves:
+            move["common_line"] = False
+            move["cut_phase"] = "narrow_feature_cleanup"
+            move["narrow_feature_cleanup"] = True
+        return moves
+
+    @staticmethod
+    def _point_inside_closed_contour(point, contour):
+        inside = False
+        x, y = float(point[0]), float(point[1])
+        for index, start in enumerate(contour):
+            end = contour[(index + 1) % len(contour)]
+            if (start[1] > y) == (end[1] > y):
+                continue
+            x_at_y = (
+                (end[0] - start[0]) * (y - start[1])
+                / (end[1] - start[1])
+                + start[0]
+            )
+            if x < x_at_y:
+                inside = not inside
+        return inside
+
+    def _owner_id_for_inner_contour(self, inner_contour, outer_contours):
+        if not inner_contour:
+            raise ValueError("Contorno interno vazio no plano global.")
+        candidates = []
+        probe = inner_contour[0]
+        for index, outer in enumerate(outer_contours, start=1):
+            if self._point_inside_closed_contour(probe, outer):
+                candidates.append((abs(self._polygon_area(outer)), index))
+        if not candidates:
+            raise ValueError(
+                "Um contorno interno não pertence a nenhuma peça externa. "
+                "Reconheça peças e furos antes de gerar o plano global."
+            )
+        _area, index = min(candidates)
+        return "outer-%04d" % index
+
+    def _build_global_cut_stage_moves(
+        self,
+        outer_contours,
+        profile_inner_contours,
+        settings,
+        effective_tool_diameter,
+        start_xy,
+    ):
+        """Prepare compensated centre-lines and run the pure sheet planner."""
+
+        common_line_enabled = bool(settings.get("common_line_enabled", False))
+        oriented_outer_contours = tuple(
+            tuple(
+                _orient_contour_for_cut(
+                    contour,
+                    settings["outer_cut_side"],
+                    settings.get("cut_climb"),
+                )
+            )
+            for contour in outer_contours
+        )
+        if common_line_enabled:
+            _validated_plan, centre_lines = self._build_common_line_outer_moves(
+                oriented_outer_contours,
+                settings,
+                effective_tool_diameter,
+                start_xy,
+                return_plan_data=True,
+            )
+        else:
+            centre_lines = tuple(
+                tuple(
+                    compensated_polygon(
+                        contour,
+                        effective_tool_diameter,
+                        settings["outer_cut_side"],
+                    )
+                )
+                for contour in oriented_outer_contours
+            )
+
+        outer_specs = tuple(
+            CommonLineContour("outer-%04d" % index, points)
+            for index, points in enumerate(centre_lines, start=1)
+        )
+        internal_specs = []
+        for index, contour in enumerate(profile_inner_contours, start=1):
+            owner_id = self._owner_id_for_inner_contour(contour, outer_contours)
+            centre_line = compensated_polygon(
+                contour,
+                effective_tool_diameter,
+                CUT_SIDE_INSIDE,
+            )
+            centre_line = _orient_contour_for_cut(
+                centre_line,
+                CUT_SIDE_INSIDE,
+                settings.get("cut_climb"),
+            )
+            internal_specs.append(
+                OwnedContour("internal-%04d" % index, owner_id, centre_line)
+            )
+
+        depths = generate_depth_steps(
+            settings["final_depth"],
+            settings["stepdown"],
+            material_thickness=settings["material_thickness"],
+            start_depth=settings["start_depth"],
+            pass_depths=settings.get("pass_depths"),
+        )
+        stock_bounds_values = settings.get("_organization_sheet_bounds") or ()
+        if not stock_bounds_values:
+            stock_bounds = settings.get("_work_area_bounds")
+            if not stock_bounds:
+                try:
+                    stock_bounds = self._work_area_bounds_for_preview(settings)
+                except Exception:
+                    stock_bounds = None
+            stock_bounds_values = (stock_bounds,) if stock_bounds else ()
+        stock_boundaries = []
+        for stock_bounds in stock_bounds_values:
+            if not isinstance(stock_bounds, (tuple, list)) or len(stock_bounds) != 4:
+                continue
+            try:
+                min_x, min_y, max_x, max_y = map(float, stock_bounds)
+            except (TypeError, ValueError):
+                continue
+            if max_x <= min_x or max_y <= min_y:
+                continue
+            stock_boundaries.append(
+                (
+                    (min_x, min_y),
+                    (max_x, min_y),
+                    (max_x, max_y),
+                    (min_x, max_y),
+                )
+            )
+        plan_arguments = dict(
+            internal_contours=tuple(internal_specs),
+            stock_boundaries=tuple(stock_boundaries),
+            depths=depths,
+            strategy=settings.get(
+                "cut_depth_strategy",
+                DEFAULT_PRESETS["cut_depth_strategy"],
+            ),
+            release_mode=(
+                settings.get("tab_release_mode", "keep_tabs")
+                if settings.get("cut_tabs_enabled", False)
+                else "keep_tabs"
+            ),
+            tabs_enabled=bool(settings.get("cut_tabs_enabled", False)),
+            tab_count=settings.get("tab_count", 0),
+            tab_width=settings.get("tab_length", 12.0),
+            tab_thickness=settings.get("tab_thickness", 3.0),
+            manual_tab_positions=settings.get("tab_positions", ()),
+            best_fixation=bool(settings.get("tab_best_fixation", False)),
+            tool_diameter=effective_tool_diameter,
+            tool_type=settings.get("tool_type", "end_mill"),
+            tolerance=settings.get(
+                "common_line_tolerance",
+                DEFAULT_PRESETS.get("common_line_tolerance", 0.02),
+            ),
+            resolve_shared_edges=common_line_enabled,
+            start_xy=start_xy,
+            through_depth=settings["material_thickness"],
+            hybrid_intermediate_mode=settings.get(
+                "_hybrid_intermediate_mode",
+                "per_piece_common_line",
+            ),
+            loose_waste_fixation=settings.get(
+                "loose_waste_fixation", "disabled"
+            ),
+            material_thickness=settings["material_thickness"],
+            screw_pilot_diameter=settings.get("screw_pilot_diameter", 0.0),
+            screw_pilot_depth=settings.get("screw_pilot_depth", 0.0),
+            screw_head_diameter=settings.get("screw_head_diameter", 10.0),
+            screw_safety_margin=settings.get("screw_safety_margin", 3.0),
+            screw_head_height=settings.get("screw_head_height", 3.0),
+        )
+        try:
+            plan = build_global_cut_plan(outer_specs, **plan_arguments)
+        except GlobalCutPlanError as error:
+            automatic_release = (
+                plan_arguments.get("release_mode") == "automatic_release"
+            )
+            retention_deadlock = (
+                "não existe ordem de TabRelease" in str(error)
+                or "nenhuma peça liberável" in str(error)
+            )
+            if not automatic_release or not retention_deadlock:
+                raise
+            # The main cut and the manual tab locations are valid; only the
+            # optional final removal order is impossible without releasing a
+            # still-retained neighbour. Preserve the safe tabs instead of
+            # rejecting the complete operation.
+            settings["tab_release_mode"] = "keep_tabs"
+            settings["_tab_release_fallback_reason"] = str(error)
+            self.cut_tab_release_checkbox.setChecked(False)
+            plan_arguments["release_mode"] = "keep_tabs"
+            plan = build_global_cut_plan(outer_specs, **plan_arguments)
+        route_metrics = [
+            {
+                "depth": metric.depth,
+                "routing_mode": metric.routing_mode,
+                "cut_distance": metric.cut_distance,
+                "rapid_distance": metric.rapid_distance,
+                "retract_count": metric.retract_count,
+                "plunge_count": metric.plunge_count,
+                "piece_switch_count": metric.piece_switch_count,
+                "trail_count": metric.trail_count,
+                "fragmented_piece_count": metric.fragmented_piece_count,
+                "duplicate_physical_segment_count": (
+                    metric.duplicate_physical_segment_count
+                ),
+                "sum_of_independent_piece_perimeters": (
+                    metric.sum_of_independent_piece_perimeters
+                ),
+                "shared_cut_savings": metric.shared_cut_savings,
+                "shared_segments_reused": metric.shared_segments_reused,
+                "long_rapid_count": metric.long_rapid_count,
+            }
+            for metric in plan.route_metrics
+        ]
+        settings["_global_cut_plan_summary"] = {
+            "retention_layout_version": 2,
+            "strategy": plan.strategy.value,
+            "hybrid_intermediate_mode": plan.hybrid_intermediate_mode,
+            "segment_count": len(plan.segments),
+            "shared_segment_count": sum(
+                segment.kind.value == "shared" for segment in plan.segments
+            ),
+            "tab_count": len(plan.tabs),
+            "tabs": [
+                {
+                    "id": tab.tab_id,
+                    "kind": tab.kind.value,
+                    "owner_ids": tuple(tab.owner_ids),
+                    "waste_id": tab.waste_id,
+                    "x1": tab.start.x,
+                    "y1": tab.start.y,
+                    "x2": tab.end.x,
+                    "y2": tab.end.y,
+                    "width": tab.width,
+                    "height": tab.thickness,
+                }
+                for tab in plan.tabs
+            ],
+            "tab_release_count": len(plan.tab_release_operations),
+            "waste_region_count": len(plan.waste_regions),
+            "waste_regions": [
+                {
+                    "id": region.waste_id,
+                    "owner_id": region.owner_id,
+                    "area": region.area,
+                    "fixation": region.fixation,
+                    "fallback_reason": region.fallback_reason,
+                }
+                for region in plan.waste_regions
+            ],
+            "screw_anchor_count": len(plan.screw_anchors),
+            "screw_anchors": [
+                {
+                    "id": anchor.anchor_id,
+                    "waste_id": anchor.waste_id,
+                    "x": anchor.point.x,
+                    "y": anchor.point.y,
+                    "keepout_radius": anchor.keepout_radius,
+                    "head_height": anchor.head_height,
+                }
+                for anchor in plan.screw_anchors
+            ],
+            "route_metrics": route_metrics,
+            "operation_sequence": [
+                {
+                    "operation_id": operation.operation_id,
+                    "depth": operation.depth,
+                    "routing_mode": operation.routing_mode,
+                    "phase": operation.phase.value,
+                    "executing_owner_id": operation.executing_owner_id,
+                    "segment_ids": tuple(operation.segment_ids),
+                    "trail_id": operation.trail_id,
+                    "reverse_trail": bool(operation.reverse_trail),
+                    "start_edge_index": int(operation.start_edge_index),
+                }
+                for operation in plan.operations
+            ],
+        }
+        if settings.get("_tab_release_fallback_reason"):
+            settings["_global_cut_plan_summary"]["tab_release_fallback"] = (
+                settings["_tab_release_fallback_reason"]
+            )
+        return build_global_cut_plan_moves(
+            plan,
+            settings["safe_height"],
+            start_xy=start_xy,
+            return_to_start=settings["return_to_start"],
+            tabs_3d=settings.get("tabs_3d", False),
+            start_depth=settings["start_depth"],
+            ramp_length=(
+                settings.get("ramp_length", 0.0)
+                if settings.get("use_ramp", False)
+                else 0.0
+            ),
+            ramp_type=settings.get("ramp_type", "smooth"),
+            tool_diameter=effective_tool_diameter,
+            material_thickness=settings["material_thickness"],
+            tab_surface_clearance=settings.get("tab_surface_clearance", 0.2),
+            tab_release_supervision=settings.get(
+                "tab_release_supervision", "per_piece"
+            ),
+            spindle_spinup_seconds=settings.get(
+                "spindle_spinup_seconds", 1.0
+            ),
+            tab_release_stepdown=settings.get(
+                "stepdown", DEFAULT_PRESETS.get("stepdown", 3.0)
+            ),
+            tab_release_ramp_angle_degrees=DEFAULT_PRESETS.get(
+                "tab_release_ramp_angle_degrees", 12.0
+            ),
+            tab_release_minimum_depth_step=DEFAULT_PRESETS.get(
+                "tab_release_minimum_depth_step", 0.5
+            ),
+            # Só permanece dentro de um kerf já aberto quando o próximo alvo
+            # está, no máximo, a uma vez e meia o diâmetro efetivo. Percursos
+            # maiores sobem e usam o rápido na altura segura.
+            stay_down_max_distance=max(
+                float(effective_tool_diameter) * 1.5,
+                float(
+                    settings.get(
+                        "common_line_tolerance",
+                        DEFAULT_PRESETS.get("common_line_tolerance", 0.02),
+                    )
+                )
+                * 2.0,
+            ),
+        )
+
     def _build_stage_moves_from_selection(self, settings):
         operation_mode = settings["operation_mode"]
         if operation_mode in {"rough3d", "finish3d"}:
             return self._build_3d_stage_from_selection(settings)
-        geometry = self._active_geometry()
+        geometry = self._active_geometry(operation_mode)
+        active_sheet_context = self._active_vector_editor_sheet_context()
+        if active_sheet_context is not None:
+            _active_sheet_index, active_sheet_bounds = active_sheet_context
+            geometry = self._geometry_for_sheet(geometry, active_sheet_bounds)
         settings["_geometry_source"] = (
             "editor_2d" if self._use_vector_editor_for_cam else "freecad_selection"
         )
@@ -9416,6 +12926,12 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                 settings["_geometry_document_uuid"] = str(
                     self._vector_editor_document.document_uuid
                 )
+                # The document revision also changes when derived Piece2D
+                # relationships are refreshed. That metadata change must not
+                # invalidate an already-applied CAM operation.
+                settings["_geometry_fingerprint"] = self._vector_editor_geometry_fingerprint(
+                    self._vector_editor_document
+                )
             # O VectorDocument ja armazena seus vetores no mesmo sistema
             # cartesiano da area tracejada. Reancorar os bounds da geometria
             # no datum da aba Material aplicava uma segunda translacao: o
@@ -9424,16 +12940,44 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             # Persistimos o snapshot da area junto da operacao para que
             # percurso, retorno e G-code usem exatamente a mesma referencia,
             # mesmo se o usuario editar a area de Trabalho depois.
-            work_area = getattr(self._vector_editor_document, "work_area", None)
-            if work_area is not None:
-                settings["_work_area_bounds"] = [
-                    float(work_area.min_x),
-                    float(work_area.min_y),
-                    float(work_area.max_x),
-                    float(work_area.max_y),
+            if active_sheet_context is not None:
+                active_sheet_index, active_sheet_bounds = active_sheet_context
+                min_x, min_y, max_x, max_y = active_sheet_bounds
+                settings["_active_sheet_index"] = int(active_sheet_index)
+                settings["_active_sheet_bounds_global"] = list(active_sheet_bounds)
+                settings["_organization_sheet_bounds"] = [
+                    list(active_sheet_bounds)
                 ]
+                settings["_work_area_bounds"] = [
+                    0.0,
+                    0.0,
+                    float(max_x - min_x),
+                    float(max_y - min_y),
+                ]
+            else:
+                work_area = getattr(self._vector_editor_document, "work_area", None)
+                if work_area is not None:
+                    settings["_work_area_bounds"] = [
+                        float(work_area.min_x),
+                        float(work_area.min_y),
+                        float(work_area.max_x),
+                        float(work_area.max_y),
+                    ]
+                organization_sheet_bounds = tuple(
+                    (self._vector_editor_document.metadata or {}).get(
+                        "organization_sheet_bounds", ()
+                    )
+                    or ()
+                )
+                if organization_sheet_bounds:
+                    settings["_organization_sheet_bounds"] = [
+                        list(map(float, bounds))
+                        for bounds in organization_sheet_bounds
+                        if isinstance(bounds, (tuple, list)) and len(bounds) == 4
+                    ]
         selected_contours = geometry["contours"]
         holes = geometry["holes"]
+        remnant_cut_paths = list(geometry.get("remnant_cuts", ()) or ())
         outer_contours, nested_inner_contours = split_nested_contours(
             selected_contours
         )
@@ -9444,13 +12988,49 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         ]
         inner_contours = nested_inner_contours
         all_inner_contours = nested_inner_contours + known_hole_contours
-        settings["_xy_origin_offset"] = (0.0, 0.0)
+        if active_sheet_context is not None:
+            _active_sheet_index, active_sheet_bounds = active_sheet_context
+            settings["_xy_origin_offset"] = (
+                -float(active_sheet_bounds[0]),
+                -float(active_sheet_bounds[1]),
+            )
+        else:
+            settings["_xy_origin_offset"] = (0.0, 0.0)
         placement_x, placement_y = settings["_xy_origin_offset"]
         machine_start_x, machine_start_y = self._configured_machine_start_xy(settings)
         start_xy = (
             machine_start_x - float(placement_x or 0.0),
             machine_start_y - float(placement_y or 0.0),
         )
+
+        if remnant_cut_paths:
+            if operation_mode != "cut":
+                raise ValueError(
+                    "Linhas de separação de retalho são usinadas somente pela operação Corte."
+                )
+            if selected_contours or holes:
+                raise ValueError(
+                    "Selecione somente linhas de separação de retalho para criar este percurso."
+                )
+            settings["_remnant_cut_entity_ids"] = list(
+                geometry.get("remnant_cut_entity_ids", ()) or ()
+            )
+            settings["_remnant_cut_centerline"] = True
+            moves = build_common_line_cut_job(
+                remnant_cut_paths,
+                settings["final_depth"],
+                settings["stepdown"],
+                settings["ramp_length"],
+                settings["safe_height"],
+                material_thickness=settings["material_thickness"],
+                start_xy=start_xy,
+                start_depth=settings["start_depth"],
+                pass_depths=settings.get("pass_depths"),
+                return_to_start=settings["return_to_start"],
+            )
+            for move in moves:
+                move["remnant_cut"] = True
+            return {"cut": moves}
 
         if operation_mode == "holes":
             if not holes:
@@ -9468,8 +13048,15 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                 use_helical_drilling=settings["use_helical_drilling"],
                 helix_pitch=settings["helix_pitch"],
                 helix_stepover_ratio=settings["helix_stepover_percent"] / 100.0,
+                counterbore_enabled=settings["hole_counterbore_enabled"],
+                counterbore_diameter=settings["hole_counterbore_diameter"],
+                counterbore_depth=settings["hole_counterbore_depth"],
+                tool_type=settings.get("tool_type", "end_mill"),
                 use_model_depths=settings["use_model_hole_depths"],
-                hole_depth_override=settings["cut_depth"],
+                hole_depth_override=max(
+                    0.0,
+                    settings["final_depth"] - settings["start_depth"],
+                ),
                 peck_enabled=settings["peck_enabled"],
                 peck_step=settings["peck_step"],
                 retract_mode=settings["peck_retract_mode"],
@@ -9521,10 +13108,202 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                     "A compensação dimensional deixa o diâmetro efetivo da "
                     "fresa inválido. Reduza o valor negativo."
                 )
+            narrow_feature_issues = []
+            compensated_outer_cut = (
+                settings.get("outer_cut_side") == CUT_SIDE_OUTSIDE
+                and not (
+                    settings.get("common_line_enabled")
+                    and settings.get("common_line_mode") == "on_vector"
+                )
+            )
+            if compensated_outer_cut:
+                for contour_index, contour in enumerate(outer_contours):
+                    issue = external_compensation_detail_loss(
+                        contour,
+                        effective_tool_diameter,
+                    )
+                    if issue is not None:
+                        narrow_feature_issues.append((contour_index, issue))
+            settings.pop("_narrow_feature_on_line_indices", None)
+            if narrow_feature_issues:
+                settings["_narrow_feature_cleanup_contour_indices"] = [
+                    index for index, _issue in narrow_feature_issues
+                ]
+                _, first_issue = narrow_feature_issues[0]
+                first_x, first_y = first_issue["point"]
+                signature = (
+                    str(settings.get("_geometry_document_uuid", "")),
+                    str(settings.get("_geometry_fingerprint", "")),
+                    round(effective_tool_diameter, 7),
+                    tuple(
+                        (
+                            index,
+                            round(issue["point"][0], 5),
+                            round(issue["point"][1], 5),
+                        )
+                        for index, issue in narrow_feature_issues
+                    ),
+                )
+                settings["_narrow_feature_confirmation_signature"] = signature
+                cleanup_specifications = []
+                for index, issue in narrow_feature_issues:
+                    modes = tuple(issue.get("cleanup_modes", ()) or ())
+                    for path_index, path in enumerate(
+                        issue.get("cleanup_paths", ()) or ()
+                    ):
+                        cleanup_specifications.append(
+                            {
+                                "contour_index": index,
+                                "points": [
+                                    [float(point[0]), float(point[1])]
+                                    for point in path
+                                ],
+                                "mode": (
+                                    modes[path_index]
+                                    if path_index < len(modes)
+                                    else "local_source_trace"
+                                ),
+                            }
+                        )
+                settings["_narrow_feature_cleanup_paths"] = (
+                    cleanup_specifications
+                )
+                settings["_narrow_feature_override_summary"] = [
+                    {
+                        "contour_index": index,
+                        "x": issue["point"][0],
+                        "y": issue["point"][1],
+                        "tool_diameter": effective_tool_diameter,
+                        "strategy": "supplemental_local_cleanup",
+                        "cleanup_modes": list(
+                            issue.get("cleanup_modes", ()) or ()
+                        ),
+                    }
+                    for index, issue in narrow_feature_issues
+                ]
+                if not settings.get("allow_narrow_feature_overcut", False):
+                    raise ValueError(
+                        "__WOODCAM_CONFIRM_NARROW_FEATURE_OVERCUT__"
+                        + translate_text(
+                            "A fresa Ø %.2f mm não alcança todos os detalhes de %d peça(s). A compensação externa fechou uma região estreita e o percurso passou reto; o primeiro ponto está próximo de X %.2f / Y %.2f.\n\nCortar mesmo assim mantém o contorno externo compensado e acrescenta um percurso auxiliar somente na região estreita. Em uma fenda aberta, a fresa segue o eixo médio local, inclusive em afunilamentos e degraus, para retirar o mínimo possível de cada lateral. A abertura final nunca pode ser menor que o diâmetro da ferramenta. Confira a prévia antes de gerar o G-code."
+                        )
+                        % (
+                            effective_tool_diameter,
+                            len(narrow_feature_issues),
+                            first_x,
+                            first_y,
+                        )
+                    )
+            else:
+                settings.pop("_narrow_feature_confirmation_signature", None)
+                settings.pop("_narrow_feature_override_summary", None)
+                settings.pop("_narrow_feature_cleanup_paths", None)
+                settings.pop("_narrow_feature_cleanup_contour_indices", None)
             last_pass_allowance = max(
                 0.0,
                 float(settings.get("cut_last_pass_allowance", 0.0) or 0.0),
             )
+            common_line_requested = bool(
+                settings.get("common_line_enabled") and outer_contours
+            )
+            if not common_line_requested:
+                settings.pop("_global_cut_plan_summary", None)
+            if common_line_requested:
+                self._build_common_line_outer_moves(
+                    outer_contours,
+                    settings,
+                    effective_tool_diameter,
+                    start_xy,
+                    return_plan_data=True,
+                )
+            # O plano global nasceu para resolver identidade física/SharedEdge.
+            # Ele só pode substituir o CAM legado quando o operador ativou
+            # explicitamente Linha comum; configurações persistidas não bastam.
+            use_global_plan = common_line_requested
+            if use_global_plan:
+                depth_strategy = str(
+                    settings.get(
+                        "cut_depth_strategy",
+                        DEFAULT_PRESETS["cut_depth_strategy"],
+                    )
+                    or DEFAULT_PRESETS["cut_depth_strategy"]
+                )
+                if depth_strategy not in {
+                    "per_piece",
+                    "piece_bidirectional",
+                    "global_by_depth",
+                    "hybrid_stability",
+                    "hybrid_piece_bidirectional",
+                }:
+                    raise ValueError(
+                        "A estratégia de profundidade da Linha comum é inválida."
+                    )
+                if (
+                    settings.get("cut_separate_last_pass")
+                    and last_pass_allowance > 1.0e-6
+                ):
+                    raise ValueError(
+                        "O plano global não pode combinar sobre-metal de última "
+                        "passada com segmentos físicos únicos. Desative a última "
+                        "passada separada ou use Por peça (compatibilidade)."
+                    )
+                profile_inner_contours = list(inner_contours)
+                fallback_holes = []
+                for hole in holes:
+                    points = hole.get("points")
+                    if not points:
+                        fallback_holes.append(hole)
+                    elif float(hole.get("diameter_mm", 0.0) or 0.0) > (
+                        effective_tool_diameter + 1.0e-6
+                    ):
+                        profile_inner_contours.append(points)
+                    else:
+                        fallback_holes.append(hole)
+
+                if fallback_holes:
+                    drill_moves = build_contour_cut_stage(
+                        [],
+                        [],
+                        settings["final_depth"],
+                        settings["stepdown"],
+                        0.0,
+                        settings["safe_height"],
+                        tool_diameter=effective_tool_diameter,
+                        material_thickness=settings["material_thickness"],
+                        start_xy=start_xy,
+                        return_to_start=False,
+                        inner_holes=fallback_holes,
+                        start_depth=settings["start_depth"],
+                    )
+                    cut_moves.extend(drill_moves)
+                global_start_xy = _last_xy_from_moves(cut_moves, start_xy)
+                global_moves = self._build_global_cut_stage_moves(
+                    outer_contours,
+                    profile_inner_contours,
+                    settings,
+                    effective_tool_diameter,
+                    global_start_xy,
+                )
+                first_main_cut = next(
+                    (
+                        index
+                        for index, move in enumerate(global_moves)
+                        if move.get("cut_phase")
+                        in {"internal", "shared", "external"}
+                    ),
+                    len(global_moves),
+                )
+                prefix = global_moves[:first_main_cut]
+                cleanup_start_xy = _last_xy_from_moves(prefix, global_start_xy)
+                cleanup_moves = self._build_narrow_feature_cleanup_moves(
+                    settings,
+                    cleanup_start_xy,
+                )
+                cut_moves.extend(prefix)
+                cut_moves.extend(cleanup_moves)
+                cut_moves.extend(global_moves[first_main_cut:])
+                return {"cut": cut_moves}
+
             if settings.get("cut_separate_last_pass") and last_pass_allowance > 1e-6:
                 rough_moves = build_contour_cut_stage(
                     outer_contours,
@@ -9551,35 +13330,97 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                 )
                 cut_moves.extend(rough_moves)
 
-            final_cut_moves = build_contour_cut_stage(
-                outer_contours,
-                inner_contours,
-                settings["final_depth"],
-                settings["stepdown"],
-                settings["ramp_length"],
-                settings["safe_height"],
-                tool_diameter=effective_tool_diameter,
-                outer_cut_side=settings["outer_cut_side"],
-                material_thickness=settings["material_thickness"],
-                smart_entry=settings["smart_entry"],
-                start_xy=start_xy,
-                return_to_start=settings["return_to_start"],
-                inner_holes=holes,
-                start_depth=settings["start_depth"],
-                corner_slowdown_enabled=settings["corner_slowdown_enabled"],
-                corner_angle_threshold=settings["corner_angle_threshold"],
-                corner_feed_percent=settings["corner_feed_percent"],
-                corner_slowdown_distance=settings["corner_slowdown_distance"],
-                climb=settings["cut_climb"],
-                tabs_enabled=settings.get("cut_tabs_enabled", False),
-                tab_length=settings.get("tab_length", 12.0),
-                tab_thickness=settings.get("tab_thickness", 3.0),
-                tab_count=settings.get("tab_count", 4),
-                tab_positions=settings.get("tab_positions", ()),
-                tabs_3d=settings.get("tabs_3d", False),
-                ramp_type=settings.get("ramp_type", "smooth"),
-                pass_depths=settings.get("pass_depths"),
+            cleanup_start_xy = _last_xy_from_moves(cut_moves, start_xy)
+            cut_moves.extend(
+                self._build_narrow_feature_cleanup_moves(
+                    settings,
+                    cleanup_start_xy,
+                )
             )
+            final_start_xy = _last_xy_from_moves(cut_moves, start_xy)
+            common_outer_moves = None
+            if settings.get("common_line_enabled") and outer_contours:
+                common_outer_moves = self._build_common_line_outer_moves(
+                    outer_contours,
+                    settings,
+                    effective_tool_diameter,
+                    final_start_xy,
+                )
+
+            if common_outer_moves is not None:
+                # Furos e recortes internos continuam fechados e são concluídos
+                # primeiro. Só a rede externa passa ao planejador edge-disjoint.
+                final_cut_moves = build_contour_cut_stage(
+                    [],
+                    inner_contours,
+                    settings["final_depth"],
+                    settings["stepdown"],
+                    settings["ramp_length"],
+                    settings["safe_height"],
+                    tool_diameter=effective_tool_diameter,
+                    outer_cut_side=settings["outer_cut_side"],
+                    material_thickness=settings["material_thickness"],
+                    smart_entry=settings["smart_entry"],
+                    start_xy=final_start_xy,
+                    return_to_start=False,
+                    inner_holes=holes,
+                    start_depth=settings["start_depth"],
+                    corner_slowdown_enabled=settings["corner_slowdown_enabled"],
+                    corner_angle_threshold=settings["corner_angle_threshold"],
+                    corner_feed_percent=settings["corner_feed_percent"],
+                    corner_slowdown_distance=settings["corner_slowdown_distance"],
+                    climb=settings["cut_climb"],
+                    ramp_type=settings.get("ramp_type", "smooth"),
+                    pass_depths=settings.get("pass_depths"),
+                )
+                common_start_xy = _last_xy_from_moves(
+                    final_cut_moves,
+                    final_start_xy,
+                )
+                # Rebuild only the nearest-end ordering from the actual exit of
+                # the internal cuts. Geometry and tab decisions remain pure.
+                if common_start_xy != final_start_xy:
+                    common_outer_moves = self._build_common_line_outer_moves(
+                        outer_contours,
+                        settings,
+                        effective_tool_diameter,
+                        common_start_xy,
+                    )
+                final_cut_moves.extend(common_outer_moves or [])
+            else:
+                final_cut_moves = build_contour_cut_stage(
+                    outer_contours,
+                    inner_contours,
+                    settings["final_depth"],
+                    settings["stepdown"],
+                    settings["ramp_length"],
+                    settings["safe_height"],
+                    tool_diameter=effective_tool_diameter,
+                    outer_cut_side=settings["outer_cut_side"],
+                    material_thickness=settings["material_thickness"],
+                    smart_entry=settings["smart_entry"],
+                    start_xy=final_start_xy,
+                    return_to_start=settings["return_to_start"],
+                    inner_holes=holes,
+                    start_depth=settings["start_depth"],
+                    corner_slowdown_enabled=settings["corner_slowdown_enabled"],
+                    corner_angle_threshold=settings["corner_angle_threshold"],
+                    corner_feed_percent=settings["corner_feed_percent"],
+                    corner_slowdown_distance=settings["corner_slowdown_distance"],
+                    climb=settings["cut_climb"],
+                    tabs_enabled=settings.get("cut_tabs_enabled", False),
+                    tab_length=settings.get("tab_length", 12.0),
+                    tab_thickness=settings.get("tab_thickness", 3.0),
+                    tab_count=settings.get("tab_count", 4),
+                    tab_positions=settings.get("tab_positions", ()),
+                    tab_best_fixation=settings.get("tab_best_fixation", False),
+                    tabs_3d=settings.get("tabs_3d", False),
+                    tab_surface_clearance=settings.get(
+                        "tab_surface_clearance", 0.2
+                    ),
+                    ramp_type=settings.get("ramp_type", "smooth"),
+                    pass_depths=settings.get("pass_depths"),
+                )
             cut_moves.extend(final_cut_moves)
             return {"cut": cut_moves}
 
@@ -9616,11 +13457,215 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
     def _build_moves_from_selection(self, settings):
         stages = self._build_stage_moves_from_selection(settings)
         machine_stages = self._transform_stages_to_machine(settings, stages)
-        return [
+        moves = [
             move
             for stage_moves in machine_stages.values()
             for move in stage_moves
         ]
+        self._synchronise_screw_anchor_machine_positions(settings, moves)
+        self._validate_screw_keepouts(settings, moves)
+        return moves
+
+    @staticmethod
+    def _synchronise_screw_anchor_machine_positions(settings, moves):
+        """Persist machine XY without losing model XY used by the preview."""
+
+        summary = settings.get("_global_cut_plan_summary", {}) or {}
+        anchors = summary.get("screw_anchors", ()) or ()
+        if not anchors:
+            return
+        positions = {}
+        for move in moves:
+            anchor_id = move.get("screw_anchor_id")
+            if (
+                anchor_id
+                and move.get("x") is not None
+                and move.get("y") is not None
+            ):
+                positions[str(anchor_id)] = (
+                    float(move["x"]),
+                    float(move["y"]),
+                )
+        for anchor in anchors:
+            position = positions.get(str(anchor.get("id", "")))
+            if position is not None:
+                anchor["machine_x"], anchor["machine_y"] = position
+
+    def _validate_screw_keepouts(self, settings, moves):
+        """Reject later low-Z trajectories through persisted screw regions."""
+
+        anchors = []
+        seen = set()
+        sources = [settings]
+        for operation in self._iter_applied_operation_objects():
+            if operation is getattr(self, "_editing_operation", None):
+                # An update replaces this operation; its previous anchors must
+                # not survive as phantom keep-outs during the rebuild.
+                continue
+            try:
+                sources.append(json.loads(str(operation.SettingsJSON)))
+            except Exception:
+                continue
+        for source in sources:
+            summary = source.get("_global_cut_plan_summary", {}) or {}
+            for anchor in summary.get("screw_anchors", ()) or ():
+                try:
+                    anchor_x = float(anchor.get("machine_x", anchor["x"]))
+                    anchor_y = float(anchor.get("machine_y", anchor["y"]))
+                    radius = float(anchor["keepout_radius"])
+                    key = (
+                        round(anchor_x, 7),
+                        round(anchor_y, 7),
+                        round(radius, 7),
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    anchors.append(
+                        (
+                            anchor_x,
+                            anchor_y,
+                            radius,
+                            float(anchor.get("head_height", 0.0) or 0.0),
+                        )
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+        if not anchors:
+            return
+
+        previous = None
+        for move in moves:
+            if move.get("cut_phase") in {"screw_pilot", "screw_setup"}:
+                if move.get("x") is not None and move.get("y") is not None:
+                    previous = (float(move["x"]), float(move["y"]))
+                continue
+            current = previous
+            if move.get("x") is not None and move.get("y") is not None:
+                current = (float(move["x"]), float(move["y"]))
+            if current is None:
+                continue
+            if move.get("type") == "rapid":
+                z_value = float(move.get("z", settings["safe_height"]) or 0.0)
+                required = max((height + 1.0 for _x, _y, _r, height in anchors), default=0.0)
+                if z_value + 1.0e-7 < required:
+                    raise ValueError(
+                        "Um movimento rápido passa abaixo da altura segura dos parafusos."
+                    )
+                previous = current
+                continue
+            if move.get("type") == "operator_pause":
+                continue
+            start = previous or current
+            tool_radius = max(
+                0.0, float(settings.get("tool_diameter", 0.0) or 0.0) * 0.5
+            )
+            for anchor_x, anchor_y, radius, _head_height in anchors:
+                dx = current[0] - start[0]
+                dy = current[1] - start[1]
+                length_squared = dx * dx + dy * dy
+                parameter = 0.0
+                if length_squared > 1.0e-18:
+                    parameter = max(
+                        0.0,
+                        min(
+                            1.0,
+                            ((anchor_x - start[0]) * dx + (anchor_y - start[1]) * dy)
+                            / length_squared,
+                        ),
+                    )
+                closest_x = start[0] + dx * parameter
+                closest_y = start[1] + dy * parameter
+                if (
+                    math.hypot(closest_x - anchor_x, closest_y - anchor_y)
+                    < radius + tool_radius - 1.0e-7
+                ):
+                    raise ValueError(
+                        "A trajetória invade a região proibida do parafuso em "
+                        "X %.3f / Y %.3f." % (anchor_x, anchor_y)
+                    )
+            previous = current
+
+    def _build_moves_with_intersection_confirmation(self, settings):
+        """Build a path, offering a deliberate override for contour overlap."""
+        try:
+            return self._build_moves_from_selection(settings)
+        except Exception as error:
+            message = str(error)
+            narrow_token = "__WOODCAM_CONFIRM_NARROW_FEATURE_OVERCUT__"
+            if message.startswith(narrow_token):
+                signature = settings.get(
+                    "_narrow_feature_confirmation_signature"
+                )
+                if (
+                    signature
+                    and signature
+                    == getattr(
+                        self,
+                        "_confirmed_narrow_feature_signature",
+                        None,
+                    )
+                ):
+                    settings["allow_narrow_feature_overcut"] = True
+                    return self._build_moves_from_selection(settings)
+                explanation = message[len(narrow_token):]
+                answer = QtWidgets.QMessageBox.warning(
+                    self,
+                    translate_text("Região menor que a fresa"),
+                    explanation
+                    + "\n\n"
+                    + translate_text(
+                        "Cortar mesmo assim e assumir conscientemente essa perda dimensional?"
+                    ),
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+                    QtWidgets.QMessageBox.Cancel,
+                )
+                if answer != QtWidgets.QMessageBox.Yes:
+                    raise ValueError(
+                        translate_text(
+                            "Corte cancelado: a região estreita não foi autorizada."
+                        )
+                    )
+                settings["allow_narrow_feature_overcut"] = True
+                self._confirmed_narrow_feature_signature = signature
+                return self._build_moves_from_selection(settings)
+            confirmation_token = "__WOODCAM_CONFIRM_COMMON_LINE_ON_VECTOR__"
+            if message.startswith(confirmation_token):
+                explanation = message[len(confirmation_token):]
+                answer = QtWidgets.QMessageBox.warning(
+                    self,
+                    "Linha comum altera as medidas",
+                    explanation
+                    + "\n\nContinuar conscientemente com o vetor como centro da fresa?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+                    QtWidgets.QMessageBox.Cancel,
+                )
+                if answer != QtWidgets.QMessageBox.Yes:
+                    raise ValueError(
+                        "Corte cancelado: linha comum sobre o vetor não foi confirmada."
+                    )
+                settings["_common_line_on_vector_confirmed"] = True
+                return self._build_moves_from_selection(settings)
+            if "intersectam ou sobrepõem" not in message:
+                raise
+            answer = QtWidgets.QMessageBox.warning(
+                self,
+                "Contornos sobrepostos",
+                "Dois contornos se intersectam ou sobrepõem.\n\n"
+                "Ignorar esta verificação e executar mesmo assim?\n"
+                "O percurso pode conter movimentos duplicados ou cortar uma "
+                "área inesperada.",
+                QtWidgets.QMessageBox.Ignore | QtWidgets.QMessageBox.Cancel,
+                QtWidgets.QMessageBox.Cancel,
+            )
+            if answer != QtWidgets.QMessageBox.Ignore:
+                raise
+            settings["ignore_contour_intersections"] = True
+            self._ignore_contour_intersections_for_build = True
+            try:
+                return self._build_moves_from_selection(settings)
+            finally:
+                self._ignore_contour_intersections_for_build = False
 
     def _available_output_path(self, path):
         path = Path(path)
@@ -9751,6 +13796,14 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
     def generate_gcode(self):
         try:
             applied_entries = self._selected_applied_entries()
+            current_index = self.operation_tabs.currentIndex()
+            tab_title = self._tab_title(current_index) if current_index >= 0 else ""
+            if not applied_entries and tab_title == ACTION_TAB_TITLE:
+                # Nesta página a lista é o gerenciador da exportação. Uma
+                # seleção vazia significa "todos", exatamente na ordem
+                # persistida que o operador vê; nunca recalcular silenciosamente
+                # a última aba CAM a partir da geometria atual.
+                applied_entries = self._all_applied_entries()
             if applied_entries:
                 output_path = self.output_path.text().strip()
                 if not output_path:
@@ -9849,16 +13902,19 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                 "G-code salvo sem sobrescrever:\n" + "\n".join(saved_paths),
             )
         except Exception as error:
-            QtWidgets.QMessageBox.critical(self, "Erro", str(error))
+            QtWidgets.QMessageBox.critical(
+                self, translate_text("Erro"), translate_text(str(error))
+            )
 
     def _update_cam_advisor_summary(self, settings, report=None):
         report = report or analyze_cam_settings(settings)
         if not hasattr(self, "cam_advisor_button"):
             return report
         count = len(report.items)
-        self.cam_advisor_button.setText(
+        button_source = (
             "Assistente CAM" if not count else "Assistente CAM (%d)" % count
         )
+        self.cam_advisor_button.setText(translate_text(button_source))
         if report.warning_count:
             self.cam_advisor_button.setStyleSheet(
                 "color: #92400e; background: #fffbeb; border: 1px solid #f59e0b;"
@@ -9869,18 +13925,17 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             )
         else:
             self.cam_advisor_button.setStyleSheet("")
-        self.cam_advisor_button.setToolTip(
-            (
+        if count:
+            tooltip = translate_text(
                 "%d observação(ões), sendo %d alerta(s). Clique para entender. "
                 "Nenhum parâmetro é alterado automaticamente."
-                % (count, report.warning_count)
-            )
-            if count
-            else (
+            ) % (count, report.warning_count)
+        else:
+            tooltip = translate_text(
                 "Nenhum alerta conservador nos parâmetros atuais. Clique para conferir; "
                 "isso não substitui prévia, simulação e teste na máquina."
             )
-        )
+        self.cam_advisor_button.setToolTip(tooltip)
         return report
 
     def show_cam_advisor(self):
@@ -9915,23 +13970,27 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                     contours = []
             report = analyze_cam_settings(settings, contours=contours)
             self._update_cam_advisor_summary(settings, report)
-            title = "Assistente CAM — análise explicável"
+            title = translate_text("Assistente CAM — análise explicável")
             operation_label = OPERATION_TREE_LABELS.get(
                 operation_mode,
                 STAGE_LABELS.get(operation_mode, operation_mode),
             )
             tool_name = str(settings.get("tool_name", "") or "Ferramenta não nomeada")
-            tool_type = str(settings.get("tool_type", "") or "tipo não informado")
+            tool_type_key = str(settings.get("tool_type", "") or "")
+            tool_type = TOOL_TYPE_DEFINITIONS.get(
+                tool_type_key,
+                {"short_label": "Tipo não informado"},
+            )["short_label"]
             diameter = float(settings.get("tool_diameter", 0.0) or 0.0)
             report_text = (
-                "ANALISANDO AGORA\n"
+                translate_text("ANALISANDO AGORA") + "\n"
                 "%s | %s | %s | Ø %g mm\n\n%s"
                 % (
-                    operation_label,
-                    tool_name,
-                    tool_type,
+                    translate_text(operation_label),
+                    translate_text(tool_name),
+                    translate_text(tool_type),
                     diameter,
-                    report.to_plain_text(),
+                    report.to_plain_text(translator=translate_text),
                 )
             )
             if report.warning_count:
@@ -9939,7 +13998,11 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             else:
                 QtWidgets.QMessageBox.information(self, title, report_text)
         except Exception as error:
-            QtWidgets.QMessageBox.critical(self, "Assistente CAM", str(error))
+            QtWidgets.QMessageBox.critical(
+                self,
+                translate_text("Assistente CAM"),
+                translate_text(str(error)),
+            )
 
     def preview_toolpath(self):
         try:
@@ -9956,14 +14019,16 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             if not self._confirm_material_pierce(settings):
                 return
             self._persist_machine_settings(settings)
-            moves = self._build_moves_from_selection(settings)
+            moves = self._build_moves_with_intersection_confirmation(settings)
             self._show_preview(settings, moves)
             self.last_preview_settings = dict(settings)
             self.last_preview_moves = [dict(move) for move in moves]
             self._set_toolpath_truth(settings, moves, "PRÉVIA EXATA")
             self._update_simulation_time_label()
         except Exception as error:
-            QtWidgets.QMessageBox.critical(self, "Erro", str(error))
+            QtWidgets.QMessageBox.critical(
+                self, translate_text("Erro"), translate_text(str(error))
+            )
 
     def apply_current_operation(self):
         try:
@@ -9980,12 +14045,13 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             if not self._confirm_material_pierce(settings):
                 return
             self._persist_machine_settings(settings)
-            editing_operation = self._selected_operation_from_tree()
-            if editing_operation is None:
-                editing_operation = self._editing_operation
+            # Atualizar é um modo explícito iniciado por “Editar”. Apenas
+            # deixar uma operação selecionada na árvore não pode transformar
+            # um novo Aplicar em sobrescrita, principalmente após Cancelar.
+            editing_operation = self._editing_operation
             if editing_operation is not None:
                 self._restore_operation_source_selection(editing_operation)
-            moves = self._build_moves_from_selection(settings)
+            moves = self._build_moves_with_intersection_confirmation(settings)
             if editing_operation is not None:
                 operation = self._update_applied_operation(settings, moves, editing_operation)
             else:
@@ -9997,9 +14063,9 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             self._clear_existing_preview(FreeCAD.ActiveDocument)
             self._ensure_persistent_work_area(FreeCAD.ActiveDocument, settings)
             if self._uses_lightweight_toolpath_overlay(settings):
-                # Corte e percursos 3D gravam somente os movimentos; a vista
-                # azul completa é recriada pelo overlay Coin, sem projeção
-                # vermelha persistente no documento.
+                # Corte, Preenchimento e percursos 3D gravam somente os
+                # movimentos; a vista completa é recriada pelo overlay Coin,
+                # sem projeção reduzida persistente no documento.
                 self._show_exact_simulation_toolpath(
                     settings,
                     moves,
@@ -10012,41 +14078,63 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                 # A edição é explícita: para editar novamente, selecione o
                 # percurso na árvore. Assim uma nova seleção de geometria
                 # volta a criar uma operação independente.
-                self._editing_operation = None
-                self.apply_button.setText("Aplicar")
-                self.apply_button.setToolTip(
-                    "Cria uma operação persistente e numerada na árvore do documento."
+                self._leave_operation_editing()
+            if settings.get("_tab_release_fallback_reason"):
+                self.operation_hint.setText(
+                    translate_text(
+                        "Operação aplicada com as tabs preservadas: não há uma ordem "
+                        "automática segura para liberar todas as peças restantes."
+                    )
                 )
+                self.operation_hint.setStyleSheet("color: #92400e; font-weight: bold;")
         except Exception as error:
-            QtWidgets.QMessageBox.critical(self, "Erro", str(error))
+            QtWidgets.QMessageBox.critical(
+                self, translate_text("Erro"), translate_text(str(error))
+            )
 
     def simulate_toolpath(self):
         try:
             applied = self._selected_applied_simulation()
             if applied is not None:
                 settings, moves = applied
-                self._show_simulation(moves, settings)
+                self._show_simulation(
+                    moves,
+                    self._settings_with_live_simulation_speed(settings),
+                )
                 return
             if self.last_preview_settings is not None and self.last_preview_moves:
                 self._show_simulation(
                     self.last_preview_moves,
-                    self.last_preview_settings,
+                    self._settings_with_live_simulation_speed(
+                        self.last_preview_settings
+                    ),
                 )
                 return
             if self.last_applied_settings is not None and self.last_applied_moves:
                 self._show_simulation(
                     self.last_applied_moves,
-                    self.last_applied_settings,
+                    self._settings_with_live_simulation_speed(
+                        self.last_applied_settings
+                    ),
                 )
                 return
             self._restore_editing_source_if_needed()
             settings = self._collect_settings()
             validate_settings(settings)
             self._persist_machine_settings(settings)
-            moves = self._build_moves_from_selection(settings)
+            moves = self._build_moves_with_intersection_confirmation(settings)
             self._show_simulation(moves, settings)
         except Exception as error:
-            QtWidgets.QMessageBox.critical(self, "Erro", str(error))
+            QtWidgets.QMessageBox.critical(
+                self, translate_text("Erro"), translate_text(str(error))
+            )
+
+    def _settings_with_live_simulation_speed(self, settings):
+        live_settings = dict(settings or {})
+        live_settings["simulation_speed_multiplier"] = (
+            self._current_simulation_speed()
+        )
+        return live_settings
 
     def stop_simulation(self):
         self._clear_existing_simulation()
@@ -10066,12 +14154,278 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                 continue
             sequence = int(getattr(obj, "WoodCAMSequence", 0) or 0)
             mode = str(getattr(obj, "WoodCAMOperationType", ""))
-            items.append((mode, sequence, obj))
+            global_order = int(getattr(obj, "WoodCAMGlobalOrder", 0) or 0)
+            items.append((global_order, mode, sequence, obj))
         mode_order = {"rough3d": 0, "finish3d": 1, "holes": 2, "cut": 3, "pocket": 4}
-        items.sort(key=lambda item: (mode_order.get(item[0], 99), item[1], item[2].Label))
-        return [obj for _mode, _sequence, obj in items]
+        # Arquivos antigos não possuem WoodCAMGlobalOrder. Enquanto a lista
+        # não tiver sido explicitamente reordenada, preserve integralmente a
+        # ordem histórica por tipo e sequência. Depois do primeiro arraste,
+        # todas as operações recebem a propriedade e a tela, a simulação e a
+        # exportação passam a compartilhar uma única ordem persistida.
+        complete_global_order = bool(items) and all(item[0] > 0 for item in items)
+        if complete_global_order:
+            items.sort(key=lambda item: (item[0], item[3].Label, item[3].Name))
+        else:
+            items.sort(
+                key=lambda item: (
+                    mode_order.get(item[1], 99),
+                    item[2],
+                    item[3].Label,
+                    item[3].Name,
+                )
+            )
+        return [obj for _order, _mode, _sequence, obj in items]
 
-    def _operation_geometry_is_stale(self, operation, settings=None):
+    def _applied_operation_objects_in_list_order(self):
+        if not hasattr(self, "applied_toolpath_list"):
+            return []
+        doc = FreeCAD.ActiveDocument
+        if doc is None:
+            return []
+        operations = []
+        for row in range(self.applied_toolpath_list.count()):
+            item = self.applied_toolpath_list.item(row)
+            name = item.data(QtCore.Qt.UserRole) if item is not None else None
+            obj = doc.getObject(str(name)) if name else None
+            if obj is not None:
+                operations.append(obj)
+        return operations
+
+    def _selected_applied_operation_objects(self):
+        if not hasattr(self, "applied_toolpath_list"):
+            return []
+        doc = FreeCAD.ActiveDocument
+        if doc is None:
+            return []
+        operations = []
+        for row in range(self.applied_toolpath_list.count()):
+            item = self.applied_toolpath_list.item(row)
+            name = item.data(QtCore.Qt.UserRole) if item is not None else None
+            if not name or not item.isSelected():
+                continue
+            operation = doc.getObject(str(name))
+            if operation is not None:
+                operations.append(operation)
+        return operations
+
+    def _persist_applied_operation_order_from_list(self, *_args):
+        if self._persisting_applied_operation_order:
+            return
+        doc = FreeCAD.ActiveDocument
+        operations = self._applied_operation_objects_in_list_order()
+        if doc is None or not operations:
+            return
+        self._persisting_applied_operation_order = True
+        transaction_open = False
+        try:
+            doc.openTransaction("WoodCAM — Reordenar operações")
+            transaction_open = True
+            for order, operation in enumerate(operations, 1):
+                if not hasattr(operation, "WoodCAMGlobalOrder"):
+                    operation.addProperty(
+                        "App::PropertyInteger",
+                        "WoodCAMGlobalOrder",
+                        "WoodCAM 2D",
+                    )
+                operation.WoodCAMGlobalOrder = int(order)
+                try:
+                    operation.setEditorMode("WoodCAMGlobalOrder", 2)
+                except Exception:
+                    pass
+            doc.recompute()
+            doc.commitTransaction()
+            transaction_open = False
+            self._update_simulation_time_label()
+        except Exception as error:
+            if transaction_open:
+                try:
+                    doc.abortTransaction()
+                except Exception:
+                    pass
+            self._refresh_applied_operation_list()
+            QtWidgets.QMessageBox.critical(
+                self,
+                translate_text("Erro"),
+                translate_text("Não foi possível salvar a nova ordem: %s") % error,
+            )
+        finally:
+            self._persisting_applied_operation_order = False
+
+    def _update_applied_operation_manager_actions(self):
+        selected_count = len(self._selected_applied_operation_objects())
+        if hasattr(self, "rename_applied_button"):
+            self.rename_applied_button.setEnabled(selected_count == 1)
+        if hasattr(self, "edit_applied_button"):
+            self.edit_applied_button.setEnabled(selected_count == 1)
+        if hasattr(self, "delete_applied_button"):
+            self.delete_applied_button.setEnabled(selected_count > 0)
+
+    def _rename_selected_applied_operation(self):
+        operations = self._selected_applied_operation_objects()
+        if len(operations) != 1:
+            return
+        operation = operations[0]
+        current_name = str(getattr(operation, "Label", operation.Name) or "")
+        new_name, accepted = QtWidgets.QInputDialog.getText(
+            self,
+            translate_text("Renomear operação"),
+            translate_text("Novo nome"),
+            QtWidgets.QLineEdit.Normal,
+            current_name,
+        )
+        new_name = str(new_name or "").strip()
+        if not accepted or new_name == current_name:
+            return
+        if not new_name:
+            QtWidgets.QMessageBox.warning(
+                self,
+                translate_text("Renomear operação"),
+                translate_text("Informe um nome para a operação."),
+            )
+            return
+        doc = FreeCAD.ActiveDocument
+        transaction_open = False
+        try:
+            doc.openTransaction("WoodCAM — Renomear operação")
+            transaction_open = True
+            settings = json.loads(str(operation.SettingsJSON))
+            settings["operation_name"] = new_name
+            operation.Label = new_name
+            operation.OperationName = new_name
+            operation.SettingsJSON = json.dumps(
+                settings,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            doc.recompute()
+            doc.commitTransaction()
+            transaction_open = False
+            self._refresh_applied_operation_list()
+            if operation is self._editing_operation:
+                operation_name_field = self.operation_names.get(
+                    str(settings.get("operation_mode", ""))
+                )
+                if operation_name_field is not None:
+                    operation_name_field.setText(new_name)
+                self.operation_hint.setText(
+                    "%s: %s" % (translate_text("Editando"), new_name)
+                )
+        except Exception as error:
+            if transaction_open:
+                try:
+                    doc.abortTransaction()
+                except Exception:
+                    pass
+            QtWidgets.QMessageBox.critical(
+                self,
+                translate_text("Erro"),
+                translate_text("Não foi possível renomear a operação: %s") % error,
+            )
+
+    def _edit_selected_applied_operation(self):
+        operations = self._selected_applied_operation_objects()
+        if len(operations) == 1:
+            self._load_selected_operation_for_editing(operations[0])
+
+    def _leave_operation_editing(self, hint=""):
+        """Leave explicit edit mode without mutating the applied operation."""
+
+        self._editing_operation = None
+        self.apply_button.setText(translate_text("Aplicar"))
+        self.apply_button.setToolTip(
+            translate_text(
+                "Cria uma operação persistente e numerada na árvore do documento."
+            )
+        )
+        self.cancel_operation_edit_button.setVisible(False)
+        self.operation_hint.setStyleSheet("")
+        self.operation_hint.setText(str(hint or ""))
+
+    def _cancel_operation_editing(self):
+        if self._editing_operation is None:
+            return
+        self.last_preview_settings = None
+        self.last_preview_moves = None
+        doc = FreeCAD.ActiveDocument
+        if doc is not None:
+            self._clear_existing_preview(doc)
+        self._leave_operation_editing(
+            translate_text(
+                "Edição cancelada; o percurso aplicado foi preservado."
+            )
+        )
+
+    def _delete_selected_applied_operations(self):
+        operations = self._selected_applied_operation_objects()
+        if not operations:
+            return
+        labels = [str(getattr(operation, "Label", operation.Name)) for operation in operations]
+        detail = "\n".join("• %s" % label for label in labels[:8])
+        if len(labels) > 8:
+            detail += "\n• …"
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            translate_text("Excluir operações"),
+            translate_text(
+                "Excluir %d operação(ões)? O Undo do FreeCAD pode restaurá-las."
+            )
+            % len(operations)
+            + "\n\n"
+            + detail,
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+            QtWidgets.QMessageBox.Cancel,
+        )
+        if answer != QtWidgets.QMessageBox.Yes:
+            return
+        doc = FreeCAD.ActiveDocument
+        transaction_open = False
+        try:
+            doc.openTransaction("WoodCAM — Excluir operações")
+            transaction_open = True
+
+            def remove_operation_tree(obj):
+                for child in list(getattr(obj, "Group", ()) or ()):
+                    remove_operation_tree(child)
+                name = getattr(obj, "Name", None)
+                if name and doc.getObject(name) is not None:
+                    doc.removeObject(name)
+
+            editing_deleted = self._editing_operation in operations
+            for operation in operations:
+                remove_operation_tree(operation)
+            doc.recompute()
+            doc.commitTransaction()
+            transaction_open = False
+            self._clear_toolpath_overlay_only()
+            self.last_applied_settings = None
+            self.last_applied_moves = None
+            if editing_deleted:
+                self._leave_operation_editing()
+            self._refresh_applied_operation_list()
+        except Exception as error:
+            if transaction_open:
+                try:
+                    doc.abortTransaction()
+                except Exception:
+                    pass
+            QtWidgets.QMessageBox.critical(
+                self,
+                translate_text("Erro"),
+                translate_text("Não foi possível excluir as operações: %s") % error,
+            )
+
+    @staticmethod
+    def _vector_editor_geometry_fingerprint(document):
+        """Hash vector entities only, excluding Piece2D/document metadata."""
+        from woodcam_editor.domain.serialization import geometry_checksum
+        return geometry_checksum(document)
+
+    def _operation_geometry_is_stale(
+        self,
+        operation,
+        settings=None,
+        editor_fingerprint=None,
+    ):
         """Compara a revisão gravada sem regenerar uma operação silenciosamente."""
         if settings is None:
             try:
@@ -10109,12 +14463,62 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         source_uuid = str(settings.get("_geometry_document_uuid", "") or "")
         if source_uuid and source_uuid != str(document.document_uuid):
             return True
+        stored_fingerprint = str(settings.get("_geometry_fingerprint", "") or "")
+        if stored_fingerprint:
+            try:
+                current_fingerprint = editor_fingerprint
+                if current_fingerprint is None:
+                    current_fingerprint = self._vector_editor_geometry_fingerprint(
+                        document
+                    )
+                return stored_fingerprint != current_fingerprint
+            except Exception:
+                return True
         try:
             return int(settings.get("_geometry_revision", -1)) != int(document.revision)
         except Exception:
             return True
 
-    def _refresh_applied_operation_list(self):
+    def _mark_applied_operations_stale_after_vector_change(self):
+        """Update existing list labels without decoding any stored toolpath.
+
+        A confirmed vector cannot change the operation tree, its names, order,
+        move counts or estimated machining time.  It can only invalidate an
+        Editor-derived operation (or a 3D operation whose boundary came from
+        the Editor), so touching the 60+ MB compressed movement payload here
+        was both unnecessary and the source of the visible multi-second stop.
+        """
+
+        if not hasattr(self, "applied_toolpath_list"):
+            return
+        doc = FreeCAD.ActiveDocument
+        document = getattr(self, "_vector_editor_document", None)
+        if doc is None or document is None:
+            return
+        stale_prefix = translate_text("⚠ DESATUALIZADA — ")
+        for row in range(self.applied_toolpath_list.count()):
+            item = self.applied_toolpath_list.item(row)
+            name = item.data(QtCore.Qt.UserRole) if item is not None else None
+            operation = doc.getObject(str(name)) if name else None
+            if operation is None:
+                continue
+            try:
+                settings = json.loads(str(operation.SettingsJSON))
+            except Exception:
+                continue
+            source = str(settings.get("_geometry_source", "") or "")
+            depends_on_editor = source == "editor_2d"
+            if source == "mesh_3d":
+                boundary_uuid = str(
+                    settings.get("_boundary_document_uuid", "") or ""
+                )
+                depends_on_editor = bool(boundary_uuid) and boundary_uuid == str(
+                    document.document_uuid
+                )
+            if depends_on_editor and not item.text().startswith(stale_prefix):
+                item.setText(stale_prefix + item.text())
+
+    def _refresh_applied_operation_list(self, update_simulation_time=True):
         if not hasattr(self, "applied_toolpath_list"):
             return
         self._hide_legacy_persisted_lightweight_paths(FreeCAD.ActiveDocument)
@@ -10124,7 +14528,16 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         }
         self.applied_toolpath_list.blockSignals(True)
         self.applied_toolpath_list.clear()
-        for obj in self._iter_applied_operation_objects():
+        operations = self._iter_applied_operation_objects()
+        current_editor_fingerprint = None
+        if operations and getattr(self, "_vector_editor_document", None) is not None:
+            try:
+                current_editor_fingerprint = self._vector_editor_geometry_fingerprint(
+                    self._vector_editor_document
+                )
+            except Exception:
+                current_editor_fingerprint = None
+        for obj in operations:
             mode = str(getattr(obj, "WoodCAMOperationType", ""))
             label = getattr(obj, "Label", obj.Name)
             move_count = int(getattr(obj, "MoveCount", 0) or 0)
@@ -10132,8 +14545,11 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             text = label if not operation_name or operation_name == label else f"{label} — {operation_name}"
             if move_count:
                 text = f"{text} ({move_count} movimentos)"
-            if self._operation_geometry_is_stale(obj):
-                text = "⚠ DESATUALIZADA — " + text
+            if self._operation_geometry_is_stale(
+                obj,
+                editor_fingerprint=current_editor_fingerprint,
+            ):
+                text = translate_text("⚠ DESATUALIZADA — ") + text
             item = QtWidgets.QListWidgetItem(text)
             icon = self._load_diagram_icon(
                 {
@@ -10152,7 +14568,9 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEnabled)
             self.applied_toolpath_list.addItem(item)
         self.applied_toolpath_list.blockSignals(False)
-        self._update_simulation_time_label()
+        self._update_applied_operation_manager_actions()
+        if update_simulation_time:
+            self._update_simulation_time_label()
 
     def _entry_from_applied_object(self, obj):
         if obj is None:
@@ -10189,8 +14607,9 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             return []
         selected_items = [
             item
-            for item in self.applied_toolpath_list.selectedItems()
-            if item.data(QtCore.Qt.UserRole)
+            for row in range(self.applied_toolpath_list.count())
+            for item in (self.applied_toolpath_list.item(row),)
+            if item.isSelected() and item.data(QtCore.Qt.UserRole)
         ]
         if not selected_items:
             return []
@@ -10285,8 +14704,28 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         else:
             self._restore_editing_source_if_needed()
             moves = None
-            settings = self._collect_settings()
-            if str(settings.get("operation_mode", "")) != operation_mode:
+            current_mode = self._operation_mode_for_index(
+                self.operation_tabs.currentIndex()
+            )
+            persisted_mode_entries = []
+            if current_mode is None:
+                persisted_mode_entries = [
+                    entry
+                    for entry in self._all_applied_entries()
+                    if str(entry[0].get("operation_mode", "")) == operation_mode
+                ]
+            if persisted_mode_entries:
+                # No Editor 2D/Simulação, "ver percurso" significa conferir
+                # o último caminho realmente aplicado. A seleção de vetores
+                # pode ter mudado depois da aplicação e não participa dessa
+                # leitura; um novo cálculo só pertence a uma aba CAM explícita.
+                settings, moves, _label = persisted_mode_entries[-1]
+            else:
+                settings = self._collect_settings()
+            if (
+                moves is None
+                and str(settings.get("operation_mode", "")) != operation_mode
+            ):
                 # The button is available from Editor 2D/Simulação as well as
                 # from every operation tab.  Prefer the latest persisted
                 # operation, exactly as Aspire does, instead of showing a
@@ -10323,10 +14762,10 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                     if use_editor:
                         self._use_vector_editor_for_cam = True
                     try:
-                        moves = self._build_moves_from_selection(settings)
+                        moves = self._build_moves_with_intersection_confirmation(settings)
                     finally:
                         self._use_vector_editor_for_cam = previous_editor_source
-            else:
+            elif moves is None:
                 validate_settings(settings)
                 editor_widget = getattr(self, "vector_editor_widget", None)
                 use_editor = bool(
@@ -10337,7 +14776,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                 if use_editor:
                     self._use_vector_editor_for_cam = True
                 try:
-                    moves = self._build_moves_from_selection(settings)
+                    moves = self._build_moves_with_intersection_confirmation(settings)
                 finally:
                     self._use_vector_editor_for_cam = previous_editor_source
         if str(settings.get("operation_mode", "")) != operation_mode:
@@ -10374,9 +14813,38 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             self._use_vector_editor_for_cam = True
             widget.use_cam_action.setChecked(True)
         self.operation_tabs.setCurrentIndex(index)
+        depth_note = ""
+        if operation_mode == "pocket" and widget is not None:
+            selected = widget.controller.expand_group_children(
+                widget.selected_entity_ids
+            )
+            depths = {
+                round(float(depth), 9)
+                for entity_id in selected
+                for entity in (widget.document.get_entity(entity_id),)
+                for depth in (
+                    (getattr(entity, "metadata", {}) or {}).get(
+                        "pocket_depth_mm"
+                    ),
+                )
+                if entity is not None and depth is not None and float(depth) > 0.0
+            }
+            if len(depths) == 1:
+                inferred_depth = next(iter(depths))
+                depth_field = self.operation_fields.get("pocket", {}).get(
+                    "cut_depth"
+                )
+                if depth_field is not None:
+                    depth_field.setText(self._format_value(inferred_depth))
+                    self._update_passes_label("pocket")
+                    depth_note = " Profundidade importada: %.3f mm; confirme antes de aplicar." % inferred_depth
+            elif len(depths) > 1:
+                depth_note = (
+                    " A seleção contém rebaixos com profundidades diferentes; configure um nível por operação."
+                )
         self._set_vector_editor_status(
-            "%s aberto para configurar/criar; a geometria do Editor 2D é a fonte CAM."
-            % OPERATION_TREE_LABELS[operation_mode]
+            "%s aberto para configurar/criar; a geometria do Editor 2D é a fonte CAM.%s"
+            % (OPERATION_TREE_LABELS[operation_mode], depth_note)
         )
 
     def _vector_editor_show_toolpath(self, operation_mode):
@@ -10390,7 +14858,10 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             settings, moves = self._operation_settings_and_moves_for_editor_preview(
                 operation_mode
             )
-            components = self._toolpath_components(moves, max_display_segments=None)
+            components = self._toolpath_components(
+                self._moves_in_document_xy(settings, moves),
+                max_display_segments=None,
+            )
             if not widget.show_toolpath_preview(components, operation_label):
                 raise ValueError("Não há deslocamentos XY neste percurso.")
             self._set_toolpath_truth(
@@ -10489,8 +14960,13 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         if mode not in {"cut", "pocket", "rough3d", "finish3d"}:
             return False
         is_3d = mode in {"rough3d", "finish3d"}
+        display_moves = (
+            moves_for_preview(settings, moves)
+            if is_3d
+            else self._moves_in_document_xy(settings, moves)
+        )
         components = self._toolpath_components(
-            moves_for_preview(settings, moves) if is_3d else moves,
+            display_moves,
             max_display_segments=None,
         )
         if is_3d:
@@ -10520,6 +14996,11 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         self._invalidating_toolpath_view = True
         try:
             self._clear_toolpath_overlay_only()
+            try:
+                if FreeCAD.ActiveDocument is not None:
+                    self._clear_existing_preview(FreeCAD.ActiveDocument)
+            except Exception:
+                pass
             self.last_preview_settings = None
             self.last_preview_moves = None
             self._toolpath_view_valid = False
@@ -10537,27 +15018,48 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
 
     def _connect_exact_toolpath_invalidation(self):
         """Uma configuração nova nunca pode permanecer sob uma vista antiga."""
-        for mode in ("rough3d", "finish3d"):
+        for mode in self.operation_fields:
             for field in self.operation_fields.get(mode, {}).values():
                 field.textChanged.connect(self._invalidate_exact_toolpath_view)
             combo = self.operation_tool_combos.get(mode)
             if combo is not None:
                 combo.currentTextChanged.connect(self._invalidate_exact_toolpath_view)
-        for widget in (
-            self.rough3d_boundary_combo,
-            self.rough3d_strategy_combo,
-            self.rough3d_profile_combo,
-            self.rough3d_order_combo,
-            self.rough3d_axis_combo,
-            self.finish3d_boundary_combo,
-            self.finish3d_strategy_combo,
+        for name in (
+            "operation_combo", "pocket_strategy_combo",
+            "pocket_direction_combo", "pocket_profile_combo",
+            "peck_retract_mode", "hole_order_combo", "cut_order_combo",
+            "cut_common_line_mode_combo", "cut_depth_strategy_combo",
+            "cut_tab_release_supervision_combo",
+            "cut_loose_waste_fixation_combo", "rough3d_boundary_combo",
+            "rough3d_strategy_combo", "rough3d_profile_combo",
+            "rough3d_order_combo", "rough3d_axis_combo",
+            "finish3d_boundary_combo", "finish3d_strategy_combo",
         ):
-            widget.currentIndexChanged.connect(self._invalidate_exact_toolpath_view)
-        for widget in (
-            self.rough3d_reverse_check,
-            self.finish3d_reverse_check,
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.currentIndexChanged.connect(
+                    self._invalidate_exact_toolpath_view
+                )
+        for name in (
+            "use_model_hole_depths", "hole_counterbore_enabled",
+            "use_helical_drilling", "peck_enabled", "dwell_enabled",
+            "cut_separate_last_pass", "cut_common_line_enabled",
+            "corner_slowdown_enabled", "cut_tabs_enabled",
+            "cut_tabs_auto_enabled", "cut_tabs_best_fixation",
+            "cut_tabs_3d", "cut_tabs_manual_enabled",
+            "cut_tab_release_checkbox", "cut_smart_entry_check",
+            "cut_direction_climb", "cut_direction_conventional",
+            "cut_start_keep_radio", "cut_start_optimize_radio",
+            "cut_start_near_radio", "rough3d_reverse_check",
+            "finish3d_reverse_check",
         ):
-            widget.toggled.connect(self._invalidate_exact_toolpath_view)
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.toggled.connect(self._invalidate_exact_toolpath_view)
+        for checkbox in self.operation_ramp_checks.values():
+            checkbox.toggled.connect(self._invalidate_exact_toolpath_view)
+        for button in getattr(self, "cut_ramp_type_buttons", ()):
+            button.toggled.connect(self._invalidate_exact_toolpath_view)
         for key in (
             "material_thickness",
             "model_gap_above",
@@ -10572,57 +15074,93 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                 field.textChanged.connect(self._invalidate_exact_toolpath_view)
 
     def _on_applied_toolpath_selection_changed(self):
+        """Keep tree selection constant-time, independent of move payload.
+
+        Exact movement decoding belongs to explicit preview, simulation,
+        editing and export actions. A row click must never inflate a 60 MB
+        compressed path merely to enable three buttons or repaint a label.
+        """
+
+        self._update_applied_operation_manager_actions()
         self._update_simulation_time_label()
-        entries = self._selected_applied_entries()
-        if not entries:
+        operations = self._selected_applied_operation_objects()
+        if not operations:
             return
-        if len(entries) != 1:
+        self._clear_toolpath_overlay_only()
+        self._toolpath_view_valid = False
+        if len(operations) != 1:
             self._clear_toolpath_overlay_only()
-            self._toolpath_view_valid = False
             self.toolpath_truth_label.setText(
-                "Selecione somente uma operação para conferir seu percurso exato. "
-                "A exportação múltipla continua usando cada lista persistida separadamente."
+                translate_text(
+                    "Selecione somente uma operação para conferir seu percurso exato. "
+                    "A exportação múltipla continua usando cada lista persistida separadamente."
+                )
             )
             self.toolpath_truth_label.setStyleSheet(
                 "color: #92400e; background: #fffbeb; border: 1px solid #f59e0b; "
                 "border-radius: 4px; padding: 5px 8px; font-weight: bold;"
             )
             return
-        if not all(
-            self._uses_lightweight_toolpath_overlay(settings)
-            for settings, _moves, _label in entries
-        ):
-            return
-        settings = dict(entries[0][0])
-        moves = [
-            dict(move)
-            for _entry_settings, entry_moves, _label in entries
-            for move in entry_moves
-        ]
-        self._show_exact_simulation_toolpath(settings, moves, "APLICADO = G-CODE")
+        operation = operations[0]
+        self.toolpath_truth_label.setText(
+            translate_text(
+                "%s selecionado. Use Ver percurso ou Simular para carregar a geometria exata."
+            )
+            % str(getattr(operation, "Label", operation.Name))
+        )
+        self.toolpath_truth_label.setStyleSheet(
+            "color: #334155; background: #f8fafc; border: 1px solid #cbd5e1; "
+            "border-radius: 4px; padding: 5px 8px; font-weight: bold;"
+        )
+
+    @staticmethod
+    def _stored_operation_seconds(operation):
+        if operation is None or not hasattr(operation, "EstimatedMachiningSeconds"):
+            return None
+        try:
+            value = float(operation.EstimatedMachiningSeconds)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) and value >= 0.0 else None
 
     def _update_simulation_time_label(self):
         if not hasattr(self, "simulation_time_label"):
             return
-        entries = self._selected_applied_entries()
-        if entries:
-            total = sum(
-                self._estimate_machining_seconds(moves, settings)
-                for settings, moves, _label in entries
-            )
-            self.simulation_time_label.setText(
-                f"Tempo estimado selecionado: {self._format_duration(total)}"
-            )
+        selected_operations = self._selected_applied_operation_objects()
+        if selected_operations:
+            values = [
+                self._stored_operation_seconds(operation)
+                for operation in selected_operations
+            ]
+            if all(value is not None for value in values):
+                self.simulation_time_label.setText(
+                    translate_text("Tempo estimado selecionado: %s")
+                    % self._format_duration(sum(values))
+                )
+            else:
+                self.simulation_time_label.setText(
+                    translate_text(
+                        "Tempo da seleção: disponível ao abrir percurso ou simulação"
+                    )
+                )
             return
-        applied_entries = self._all_applied_entries()
-        if applied_entries:
-            total = sum(
-                self._estimate_machining_seconds(moves, settings)
-                for settings, moves, _label in applied_entries
-            )
-            self.simulation_time_label.setText(
-                f"Tempo estimado total aplicado: {self._format_duration(total)}"
-            )
+        applied_operations = self._iter_applied_operation_objects()
+        if applied_operations:
+            values = [
+                self._stored_operation_seconds(operation)
+                for operation in applied_operations
+            ]
+            if all(value is not None for value in values):
+                self.simulation_time_label.setText(
+                    translate_text("Tempo estimado total aplicado: %s")
+                    % self._format_duration(sum(values))
+                )
+            else:
+                self.simulation_time_label.setText(
+                    translate_text(
+                        "Tempo total: disponível ao abrir percurso ou simulação"
+                    )
+                )
             return
         if self.last_preview_settings is not None and self.last_preview_moves:
             total = self._estimate_machining_seconds(
@@ -10799,6 +15337,8 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             )
         if hasattr(self, "simulate_button"):
             self.simulate_button.setEnabled(not running and operation_tab_active)
+        if hasattr(self, "generate_button"):
+            self.generate_button.setEnabled(not running and operation_tab_active)
         if hasattr(self, "stop_sim_button"):
             self.stop_sim_button.setEnabled(running)
             self.stop_sim_button.setVisible(running)
@@ -11067,7 +15607,6 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         cut_spacing = max(1.5, min(6.0, float(tool_diameter) * 0.75))
         rapid_spacing = cut_spacing * 3.0
         timeline_ms = 0.0
-        speed_multiplier = max(float(settings["simulation_speed_multiplier"]), 0.001)
 
         for move_index, move in enumerate(moves):
             frame, current_position = self._move_to_frame(move, current_position)
@@ -11082,9 +15621,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
 
             previous = frames[-1]
             if frame["type"] == "dwell":
-                timeline_ms += (
-                    frame.get("seconds", 0.0) * 1000.0 / speed_multiplier
-                )
+                timeline_ms += frame.get("seconds", 0.0) * 1000.0
                 frame["time_ms"] = timeline_ms
                 frames.append(frame)
                 continue
@@ -11095,7 +15632,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             spacing = rapid_spacing if frame["type"] == "rapid" else cut_spacing
             step_count = max(1, int(math.ceil(length / spacing)))
             feed = max(self._simulation_feed_for_move(frame, settings), 1.0)
-            move_time_ms = (length / feed) * 60000.0 / speed_multiplier
+            move_time_ms = (length / feed) * 60000.0
 
             for step in range(1, step_count + 1):
                 ratio = step / step_count
@@ -11129,10 +15666,6 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         current_position = (None, None, None)
         previous_frame = None
         timeline_ms = 0.0
-        speed_multiplier = max(
-            float(settings["simulation_speed_multiplier"]),
-            0.001,
-        )
         for move in moves:
             frame, current_position = self._move_to_frame(move, current_position)
             if frame is None:
@@ -11142,7 +15675,6 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                     timeline_ms += (
                         float(frame.get("seconds", 0.0))
                         * 1000.0
-                        / speed_multiplier
                     )
                 else:
                     dx = frame["x"] - previous_frame["x"]
@@ -11151,7 +15683,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                     length = math.sqrt(dx * dx + dy * dy + dz * dz)
                     feed = max(self._simulation_feed_for_move(frame, settings), 1.0)
                     timeline_ms += (
-                        length / feed * 60000.0 / speed_multiplier
+                        length / feed * 60000.0
                     )
             timeline["times"].append(timeline_ms)
             timeline["x"].append(frame["x"])
@@ -11475,7 +16007,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         return created
 
     def _hide_legacy_persisted_lightweight_paths(self, doc):
-        """Oculta projeções antigas de Corte/3D sem alterar movimentos ou G-code."""
+        """Oculta projeções antigas densas sem alterar movimentos ou G-code."""
         if doc is None:
             return
         for obj in list(getattr(doc, "Objects", []) or []):
@@ -11484,7 +16016,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             parents = list(getattr(obj, "InList", []) or [])
             uses_lightweight_overlay = any(
                 str(getattr(parent, "WoodCAMOperationType", ""))
-                in {"cut", "rough3d", "finish3d"}
+                in {"cut", "pocket", "rough3d", "finish3d"}
                 for parent in parents
             )
             if not uses_lightweight_overlay:
@@ -11503,16 +16035,19 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
     ):
         """Persiste projeção somente para operações 2D de baixa cardinalidade.
 
-        Em Corte e 3D, ``MovesCompressedBase64`` é a operação. A visualização
-        completa azul é recriada sob demanda pelo overlay Coin; duplicá-la em
-        vermelho no FCStd tornava o documento pesado e poluía a prévia.
+        Em Corte, Preenchimento e 3D, ``MovesCompressedBase64`` é a operação.
+        A visualização completa é recriada sob demanda pelo overlay Coin;
+        duplicá-la em vermelho no FCStd tornava o documento pesado e poluía a
+        prévia.
         """
         if self._uses_lightweight_toolpath_overlay(settings):
             return []
         return self._add_toolpath_objects(
             doc,
             operation,
-            self._toolpath_components(moves),
+            self._toolpath_components(
+                self._moves_in_document_xy(settings, moves)
+            ),
             name_prefix,
             settings["tool_diameter"],
             applied=True,
@@ -11581,7 +16116,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         return min_x, min_y, max_x, max_y
 
     def _add_work_area_preview(self, doc, parent_group, settings):
-        bounds = self._work_area_bounds_for_preview(settings)
+        bounds = self._datum_reference_bounds(settings)
         if bounds is None:
             return None
 
@@ -11614,6 +16149,105 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                 pass
         parent_group.addObject(area_object)
         return area_object
+
+    def _add_screw_keepout_preview(self, doc, parent_group, settings):
+        summary = settings.get("_global_cut_plan_summary", {}) or {}
+        anchors = summary.get("screw_anchors", ()) or ()
+        if not anchors:
+            return ()
+        z_value = preview_material_top_z(settings) + 0.05
+        created = []
+        for index, anchor in enumerate(anchors, start=1):
+            radius = max(0.1, float(anchor.get("keepout_radius", 0.0) or 0.0))
+            edge = Part.makeCircle(
+                radius,
+                FreeCAD.Vector(
+                    float(anchor["x"]),
+                    float(anchor["y"]),
+                    z_value,
+                ),
+            )
+            marker = doc.addObject(
+                "Part::Feature", "Preview_ScrewKeepout_%03d" % index
+            )
+            marker.Label = "Parafuso de resto %02d — região proibida" % index
+            marker.Shape = edge
+            marker.ViewObject.LineColor = (0.90, 0.10, 0.05)
+            marker.ViewObject.LineWidth = 3.0
+            parent_group.addObject(marker)
+            created.append(marker)
+        return tuple(created)
+
+    def _add_physical_tabs_preview(
+        self,
+        doc,
+        parent_group,
+        settings,
+        name_prefix="Preview",
+    ):
+        """Show every physical bridge once, independently of depth passes."""
+
+        summary = settings.get("_global_cut_plan_summary", {}) or {}
+        tabs = summary.get("tabs", ()) or ()
+        if not tabs:
+            return ()
+        z_value = preview_material_top_z(settings) + 0.25
+        specs = {
+            "stock_tab": (
+                "StockTabs físicas",
+                (0.15, 0.75, 0.25),
+            ),
+            "shared_tab": (
+                "SharedTabs físicas",
+                (0.05, 0.70, 1.00),
+            ),
+            "waste_tab": (
+                "WasteTabs físicas",
+                (1.00, 0.35, 0.05),
+            ),
+        }
+        created = []
+        for kind, (label, color) in specs.items():
+            edges = []
+            for tab in tabs:
+                if str(tab.get("kind", "")) != kind:
+                    continue
+                try:
+                    edges.append(
+                        Part.makeLine(
+                            FreeCAD.Vector(
+                                float(tab["x1"]), float(tab["y1"]), z_value
+                            ),
+                            FreeCAD.Vector(
+                                float(tab["x2"]), float(tab["y2"]), z_value
+                            ),
+                        )
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+            if not edges:
+                continue
+            marker = doc.addObject(
+                "Part::Feature",
+                "%s_PhysicalTabs_%s" % (name_prefix, kind),
+            )
+            marker.Label = "%s — %d" % (translate_text(label), len(edges))
+            marker.Shape = Part.makeCompound(edges)
+            marker.addProperty(
+                "App::PropertyString",
+                "WoodCAMTabKind",
+                "WoodCAM 2D",
+            )
+            marker.WoodCAMTabKind = kind
+            self._set_view_style(
+                marker,
+                color,
+                line_width=6,
+                transparency=0,
+            )
+            parent_group.addObject(marker)
+            created.append(marker)
+        return tuple(created)
 
     def _geometry_for_datum_preview(self, settings):
         if not settings.get("use_selection_bounds_origin", False):
@@ -11937,9 +16571,10 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         if operation is not None:
             self._restore_operation_source_selection(operation)
 
-    def _load_selected_operation_for_editing(self):
-        operation = self._selected_operation_from_tree()
-        if operation is None or operation is self._editing_operation:
+    def _load_selected_operation_for_editing(self, operation=None):
+        if operation is None:
+            operation = self._selected_operation_from_tree()
+        if operation is None:
             return
         try:
             settings = json.loads(str(operation.SettingsJSON))
@@ -11948,12 +16583,25 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         mode = str(settings.get("operation_mode", ""))
         if mode not in self.operation_fields:
             return
+        displayed_settings = dict(settings)
+        if (
+            mode in {"cut", "holes", "pocket"}
+            and settings.get("depth_input_mode") != "absolute_final"
+            and "final_depth" in settings
+        ):
+            # Até 26/08/2026 ``cut_depth`` guardava quanto descer depois da
+            # cota inicial. A tela nova mostra a cota final absoluta. Usar o
+            # ``final_depth`` já persistido mantém exatamente o mesmo G-code
+            # quando uma operação antiga é aberta para edição.
+            displayed_settings["cut_depth"] = settings["final_depth"]
         for key, field in self.fields.items():
+            if key == "simulation_speed_multiplier":
+                continue
             if key in settings:
                 field.setText(self._format_value(settings[key]))
         for key, field in self.operation_fields[mode].items():
-            if key in settings:
-                field.setText(self._format_value(settings[key]))
+            if key in displayed_settings:
+                field.setText(self._format_value(displayed_settings[key]))
         tool_combo = self.operation_tool_combos.get(mode)
         tool_name = str(settings.get("tool_name", "") or "")
         if tool_combo is not None and tool_name:
@@ -11962,18 +16610,90 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                 tool_combo.setCurrentIndex(tool_index)
         self.operation_names[mode].setText(str(settings.get("operation_name", operation.Label)))
         if mode == "cut":
+            loaded_tab_positions = []
+            for position in tuple(settings.get("tab_positions", ()) or ()):
+                if not isinstance(position, dict):
+                    continue
+                try:
+                    loaded_tab_positions.append(
+                        {"x": float(position["x"]), "y": float(position["y"])}
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+            self.cut_tab_positions = loaded_tab_positions
+            self._cut_tab_positions_scope = None
+            self._cut_tab_positions_operation = str(operation.Name)
             self.operation_combo.setCurrentIndex(
                 self.CUT_SIDE_BY_INDEX.index(settings.get("outer_cut_side", CUT_SIDE_OUTSIDE))
                 if settings.get("outer_cut_side", CUT_SIDE_OUTSIDE) in self.CUT_SIDE_BY_INDEX else 0
             )
             self.cut_smart_entry_check.setChecked(bool(settings.get("smart_entry", True)))
+            self.cut_common_line_enabled.setChecked(
+                bool(settings.get("common_line_enabled", False))
+            )
+            common_line_mode = str(
+                settings.get("common_line_mode", "preserve_dimensions")
+            )
+            common_line_index = self.cut_common_line_mode_combo.findData(
+                common_line_mode
+            )
+            if common_line_index >= 0:
+                self.cut_common_line_mode_combo.setCurrentIndex(common_line_index)
+            depth_strategy = str(
+                settings.get(
+                    "cut_depth_strategy",
+                    DEFAULT_PRESETS["cut_depth_strategy"],
+                )
+                if settings.get("common_line_enabled", False)
+                else "per_piece"
+            )
+            if settings.get("common_line_enabled", False) and depth_strategy == "per_piece":
+                # Trabalhos gravados antes do scheduler direto otimizado usavam
+                # ``per_piece`` para esta opção visual. Reabrir esses trabalhos
+                # deve manter a intenção do operador: todas as profundidades na
+                # mesma visita da peça, agora sem os retornos do scheduler legado.
+                depth_strategy = "piece_bidirectional"
+            depth_strategy_index = self.cut_depth_strategy_combo.findData(
+                depth_strategy
+            )
+            if depth_strategy_index >= 0:
+                self.cut_depth_strategy_combo.setCurrentIndex(depth_strategy_index)
             self.cut_tabs_enabled.setChecked(bool(settings.get("cut_tabs_enabled", False)))
             self.cut_tabs_3d.setChecked(bool(settings.get("tabs_3d", False)))
             self.cut_tabs_auto_enabled.setChecked(bool(settings.get("tab_count", 0)))
+            self.cut_tabs_best_fixation.setChecked(
+                bool(settings.get("tab_best_fixation", True))
+            )
+            tab_release_mode = str(
+                settings.get("tab_release_mode", "keep_tabs")
+                if settings.get("common_line_enabled", False)
+                else "keep_tabs"
+            )
+            tab_release_index = self.cut_tab_release_combo.findData(
+                tab_release_mode
+            )
+            if tab_release_index >= 0:
+                self.cut_tab_release_combo.setCurrentIndex(tab_release_index)
+            supervision_index = self.cut_tab_release_supervision_combo.findData(
+                settings.get("tab_release_supervision", "per_piece")
+            )
+            if supervision_index >= 0:
+                self.cut_tab_release_supervision_combo.setCurrentIndex(
+                    supervision_index
+                )
+            waste_index = self.cut_loose_waste_fixation_combo.findData(
+                settings.get("loose_waste_fixation", "disabled")
+            )
+            if waste_index >= 0:
+                self.cut_loose_waste_fixation_combo.setCurrentIndex(waste_index)
             self.cut_tabs_manual_enabled.setChecked(bool(settings.get("tab_positions", [])))
             ramp_types = ("smooth", "zigzag", "spiral")
             ramp_type = settings.get("ramp_type", "smooth")
             self.cut_ramp_type_buttons[ramp_types.index(ramp_type) if ramp_type in ramp_types else 0].setChecked(True)
+        elif mode == "holes":
+            self.hole_counterbore_enabled.setChecked(
+                bool(settings.get("hole_counterbore_enabled", False))
+            )
         elif mode == "rough3d":
             self.rough3d_boundary_combo.setCurrentIndex(
                 {"model": 0, "material": 1, "selected_vectors": 2, "selected_level": 3}.get(
@@ -12013,7 +16733,20 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         self._editing_operation = operation
         self.apply_button.setText("Atualizar operação")
         self.apply_button.setToolTip("Atualiza a operação selecionada e mantém a mesma entrada na árvore.")
-        self.operation_hint.setText(f"Editando: {operation.Label}")
+        self.cancel_operation_edit_button.setVisible(True)
+        summary = settings.get("_global_cut_plan_summary", {}) or {}
+        legacy_tab_layout = bool(
+            mode == "cut"
+            and settings.get("cut_tabs_enabled", False)
+            and summary.get("tab_count", 0)
+            and not summary.get("tabs")
+        )
+        hint = "%s: %s" % (translate_text("Editando"), operation.Label)
+        if legacy_tab_layout:
+            hint += " — " + translate_text(
+                "distribuição antiga de tabs; atualize a operação para recalcular"
+            )
+        self.operation_hint.setText(hint)
         self._update_operation_controls()
 
     def _update_applied_operation(self, settings, moves, operation):
@@ -12033,12 +16766,31 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         operation.MovesJSON = ""
         operation.SelectionJSON = json.dumps(self._selection_snapshot(), ensure_ascii=False, separators=(",", ":"))
         operation.MoveCount = len(moves)
+        if not hasattr(operation, "EstimatedMachiningSeconds"):
+            operation.addProperty(
+                "App::PropertyFloat",
+                "EstimatedMachiningSeconds",
+                "WoodCAM 2D",
+            )
+        operation.EstimatedMachiningSeconds = float(
+            self._estimate_machining_seconds(moves, settings)
+        )
+        try:
+            operation.setEditorMode("EstimatedMachiningSeconds", 2)
+        except Exception:
+            pass
         self._add_applied_toolpath_projection(
             doc,
             operation,
             moves,
             operation.Name,
             settings,
+        )
+        self._add_physical_tabs_preview(
+            doc,
+            operation,
+            settings,
+            name_prefix=operation.Name,
         )
         doc.recompute()
         return operation
@@ -12052,6 +16804,15 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             and hasattr(obj, "WoodCAMSequence")
         ]
         return max(sequences, default=0) + 1
+
+    @staticmethod
+    def _next_global_operation_order(doc):
+        orders = [
+            int(getattr(obj, "WoodCAMGlobalOrder", 0) or 0)
+            for obj in doc.Objects
+            if hasattr(obj, "SettingsJSON")
+        ]
+        return max(orders, default=0) + 1
 
     def _create_applied_operation(
         self,
@@ -12107,6 +16868,11 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             "WoodCAM 2D",
         )
         operation_group.addProperty(
+            "App::PropertyInteger",
+            "WoodCAMGlobalOrder",
+            "WoodCAM 2D",
+        )
+        operation_group.addProperty(
             "App::PropertyString",
             "OperationName",
             "WoodCAM 2D",
@@ -12136,8 +16902,18 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             "MoveCount",
             "WoodCAM 2D",
         )
+        operation_group.addProperty(
+            "App::PropertyFloat",
+            "EstimatedMachiningSeconds",
+            "WoodCAM 2D",
+        )
         operation_group.WoodCAMOperationType = operation_mode
         operation_group.WoodCAMSequence = sequence
+        operation_group.WoodCAMGlobalOrder = self._next_global_operation_order(doc)
+        try:
+            operation_group.setEditorMode("WoodCAMGlobalOrder", 2)
+        except Exception:
+            pass
         operation_group.OperationName = operation_group.Label
         operation_group.SettingsJSON = json.dumps(
             settings,
@@ -12156,6 +16932,13 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             separators=(",", ":"),
         )
         operation_group.MoveCount = len(moves)
+        operation_group.EstimatedMachiningSeconds = float(
+            self._estimate_machining_seconds(moves, settings)
+        )
+        try:
+            operation_group.setEditorMode("EstimatedMachiningSeconds", 2)
+        except Exception:
+            pass
         operations_root.addObject(operation_group)
 
         self._add_applied_toolpath_projection(
@@ -12164,6 +16947,12 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             moves,
             internal_name,
             settings,
+        )
+        self._add_physical_tabs_preview(
+            doc,
+            operation_group,
+            settings,
+            name_prefix=internal_name,
         )
         doc.recompute()
         return operation_group
@@ -12194,6 +16983,8 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             if exact_static_path
             else moves
         )
+        if settings.get("operation_mode") not in {"rough3d", "finish3d"}:
+            display_moves = self._moves_in_document_xy(settings, display_moves)
         exact_timeline = (
             self._exact_3d_simulation_timeline(display_moves, settings)
             if exact_static_path
@@ -12202,7 +16993,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         frames = (
             []
             if exact_static_path
-            else self._interpolate_simulation_frames(moves, settings)
+            else self._interpolate_simulation_frames(display_moves, settings)
         )
         simulation_point_count = (
             len(exact_timeline["times"])
@@ -12224,6 +17015,11 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         simulation_group = doc.addObject("App::DocumentObjectGroup", "WoodCAM2D_Simulation")
         simulation_group.Label = "Simulação"
         ensure_woodcam_tree(doc).operations.addObject(simulation_group)
+        self._add_physical_tabs_preview(
+            doc,
+            simulation_group,
+            settings,
+        )
 
         cutter_obj = doc.addObject("Part::Feature", "Simulation_Cutter")
         cutter_obj.Shape = self._make_cutter_shape(
@@ -12260,6 +17056,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             )
             simulation_group.addObject(cut_obj)
 
+        playback_started = time.monotonic()
         self.simulation_state = {
             "doc": doc,
             "group": simulation_group,
@@ -12277,7 +17074,13 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             "cut_edges": [],
             "exact_static_path": exact_static_path,
             "settings": dict(settings),
-            "start_time": time.monotonic(),
+            "start_time": playback_started,
+            "last_wall_time": playback_started,
+            "playback_time_ms": 0.0,
+            "speed_multiplier": max(
+                0.001,
+                float(settings.get("simulation_speed_multiplier", 1.0)),
+            ),
         }
 
         if exact_timeline is not None:
@@ -12299,8 +17102,9 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             0.0,
         )
         doc.recompute()
-        if FreeCADGui.ActiveDocument:
-            FreeCADGui.ActiveDocument.ActiveView.fitAll()
+        gui_document = getattr(FreeCADGui, "ActiveDocument", None)
+        if gui_document:
+            gui_document.ActiveView.fitAll()
 
         self.sim_timer = QtCore.QTimer(self)
         try:
@@ -12323,7 +17127,13 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
 
     @staticmethod
     def _uses_lightweight_toolpath_overlay(settings):
-        return settings.get("operation_mode") in {"cut", "rough3d", "finish3d"}
+        # Preenchimentos densos precisam seguir o mesmo caminho integral da
+        # simulação. A antiga projeção limitada a 4.000 segmentos descartava
+        # pontos intermediários e os religava por cordas diagonais, embora os
+        # movimentos persistidos e o G-code continuassem corretos.
+        return settings.get("operation_mode") in {
+            "cut", "pocket", "rough3d", "finish3d"
+        }
 
     @staticmethod
     def _simulation_uses_exact_static_path(settings):
@@ -12398,6 +17208,33 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         )
         return lower_index, position, False
 
+    @staticmethod
+    def _simulation_clock_time(state, now=None):
+        """Advance physical path time using the current live playback speed."""
+
+        current_wall_time = time.monotonic() if now is None else float(now)
+        previous_wall_time = float(
+            state.get("last_wall_time", current_wall_time)
+        )
+        elapsed_seconds = max(0.0, current_wall_time - previous_wall_time)
+        playback_time_ms = float(state.get("playback_time_ms", 0.0))
+        playback_time_ms += (
+            elapsed_seconds
+            * 1000.0
+            * max(0.001, float(state.get("speed_multiplier", 1.0)))
+        )
+        state["last_wall_time"] = current_wall_time
+        state["playback_time_ms"] = playback_time_ms
+        return playback_time_ms
+
+    @classmethod
+    def _set_simulation_clock_speed(cls, state, speed_multiplier, now=None):
+        """Change speed at one clock boundary without a time jump."""
+
+        target_time_ms = cls._simulation_clock_time(state, now)
+        state["speed_multiplier"] = max(0.001, float(speed_multiplier))
+        return target_time_ms
+
     def _advance_simulation(self):
         state = self.simulation_state
         if not state:
@@ -12411,7 +17248,7 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
                 self.simulation_state = None
                 return
 
-        target_time_ms = (time.monotonic() - state["start_time"]) * 1000.0
+        target_time_ms = self._simulation_clock_time(state)
         index = state["index"]
 
         if state.get("exact_static_path", False):
@@ -12506,10 +17343,14 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
         self._clear_existing_preview(doc)
         is_3d = settings.get("operation_mode") in {"rough3d", "finish3d"}
         uses_lightweight_overlay = self._uses_lightweight_toolpath_overlay(settings)
-        # Em Corte e 3D, o percurso completo vai direto ao scene graph Coin/GPU.
-        # Assim a forma continua legível sem reduzir a precisão do percurso ou
-        # do G-code, nem criar a projeção vermelha antiga no documento.
-        display_moves = moves_for_preview(settings, moves) if is_3d else moves
+        # Em Corte, Preenchimento e 3D, o percurso completo vai direto ao scene
+        # graph Coin/GPU. Assim a forma continua legível sem reduzir a precisão
+        # do percurso ou do G-code, nem criar cordas diagonais por amostragem.
+        display_moves = (
+            moves_for_preview(settings, moves)
+            if is_3d
+            else self._moves_in_document_xy(settings, moves)
+        )
         components = self._toolpath_components(
             display_moves,
             max_display_segments=None if uses_lightweight_overlay else 4000,
@@ -12537,6 +17378,8 @@ class WoodCAM2DDialog(QtWidgets.QDialog):
             settings,
             geometry if settings.get("use_selection_bounds_origin", False) else {},
         )
+        self._add_screw_keepout_preview(doc, preview_group, settings)
+        self._add_physical_tabs_preview(doc, preview_group, settings)
         if is_3d:
             # O modelo-fonte 3D permanece nas coordenadas originais do
             # documento. Os movimentos, por outro lado, já foram convertidos

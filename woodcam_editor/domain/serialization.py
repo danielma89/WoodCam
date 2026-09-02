@@ -458,6 +458,20 @@ def document_checksum(document: VectorDocument) -> str:
     return checksum_for_data(document_to_dict(document))
 
 
+def geometry_checksum(document: VectorDocument) -> str:
+    """Checksum of vector entities, excluding derived/document metadata.
+
+    CAM operations depend on the entities that produced their toolpaths. The
+    Piece2D classification cache and document revision can change while those
+    entities remain identical, so they must not make an operation stale.
+    """
+    entities = [
+        _entity_to_dict(entity)
+        for entity in sorted(document.entities_by_id.values(), key=lambda item: item.id)
+    ]
+    return checksum_for_data({"entities": entities})
+
+
 def serialize_document(document: VectorDocument, *, pretty: bool = False) -> SerializedDocument:
     data = document_to_dict(document)
     checksum = checksum_for_data(data)
@@ -506,4 +520,3 @@ def migrate_to_current(data: Dict[str, Any]) -> Dict[str, Any]:
     if version != SCHEMA_VERSION:
         raise SerializationError("no migration path from v%d to v%d" % (version, SCHEMA_VERSION))
     return migrated
-

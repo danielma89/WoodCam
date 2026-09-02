@@ -5,6 +5,8 @@ from __future__ import annotations
 import math
 from typing import Any, Iterable, Optional, Sequence
 
+from woodcam_editor.domain.document import entity_is_remnant_cut
+
 
 class GeometryAdapterError(ValueError):
     """Raised when editor geometry is not safe/complete enough for CAM."""
@@ -236,7 +238,10 @@ def _hole_record(entity: Any, deflection: float, transform: Any = None) -> dict:
         "x": center[0],
         "y": center[1],
         "diameter_mm": radius * 2.0,
-        "depth_mm": 0.0,
+        "depth_mm": float(
+            (getattr(entity, "metadata", {}) or {}).get("source_depth_mm", 0.0)
+            or 0.0
+        ),
         "points": points,
     }
 
@@ -346,8 +351,14 @@ def document_to_woodcam_geometry(
     piece_ids: Optional[Sequence[str]] = None,
     deflection: float = 0.01,
     strict: bool = True,
+    classify_small_circles_as_holes: bool = True,
 ) -> dict:
-    """Return the existing ``{"contours": ..., "holes": ...}`` contract."""
+    """Return the existing ``{"contours": ..., "holes": ...}`` contract.
+
+    Small circles are holes for drilling/cutting by default. Operations that
+    need the selected circle itself as an area, such as pocketing, can disable
+    that classification without changing the source ``VectorDocument``.
+    """
 
     if deflection <= 0.0:
         raise ValueError("A deflexão CAM precisa ser maior que zero.")
@@ -384,7 +395,7 @@ def document_to_woodcam_geometry(
                     # Imported round holes may be tessellated paths instead
                     # of CircleEntity.  The adapter applies the same strict
                     # <=12 mm circularity rule before promoting one to a hole.
-                    circle_as_hole=True,
+                    circle_as_hole=classify_small_circles_as_holes,
                     strict=strict,
                 )
         return result
@@ -394,13 +405,38 @@ def document_to_woodcam_geometry(
         if entity_id not in entities:
             raise GeometryAdapterError(f"Entidade 2D inexistente: {entity_id}")
         entity = entities[entity_id]
+        if entity_is_remnant_cut(entity):
+            # Open stock-separation paths use the dedicated centerline bridge.
+            continue
+        if entity_ids is None and (
+            "group" in type(entity).__name__.lower()
+            or (
+                str(getattr(entity, "type", "") or "").lower() == "group"
+                and hasattr(entity, "child_ids")
+            )
+        ):
+            # GroupEntity is a persistent selection/movement relationship,
+            # never CAM geometry. Whole-document fallback consumes its leaf
+            # vectors below, but must not reinterpret the group itself as a
+            # zero-point contour.
+            continue
+        role = str(
+            (getattr(entity, "metadata", {}) or {}).get("import_role", "") or ""
+        )
+        if entity_ids is None and role in {"pocket_region", "pocket_island"}:
+            # A shallow feature is opt-in CAM geometry.  Whole-document Corte
+            # and PanelNest must never reinterpret it as a through-cut contour.
+            continue
         if not _is_cam_layer(vector_document, entity):
             continue
         _append_entity(
             result,
             entity,
             deflection=deflection,
-            circle_as_hole=_entity_kind(entity) == "circle",
+            circle_as_hole=(
+                classify_small_circles_as_holes
+                and _entity_kind(entity) == "circle"
+            ),
             strict=strict,
         )
     return result

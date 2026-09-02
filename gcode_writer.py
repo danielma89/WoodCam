@@ -70,7 +70,19 @@ def build_gcode(
     lines.append("")
 
     for move in moves:
-        if move["type"] == "dwell":
+        if move["type"] == "operator_pause":
+            message = str(move.get("message", "Pausa do operador")).replace(
+                ")", "]"
+            )
+            lines.append("M5")
+            lines.append("(%s)" % message)
+            lines.append("M0")
+            if move.get("resume_spindle", True):
+                lines.append(f"M3 S{int(rpm)}")
+                spinup = max(0.0, float(move.get("spinup_seconds", 0.0) or 0.0))
+                if spinup > 0.0:
+                    lines.append(f"G4 P{format_coordinate(spinup, precision=3)}")
+        elif move["type"] == "dwell":
             seconds = max(0.0, float(move.get("seconds", 0.0)))
             lines.append(f"G4 P{format_coordinate(seconds, precision=3)}")
         elif move["type"] == "rapid":

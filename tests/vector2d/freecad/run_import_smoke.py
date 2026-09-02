@@ -11,6 +11,7 @@ sys.path.insert(
 from woodcam_editor.importers.part_shape import import_freecad_tree, import_part_shape
 from woodcam_editor.importers.panelnest_parts import import_panelnest_parts
 from woodcam_editor.application.piece_organizer import classify_document_pieces
+from woodcam_editor.domain import VectorDocument, validate_document
 from geometry_reader import resolve_selection_objects
 from ui import WoodCAM2DDialog
 
@@ -46,6 +47,161 @@ solid_paths = [
 ]
 assert len(solid_paths) == 2, solid_result
 assert all(entity.closed for entity in solid_paths)
+
+# Um rebaixo cego tem uma face de fundo real. A importação deve preservar essa
+# região como hachura/seleção CAM independente, inclusive quando o rebaixo abre
+# na borda e compartilha um trecho com o contorno externo da chapa.
+for pocket_name, cutter in (
+    (
+        "closed",
+        Part.makeBox(60, 40, 5, FreeCAD.Vector(50, 30, 13)),
+    ),
+    (
+        "edge-open",
+        Part.makeBox(70, 40, 5, FreeCAD.Vector(-1, 30, 13)),
+    ),
+):
+    pocket_source = Part.makeBox(200, 100, 18).cut(cutter)
+    source_volume = round(float(pocket_source.Volume), 9)
+    source_bounds = (
+        round(float(pocket_source.BoundBox.XMin), 9),
+        round(float(pocket_source.BoundBox.YMin), 9),
+        round(float(pocket_source.BoundBox.ZMin), 9),
+        round(float(pocket_source.BoundBox.XMax), 9),
+        round(float(pocket_source.BoundBox.YMax), 9),
+        round(float(pocket_source.BoundBox.ZMax), 9),
+    )
+    pocket_document = VectorDocument.create_default()
+    pocket_result = import_part_shape(
+        pocket_source,
+        layer_id=pocket_document.active_layer_id,
+    )
+    pocket_document.add_entities(pocket_result.entities, bump_revision=False)
+    pocket_regions = [
+        entity
+        for entity in pocket_result.entities
+        if str(entity.metadata.get("import_role", "")) == "pocket_region"
+    ]
+    assert len(pocket_regions) == 1, (pocket_name, pocket_result)
+    assert round(float(pocket_regions[0].metadata["pocket_depth_mm"]), 9) == 5.0
+    external_contours = [
+        entity
+        for entity in pocket_result.entities
+        if str(entity.metadata.get("import_role", "")) == "cut_external"
+    ]
+    assert len(external_contours) == 1, (pocket_name, pocket_result)
+    assert abs(abs(float(external_contours[0].signed_area(0.05))) - 20000.0) < 0.1
+
+    classification = classify_document_pieces(pocket_document)
+    assert len(classification.pieces) == 1, (pocket_name, classification)
+    assert classification.pieces[0].inner_ids == (), (pocket_name, classification)
+    assert classification.pieces[0].feature_ids == (
+        pocket_regions[0].id,
+    ), (pocket_name, classification)
+    if pocket_name == "edge-open":
+        report = validate_document(pocket_document)
+        assert not report.by_code("CONTOUR_INTERSECTION"), report
+        assert not report.by_code("BRANCH_NODE"), report
+
+    assert round(float(pocket_source.Volume), 9) == source_volume
+    assert (
+        round(float(pocket_source.BoundBox.XMin), 9),
+        round(float(pocket_source.BoundBox.YMin), 9),
+        round(float(pocket_source.BoundBox.ZMin), 9),
+        round(float(pocket_source.BoundBox.XMax), 9),
+        round(float(pocket_source.BoundBox.YMax), 9),
+        round(float(pocket_source.BoundBox.ZMax), 9),
+    ) == source_bounds
+
+# A mesma chapa pode estar em pé no móvel. O fundo do rebaixo precisa usar a
+# exata projeção escolhida para a face larga; projetá-lo outra vez em XY global
+# o reduz a uma linha sem área (e desloca rebaixos circulares para fora).
+upright_pocket_source = Part.makeBox(200, 100, 18).cut(
+    Part.makeBox(60, 40, 5, FreeCAD.Vector(50, 30, 13))
+)
+upright_pocket_source.rotate(
+    FreeCAD.Vector(0, 0, 0), FreeCAD.Vector(1, 0, 0), 90.0
+)
+upright_pocket_result = import_part_shape(
+    upright_pocket_source,
+    layer_id="layer",
+    flatten_solids=True,
+)
+upright_pocket_regions = [
+    entity
+    for entity in upright_pocket_result.entities
+    if str(entity.metadata.get("import_role", "")) == "pocket_region"
+]
+assert len(upright_pocket_regions) == 1, upright_pocket_result
+upright_pocket_bounds = upright_pocket_regions[0].bounds()
+assert sorted(
+    (round(upright_pocket_bounds.width, 6), round(upright_pocket_bounds.height, 6))
+) == [40.0, 60.0], upright_pocket_bounds
+assert abs(float(upright_pocket_regions[0].signed_area(0.05))) > 2399.0
+
+upright_edge_pocket = Part.makeBox(200, 100, 18).cut(
+    Part.makeBox(70, 40, 5, FreeCAD.Vector(-1, 30, 13))
+)
+upright_edge_pocket.rotate(
+    FreeCAD.Vector(0, 0, 0), FreeCAD.Vector(1, 0, 0), 90.0
+)
+upright_edge_result = import_part_shape(
+    upright_edge_pocket,
+    layer_id="layer",
+    flatten_solids=True,
+)
+upright_edge_external = next(
+    entity
+    for entity in upright_edge_result.entities
+    if str(entity.metadata.get("import_role", "")) == "cut_external"
+)
+upright_edge_regions = [
+    entity
+    for entity in upright_edge_result.entities
+    if str(entity.metadata.get("import_role", "")) == "pocket_region"
+]
+assert len(upright_edge_regions) == 1, upright_edge_result
+assert abs(abs(float(upright_edge_external.signed_area(0.05))) - 20000.0) < 0.1
+assert abs(float(upright_edge_regions[0].signed_area(0.05))) > 2759.0
+
+# Rebaixos circulares cegos usam o mesmo plano compartilhado. Eles não podem
+# aparecer como anéis soltos no canto da grade nem permanecer como corte
+# interno coincidente.
+upright_circular_pockets = Part.makeBox(200, 100, 18)
+for center_x in (45.0, 155.0):
+    upright_circular_pockets = upright_circular_pockets.cut(
+        Part.makeCylinder(17.5, 5, FreeCAD.Vector(center_x, 25.0, 13.0))
+    )
+upright_circular_pockets.rotate(
+    FreeCAD.Vector(0, 0, 0), FreeCAD.Vector(1, 0, 0), 90.0
+)
+upright_circular_result = import_part_shape(
+    upright_circular_pockets,
+    layer_id="layer",
+    flatten_solids=True,
+)
+circular_regions = [
+    entity
+    for entity in upright_circular_result.entities
+    if str(entity.metadata.get("import_role", "")) == "pocket_region"
+]
+assert len(circular_regions) == 2, upright_circular_result
+assert all(type(entity).__name__ == "CircleEntity" for entity in circular_regions)
+assert not [
+    entity
+    for entity in upright_circular_result.entities
+    if str(entity.metadata.get("import_role", "")) == "cut_internal"
+], upright_circular_result
+upright_circular_outer = next(
+    entity
+    for entity in upright_circular_result.entities
+    if str(entity.metadata.get("import_role", "")) == "cut_external"
+)
+outer_bounds = upright_circular_outer.bounds()
+assert all(
+    outer_bounds.contains_bbox(entity.bounds(), 1.0e-7)
+    for entity in circular_regions
+)
 
 # Um recorte "osso" pode chegar como um único Compound composto por uma
 # placa central e quatro discos sobrepostos.  A cópia 2D deve unir as faces
@@ -211,6 +367,102 @@ tree_classification = classify_document_pieces(_TreeImportDocument(tree_result.e
 assert len(tree_classification.pieces) == 2, tree_classification
 assert all(len(piece.inner_ids) == 1 for piece in tree_classification.pieces), tree_classification
 FreeCAD.closeDocument(tree_document.Name)
+
+# Um único nó gerado pode conter várias chapas físicas.  Se duas delas têm o
+# mesmo XY mas estão em alturas Z distintas, a importação precisa estacioná-las
+# separadamente e classificá-las como duas peças, não como chapa + recorte.
+stacked_document = FreeCAD.newDocument("WoodCAMStackedTreePartShapeSmoke")
+stacked_root = stacked_document.addObject("App::DocumentObjectGroup", "StackedFurniture")
+stacked_leaf = stacked_document.addObject("PartDesign::Feature", "StackedLeaf")
+lower_board = Part.makeBox(100, 80, 15)
+upper_board = Part.makeBox(40, 20, 15, FreeCAD.Vector(0, 0, 30))
+stacked_source_shape = Part.makeCompound([lower_board, upper_board])
+stacked_leaf.Shape = stacked_source_shape
+stacked_root.addObject(stacked_leaf)
+stacked_document.recompute()
+source_volume_before = round(float(stacked_leaf.Shape.Volume), 9)
+source_bounds_before = (
+    round(float(stacked_leaf.Shape.BoundBox.XMin), 9),
+    round(float(stacked_leaf.Shape.BoundBox.YMin), 9),
+    round(float(stacked_leaf.Shape.BoundBox.ZMin), 9),
+    round(float(stacked_leaf.Shape.BoundBox.XMax), 9),
+    round(float(stacked_leaf.Shape.BoundBox.YMax), 9),
+    round(float(stacked_leaf.Shape.BoundBox.ZMax), 9),
+)
+stacked_result = import_freecad_tree(
+    (stacked_root,),
+    layer_id="layer",
+    flatten_solids=True,
+    compound_groups=True,
+)
+stacked_paths = [
+    entity
+    for entity in stacked_result.entities
+    if type(entity).__name__ == "PathEntity" and entity.closed
+]
+assert len(stacked_paths) == 2, stacked_result
+stacked_instances = {
+    str(entity.metadata.get("source_tree_instance_id", ""))
+    for entity in stacked_paths
+}
+assert len(stacked_instances) == 2, stacked_instances
+assert all("component-" in instance for instance in stacked_instances), stacked_instances
+stacked_bounds = [entity.bounds() for entity in stacked_paths]
+assert not (
+    stacked_bounds[0].max_x > stacked_bounds[1].min_x
+    and stacked_bounds[1].max_x > stacked_bounds[0].min_x
+    and stacked_bounds[0].max_y > stacked_bounds[1].min_y
+    and stacked_bounds[1].max_y > stacked_bounds[0].min_y
+), stacked_bounds
+stacked_classification = classify_document_pieces(
+    _TreeImportDocument(stacked_result.entities)
+)
+assert len(stacked_classification.pieces) == 2, stacked_classification
+assert all(not piece.inner_ids for piece in stacked_classification.pieces), stacked_classification
+assert round(float(stacked_leaf.Shape.Volume), 9) == source_volume_before
+assert (
+    round(float(stacked_leaf.Shape.BoundBox.XMin), 9),
+    round(float(stacked_leaf.Shape.BoundBox.YMin), 9),
+    round(float(stacked_leaf.Shape.BoundBox.ZMin), 9),
+    round(float(stacked_leaf.Shape.BoundBox.XMax), 9),
+    round(float(stacked_leaf.Shape.BoundBox.YMax), 9),
+    round(float(stacked_leaf.Shape.BoundBox.ZMax), 9),
+) == source_bounds_before
+FreeCAD.closeDocument(stacked_document.Name)
+
+# A identidade por componente é aplicada somente depois da fusão coplanar.
+# Assim, o osso continua sendo uma única peça física também pelo caminho da
+# árvore e não regride para uma placa mais quatro círculos soltos.
+tree_bone_document = FreeCAD.newDocument("WoodCAMTreeDogboneSmoke")
+tree_bone_root = tree_bone_document.addObject("App::DocumentObjectGroup", "BoneFurniture")
+tree_bone_leaf = tree_bone_document.addObject("PartDesign::Feature", "BoneLeaf")
+tree_bone_leaf.Shape = bone_compound
+tree_bone_root.addObject(tree_bone_leaf)
+tree_bone_document.recompute()
+tree_bone_result = import_freecad_tree(
+    (tree_bone_root,),
+    layer_id="layer",
+    flatten_solids=True,
+    compound_groups=True,
+)
+tree_bone_paths = [
+    entity
+    for entity in tree_bone_result.entities
+    if type(entity).__name__ == "PathEntity" and entity.closed
+]
+assert len(tree_bone_paths) == 1, tree_bone_result
+assert not [
+    entity
+    for entity in tree_bone_result.entities
+    if type(entity).__name__ == "CircleEntity"
+], tree_bone_result
+assert len(
+    {
+        str(entity.metadata.get("source_tree_instance_id", ""))
+        for entity in tree_bone_result.entities
+    }
+) == 1, tree_bone_result
+FreeCAD.closeDocument(tree_bone_document.Name)
 
 # O PanelNest pode reportar os arcos circulares de um recorte "osso" como
 # quatro furos soltos e omitir o perfil externo por ele ainda ser retangular.
