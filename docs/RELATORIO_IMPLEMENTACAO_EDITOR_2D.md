@@ -3478,3 +3478,983 @@ Validação após a unificação: **165 testes PanelNest**, **410 testes puros d
 Editor** (dois opcionais ignorados), **83 testes Qt offscreen**, **161 testes
 gerais**, **15 smokes FreeCADCmd**, smoke isolado da bancada unificada,
 compilação integral e verificação de whitespace aprovados no FreeCAD 1.1.3.
+
+### Preservação do arranjo ao transbordar chapas — 4 de setembro de 2026
+
+O caso visual com famílias de ripas já alinhadas revelou uma decisão ruim do
+organizador: embora duas chapas fossem inevitáveis, a busca ignorava o arranjo
+de entrada, lotava a primeira folha e redesenhava a composição inteira, podendo
+deixar uma ocorrência isolada na segunda. Isso contradizia a intenção evidente
+do operador de conservar blocos já montados e apenas separar o excedente.
+
+Uma segunda captura expôs a causa algorítmica mais profunda: o empacotamento de
+cada folha dava prioridade à quantidade bruta de objetos colocados. Assim,
+muitas peças pequenas venciam uma combinação com menos peças, porém maior área
+real ocupada, e as peças compridas/difíceis ficavam isoladas nas folhas
+seguintes. O resultado local parecia cheio, mas o trabalho completo consumia
+uma chapa adicional.
+
+O arranjo atual passou a participar como candidato puro de uma ou múltiplas chapas.
+Ele procura separações de guilhotina nos vazios reais entre blocos, conserva
+posição relativa e orientação de todas as peças dentro de cada bloco e apenas
+translada cada bloco inteiro para uma folha virtual lado a lado. O candidato só
+vence quando melhora a quantidade de ocorrências colocadas, reduz a quantidade
+de chapas ou, em um empate com transbordo, preserva os blocos deliberados. Em
+particular, um arranjo manual válido em uma chapa vence uma tentativa automática
+que desperdiçaria duas. Sobreposição, folga insuficiente, rotação incompatível ou
+ausência de uma separação segura também mantêm o fluxo anterior.
+
+O ranking interno de MaxRects, pontos de fronteira e raster também passou a
+priorizar a área real colocada antes da contagem de peças. A regressão mínima
+usa duas peças de 60 x 100 e quatro de 40 x 50 em folhas de 100 x 100: o
+critério anterior colocava as quatro pequenas e terminava em três folhas; o
+novo distribui uma grande e duas pequenas por folha e conclui em duas.
+
+Depois que o SVG real
+`table-lr4-1834x2745x100mm-furos-3.175-v4-compat.svg` foi disponibilizado, a
+reprodução deixou de ser inferida pelas capturas. O importador reconheceu 28
+peças fechadas, oito marcações internas abertas e nenhum contorno aberto
+bloqueador. Com Trabalho 1834 x 2745 mm, folga 3,175 mm e rotação livre, o
+fluxo anterior produziu três chapas: a rota livre escolhia poses inclinadas que
+pareciam boas dentro de uma folha, mas pioravam o conjunto completo.
+Restringindo apenas a tentativa comparativa a 0°/90°, as mesmas 28 peças
+couberam em duas chapas.
+
+O organizador agora executa essa alternativa ortogonal como candidata, sem
+retirar do operador a rotação livre. A comparação global mantém o contrato de
+cobertura e prioriza a menor quantidade de chapas. No arquivo real, venceu
+`ângulos ortogonais`: 25 peças na primeira folha e 3 na segunda, com todas as
+28 colocadas e 48,47% de ocupação nas duas chapas; a terceira folha deixou de
+existir e a sobra ficou consolidada na segunda.
+
+Os oito `OPEN_PATH` exibidos pelo diagnóstico também foram reproduzidos no SVG
+real. Eles não eram contornos rompidos: eram segmentos internos de marcação,
+cada um inequivocamente contido no contorno fechado irmão do mesmo elemento
+SVG. O importador agora registra `woodcam_role=piece_marking`, e o validador
+também respeita `Piece2D.marking_path_ids`. Assim, essas linhas continuam
+existindo e acompanham rigidamente suas peças, mas não pedem uma união
+geométrica incorreta. No arquivo real, o diagnóstico passou de oito para zero
+`OPEN_PATH` e as oito marcações permaneceram nas colocações das duas chapas.
+
+O campo de folga passou a aceitar três casas decimais e passo de 0,125 mm. A
+proteção que usa o diâmetro efetivo da fresa no modo de linha comum preservando
+medidas continua ativa e agora possui explicação direta no campo: uma fresa de
+3,175 mm permite esse valor; uma fresa efetiva de 4 mm não pode usar folga
+inferior sem tornar impossível preservar as duas dimensões usinadas.
+
+A seleção residual de uma ocorrência do diagnóstico revelou outro bloqueio de
+orquestração: ao marcar `Usar Editor 2D como fonte`, o diálogo tentava validar
+somente o vetor selecionado. Uma marcação aberta válida era então enviada
+isoladamente ao adapter, rejeitada como contorno de Corte e a ação voltava a
+ficar desmarcada. A ativação agora valida o documento/folha inteira ignorando
+apenas essa seleção residual; Corte, Furo e Rebaixo continuam honrando a
+seleção explícita quando a operação é configurada. O adapter de documento
+inteiro ignora `piece_marking`, mas uma marcação escolhida isoladamente ainda é
+recusada como contorno fechado, preservando o contrato CAM.
+
+Na sequência, o fluxo real de Furo expôs uma segunda assimetria desse adapter.
+Os 97 furos do SVG LR4 são `PathEntity` circulares fechados: eles eram
+reconhecidos quando chegavam pela relação `Piece2D`, mas uma seleção explícita
+restringia a promoção a `CircleEntity` e retornava zero furos. Além disso,
+selecionar somente o contorno externo da peça não expandia seus internos. O
+adapter agora aplica a mesma regra circular conservadora de até 12 mm também
+aos caminhos fechados selecionados; a ponte Editor → CAM expande o externo de
+uma `Piece2D` para seus internos e retira marcações abertas do escopo de Corte e
+Furo. Um furo selecionado sozinho continua isolado. No arquivo real, a seleção
+CAM completa passou de zero para 97 furos e uma peça amostrada retornou seus
+cinco furos vinculados.
+
+Essa promoção geométrica possuía ainda uma falha de segurança: depois de
+expandir a peça, a operação de Furo mantinha também seu contorno externo. Se o
+externo contivesse alívios dogbone, a prévia podia dar a impressão — e o
+gerador podia receber a instrução — de usiná-los como parte da furação. O
+escopo agora é semântico: quando há relações `Piece2D`, selecionar uma peça ou
+uma seleção múltipla entrega exclusivamente os `inner_path_ids` pertencentes
+às peças escolhidas. O adapter também veta a promoção de qualquer
+`outer_path_id` a furo, mesmo quando ele é um caminho circular pequeno. Um
+círculo solto escolhido isoladamente permanece uma intenção explícita válida.
+Sem seleção explícita, o escopo passa a ser todos os internos pertencentes às
+peças da chapa ativa; os externos não são sequer enviados no contrato de
+furação, em vez de depender de uma etapa posterior para ignorá-los. A saída de
+Furo é normalizada para `contours: []`, protegendo também documentos antigos
+sem relações `Piece2D` e recortes internos não circulares.
+
+A reprodução seguinte distinguiu dados e apresentação. No SVG real, a lista
+nova de Furo produziu 97 centros, zero contornos e 236.292 movimentos com a
+fresa nominal de 3,175 mm; todo movimento de usinagem ficou a no máximo
+0,00025 mm de um desses centros, enquanto todos os centros estão 50 mm para
+dentro do respectivo externo. O dogbone não estava nessa lista. A interface,
+porém, permitia conservar várias operações selecionadas na aba Simulação e
+concatenava seus movimentos usando as configurações da primeira. Assim, Corte
+e Furo podiam aparecer juntos numa inspeção visual que parecia ser somente de
+Furo. Simular agora exige exatamente uma operação; a seleção múltipla permanece
+somente para exportação. Depois de Aplicar, a operação recém-criada vira a única
+selecionada. Operações antigas de Furo do Editor, sem a versão 2 do escopo,
+ficam desatualizadas e são bloqueadas tanto na inspeção quanto no G-code até
+serem recalculadas explicitamente.
+
+O mesmo diagnóstico encontrou uma amplificação desnecessária: a aproximação
+cúbica dos círculos de 3,175 mm resultava em diâmetro medido de 3,1755 mm. Com
+fresa de 3,175 mm, a diferença de 0,0005 mm era interpretada como folga para
+hélice e produzia 236.292 movimentos praticamente concêntricos. A decisão de
+hélice agora exige ao menos 0,01 mm de diferença diametral (ou 0,1% do diâmetro
+da fresa, se maior). O caso nominal passa a mergulho central, conservando a
+posição e eliminando os segmentos sem deslocamento útil.
+
+A regressão da UI constrói um contorno externo circular de raio 1,5875 mm,
+dimensão deliberadamente idêntica a um alívio de fresa de 3,175 mm, junto de
+uma peça com furo interno. Tanto a seleção da peça quanto a seleção múltipla
+produzem um furo e zero contornos; o candidato dogbone nunca aumenta a
+contagem. A auditoria do SVG LR4 exato da pasta Downloads encontrou 28 peças,
+97 internos vinculados e 8 marcações abertas: os 97 internos continuaram como
+furos e nenhum dos 28 externos foi promovido.
+
+A prévia 3D desse mesmo trabalho revelou que Furo ainda estava fora do overlay
+integral já usado por Corte e Preenchimento. Com 37 mil movimentos helicoidais,
+o limite visual antigo de 4.000 segmentos agrupava duas ordens consecutivas —
+retrair verticalmente e depois avançar em XY na altura segura — numa única
+corda diagonal do fundo do furo ao próximo ponto. Essa diagonal não existia nos
+movimentos nem no G-code, mas era uma representação inaceitável de segurança e
+a animação reduzida também saltava entre quadros.
+
+Furo agora usa o overlay Coin integral e a linha do tempo exata: cada retração
+Z e cada rápido XY continuam segmentos separados, enquanto a posição da fresa
+é interpolada continuamente dentro do movimento real. A regressão gera 2.001
+furos e mais de 6.000 movimentos, exige exatamente 4.001 segmentos rápidos e
+proíbe qualquer rápido que altere XY fora de Z seguro. O smoke completo da UI
+foi aprovado no FreeCADCmd.
+
+A nova rota passa pelo mesmo validador vetorial exato de colisão, folga e
+compensação da fresa antes de chegar à prévia. Furos, recortes, rebaixos e
+marcações continuam nos `entity_ids` da transformação rígida; somente aplicar a
+prévia produz o `CompositeCommand` e o Undo já existentes. A regressão reproduz
+dois blocos deliberados de três peças: o resultado antigo era 5 + 1, enquanto o
+novo preserva 3 + 3 e mantém o furo da primeira peça vinculado.
+
+Fase/entrega: manutenção de produção do organizador multi-chapa.
+
+Arquivos alterados: organizador, importador SVG, validação de domínio, widget,
+orquestração do diálogo, catálogo de idioma, testes puros/Qt, README e este
+relatório.
+
+Testes executados e resultados: **420 testes puros executados** (418 aprovados
+e dois opcionais ignorados), **84 testes Qt offscreen**, **162 testes gerais**,
+os **15 smokes FreeCADCmd** da matriz e o smoke isolado da bancada unificada
+aprovados no FreeCAD 1.1.3. A bateria direcionada
+do organizador aprovou 49 casos, incluindo contorno real, rotação livre, fonte
+dispersa, múltiplas chapas, distribuição de peças difíceis e os contratos de
+preservação, economia de chapa e fallback.
+
+Critérios de aceite aprovados: preservação rígida dos blocos e internos,
+divisão do excesso sem folha adicional, fallback para nesting em entrada
+inválida, prévia sem mutação e aplicação/Undo pelo comando atômico existente.
+
+Critérios ainda pendentes: confirmação visual do operador no FreeCAD GUI após
+reiniciar a bancada; a geometria SVG exata já foi reproduzida pela camada de
+produção e incorporada como regressão dimensional.
+
+### Correção de entrada do Corte em dogbones — 2026-09-04
+
+A inspeção conjunta da prévia 2D e da simulação 3D mostrou que a operação ativa
+era `Corte`, não `Furo`: os círculos magenta de entrada coincidiam com o início
+dos dogbones. O CAM padrão já pontuava pontos internos de segmentos, mas a rota
+do `GlobalCutPlan`, usada quando Linha comum estava ativa, só conseguia iniciar
+em limites de segmentos físicos. Além disso, sua seleção chamada
+`geometric_vertices_only` favorecia justamente vértices com mudança de direção.
+Em um SVG cujo `M` inicial estava dentro de um arco de alívio, o planejador
+preservava esse ponto e mergulhava sobre um chord de aproximadamente 0,349 mm.
+
+O plano físico agora divide, sem alterar a geometria nem o comprimento total,
+cada reta fechada suficientemente longa em seu ponto médio. A rota de qualquer
+estratégia otimizada aceita prioritariamente apenas esses nós colineares, com
+ao menos 12 mm de folga de cada lado e folga adicional proporcional ao diâmetro
+da fresa. A estratégia `Por peça` também passou a materializar a rota escolhida
+no `CutOperation`, em vez de descartar o ponto seguro e retornar ao primeiro nó
+canônico do SVG. Curvas curtas, cantos e dogbones deixam de competir por menor
+distância até o ponto atual.
+
+Operações de Corte com Linha comum aplicadas com versão de entrada inferior à
+atual passam a aparecer como `DESATUALIZADA`.
+Seus movimentos persistidos são bloqueados na simulação e no G-code até o
+operador editar e aplicar novamente; o programa não reapresenta o percurso
+antigo como se tivesse sido recalculado.
+
+A reprodução direta do arquivo
+`table-lr4-1834x2745x100mm-furos-3.175-v4-compat.svg`, com fresa de 4 mm,
+profundidades 5,4/10,8/16,2 mm, tolerância de Linha comum de 0,2 mm e corte
+externo, aprovou entradas retas em **28 de 28 peças**. Nas ripas longas, o caso
+que antes iniciava no chord de 0,349 mm passou a iniciar no meio de uma reta de
+2.094 mm, com 1.047 mm livres em cada direção. A regressão permanente cobre
+Dogbone e T-bone compensados e exige colinearidade e folga mínima ao redor do
+mergulho.
+
+Validação: **420 testes puros executados** (418 aprovados e dois opcionais
+ignorados), **84 testes Qt offscreen**, **162 testes gerais**, bateria
+direcionada de 165 testes de operações/plano global e o smoke completo da UI
+no FreeCADCmd aprovados. Compilação/importação durante as suítes e
+`git diff --check` também foram aprovados.
+
+#### Complemento: sentido invertido e Linha comum fragmentada — 2026-09-05
+
+A validação anterior com peças isoladas não cobriu o estado mostrado depois
+pelo operador: `Linha comum` combinada com `Todas as passadas direto por peça`.
+A reprodução completa do nesting encontrou 595 trails e 453 descidas na
+primeira chapa. Duas causas independentes foram confirmadas.
+
+Primeiro, ao inverter um trail fechado, `_route_variants` preservava o índice
+numérico da aresta em vez do mesmo vértice físico. Assim, uma entrada escolhida
+no meio de uma reta podia reaparecer no primeiro chord de 0,349 mm do dogbone.
+O índice invertido agora é remapeado para `(-offset) % edge_count`, com uma
+regressão que percorre explicitamente as duas direções e exige o mesmo nó
+colinear.
+
+Segundo, uma fronteira compartilhada interrompida várias vezes por rasgos ou
+dogbones alternava segmentos `SHARED` e `EXTERNAL`. O contrato de segmento
+físico único convertia cada trecho restante em trail aberto, gerando uma nova
+descida em cada emenda. Uma primeira contenção manteve os perfis compensados
+fechados, mas ao cortar a divisa uma vez por peça desativava justamente a
+economia solicitada. O plano atual mantém cada intervalo coincidente como
+`SHARED`, executado uma única vez por profundidade. Os remanescentes abertos do
+segundo proprietário são operações separadas: cada um termina com retração e o
+seguinte começa após G0 em Z seguro; não existe corda direta por material
+intacto nem travessia extensa em baixa pelo kerf anterior.
+
+O smoke FreeCADCmd reproduz duas peças com três trechos compartilhados
+separados por rasgos, fresa de 4 mm e três profundidades até 16,2 mm. O resultado
+possui três segmentos `SHARED`, economia de 272 mm por profundidade, zero
+segmento físico duplicado e quatro componentes físicos. As três profundidades
+preservam a mesma cobertura; cada componente desconectado retrai e reposiciona
+em Z seguro, sem `cleared_path_link`. Operações persistidas pelas correções
+incompletas anteriores usam contrato de entrada inferior ao atual; a versão
+atual é 8, portanto elas também aparecem como `DESATUALIZADA` e ficam
+bloqueadas até nova aplicação.
+
+Validação final do complemento: **421 testes puros executados** (419 aprovados
+e dois opcionais ignorados), **84 testes Qt offscreen**, **162 testes gerais**,
+166 testes direcionados do plano/geradores e o smoke completo da interface no
+FreeCADCmd aprovados; compilação e `git diff --check` sem erros.
+
+Riscos conhecidos: a preservação deliberadamente exige uma separação espacial
+segura entre os blocos. Um mosaico entrelaçado que exceda a chapa e não possua
+linha de separação volta ao nesting global, em vez de adivinhar quais relações
+visuais o operador pretendia manter. A prioridade por área e a concorrência
+ortogonal corrigem o SVG LR4 reproduzido; outros conjuntos com restrições
+explícitas de veio ou rotação continuam respeitando essas restrições e não
+recebem ângulos que o operador não autorizou.
+
+#### Complemento: Dogbone não é limpeza estreita nem furação — 2026-09-05
+
+A simulação seguinte revelou uma terceira causa independente. Mesmo com o
+ponto de entrada principal corrigido e o perfil fechado, a análise de detalhes
+inacessíveis via compensação interpretava cada arco de Dogbone de 3,175 mm
+como uma fenda estreita quando a ferramenta selecionada era Ø4 mm. Ela então
+antepunha ao corte um `narrow_feature_cleanup` de apenas 0,598 mm para cada
+alívio. Como cada micropercurso começa com uma descida Z própria, a simulação
+parecia — e o G-code se comportaria — como se todos os dogbones fossem furos.
+
+O detector agora diferencia uma fenda de um alívio circular tessellado. Uma
+sequência com raio circular consistente, menor ou igual ao raio da fresa, e
+cujo eixo residual não chega a um raio da ferramenta é convertida numa excursão
+do próprio perfil externo. Em cada profundidade, a ferramenta sai do ponto mais
+próximo do perfil já engatado, percorre o alívio e retorna pelo mesmo kerf, no
+mesmo Z. Não existe G0, retração, novo mergulho ou operação de furo nesse
+trecho. Fendas retas, escalonadas ou afuniladas continuam sendo detectadas e
+continuam com o percurso no eixo médio após confirmação; uma regressão separada
+garante inclusive que uma fenda reta curta não seja confundida com arco de
+alívio.
+
+A reprodução direta do SVG informado importou **133 entidades**, reconheceu
+**28 peças**, **28 contornos externos** e **97 furos circulares**. Antes da
+correção, Ø4 mm produzia limpezas auxiliares em 19 peças e de 14 a 18
+micropercursos em cada ripa longa; depois da correção, o mesmo arquivo produziu
+**zero** `narrow_feature_cleanup` para os dogbones, identificou **270 alívios**
+e gerou **2.160 movimentos contínuos de corte** para visitá-los nas passadas,
+sempre precedidos por `feed_cut` no mesmo Z. O contrato de corte do Editor
+passou à versão 3 e o contrato global de entrada à versão 8: toda operação de
+Corte antiga fica `DESATUALIZADA` e precisa ser aplicada novamente, impedindo
+simulação ou exportação dos movimentos defeituosos já persistidos.
+
+Na mesma revisão, `Ver percurso` deixou de consultar a seleção invisível de
+operações aplicadas quando o operador está no Editor 2D ou numa aba CAM: nesses
+contextos a prévia é recalculada a partir da geometria e das configurações
+atuais. A operação persistida selecionada continua sendo a autoridade somente
+na página `Simulação e Salvar`. O painel `Chapas` também recebeu `+ Nova chapa
+vazia`; o comando acrescenta uma folha com as dimensões da chapa ativa, ativa e
+enquadra a nova área sem tocar nos vetores e é desfeito integralmente por um
+único Ctrl+Z.
+
+Validação final: **421 testes puros** (dois opcionais ignorados), **85 testes Qt
+offscreen**, **164 testes gerais**, o smoke completo da UI/CAM e os **15 smokes
+FreeCADCmd** aprovados. O smoke da interface contém uma cópia reduzida do
+Dogbone do SVG com e sem Linha comum e exige que toda excursão seja `feed_cut`,
+precedida por outro `feed_cut` no mesmo Z, ao mesmo tempo em que preserva o
+teste de uma fenda estreita profunda. A regressão Qt cria a terceira chapa,
+mantém todos os IDs e vetores intactos e desfaz somente a folha nova.
+Compilação e `git diff --check` também foram aprovados.
+
+#### Complemento: ativação da fonte CAM com vetor aberto solto — 2026-09-05
+
+A ação `Usar Editor 2D como fonte` ainda executava uma validação global antes
+de marcar a caixa. Qualquer caminho aberto independente, mesmo fora de todas as
+relações `Piece2D`, lançava `OPEN_PATH`; a ação voltava imediatamente ao estado
+desmarcado e mostrava `Editor não pode ser usado no CAM`. Isso misturava duas
+decisões diferentes: escolher a fonte e criar uma operação de usinagem.
+
+A ação agora apenas seleciona o Editor como fonte, desde que o documento tenha
+vetores. A validação permanece obrigatória ao criar Corte, Furo ou Rebaixo. Se
+há seleção explícita, ela continua estrita. Sem seleção e com peças reconhecidas,
+o escopo de validação e do adapter é formado somente pelo contorno externo e
+pelos internos das `Piece2D` da chapa ativa; um vetor aberto solto continua no
+documento e no diagnóstico, mas não veta peças fechadas às quais não pertence.
+Nenhum caminho é fechado, removido ou alterado automaticamente.
+
+O smoke completo reproduz esse estado, mantém o `OPEN_PATH`, marca a ação e
+obtém os contornos reconhecidos para Corte sem incluir a linha solta. Depois da
+mudança passaram novamente **421 testes puros** (dois opcionais ignorados),
+**85 testes Qt offscreen**, **164 testes gerais** e o smoke completo da UI no
+FreeCADCmd; compilação e `git diff --check` também foram aprovados.
+
+#### Complemento: restauração efetiva da Linha comum fragmentada — 2026-09-05
+
+A captura do percurso mostrou que a contenção anterior para dogbones havia
+preservado a continuidade de cada contorno ao custo de desativar a Linha comum
+na chapa inteira. O gatilho era a existência de mais de um intervalo `SHARED`
+para o mesmo par de peças: `resolve_shared_edges` recebia falso e voltava a
+emitir os dois perímetros completos. Por isso a simulação mostrava duas linhas
+paralelas onde deveria existir uma única fronteira física.
+
+O planejador agora mantém `resolve_shared_edges` ativo mesmo quando rasgos,
+T-bones ou dogbones dividem a fronteira em vários intervalos. Cada intervalo
+`SHARED` conserva um único `segment_id` e uma única execução por profundidade.
+Na estratégia por peça, remanescentes fisicamente desconectados nunca são
+unidos por uma rota extensa em baixa: o adapter retrai, reposiciona em Z seguro
+e cria a próxima entrada numa reta válida. A geometria da peça não é alterada.
+
+A regressão integrada usa duas peças com três trechos comuns separados por
+dois rasgos, fresa de 4 mm e três passadas até 16,2 mm. O plano resultante
+mantém os três trechos `SHARED`, economiza 272 mm de corte em cada passada,
+registra zero duplicação física e produz quatro entradas, todas precedidas por
+retração e G0 na altura segura; não existe `cleared_path_link`. O contrato
+global foi elevado à versão 8, tornando inclusive as operações das versões 6 e 7
+`DESATUALIZADA` até serem editadas e aplicadas novamente.
+
+O probe adicional executou o SVG real da pasta Downloads com Ø4 mm, folga de
+4 mm, três passadas 5,4/10,8/16,2 e `Todas as passadas direto por peça`.
+Reconheceu 133 entidades e 28 peças, organizadas 25 + 3 em duas chapas. A
+primeira manteve 151 segmentos `SHARED` e a segunda nove; ambas registraram
+zero duplicação física, zero `cleared_path_link` e zero rápido XY fora do Z
+seguro. A economia por profundidade permaneceu ativa nas duas chapas.
+
+Validação: **421 testes puros** (dois opcionais ignorados), **85 testes Qt
+offscreen**, **164 testes gerais**, **151 testes direcionados** do plano e dos
+geradores, os **15 smokes FreeCADCmd** da matriz (incluindo a UI completa) e o
+smoke isolado da bancada unificada aprovados. Compilação dos módulos alterados e
+`git diff --check` também foram aprovados.
+
+#### Complemento: Dogbones multiplicados entre fragmentos — 2026-09-05
+
+A prévia integral ainda exibiu faixas e triângulos atravessando as ripas. A
+auditoria do percurso completo, e não apenas das métricas do plano global,
+encontrou a causa: `_insert_inline_corner_relief_moves` agrupava candidatos por
+`cut_operation_id`. Como uma mesma peça possui vários `CutOperation` quando a
+Linha comum divide seu contorno em trails, cada dogbone era reinserido uma vez
+em cada fragmento do proprietário. O algoritmo então ligava um fragmento no
+topo da ripa a um alívio na base usando `feed_cut`.
+
+No SVG real, a versão defeituosa gerou 1.326 grupos de alívio e 22.920
+movimentos auxiliares. Havia 636 ligações acima de 5 mm; a maior media
+2.340,621 mm. O visualizador apenas revelou as cordas que realmente estavam na
+lista de movimentos e, portanto, também chegariam ao G-code.
+
+A associação agora usa proprietário e profundidade: para cada alívio escolhe
+um único candidato local entre todos os fragmentos daquela peça. Uma trava
+independente exige que a âncora fique dentro do raio efetivo da fresa mais a
+tolerância geométrica; se isso não for possível, a geração é bloqueada com uma
+mensagem explícita, sem omitir o alívio e sem criar uma corda. O contrato global
+passou à versão 8 para invalidar os percursos já aplicados pela versão 7.
+
+O probe integral repetido sobre a primeira chapa do SVG da pasta Downloads,
+com 25 peças, Ø4 mm e três passadas 5,4/10,8/16,2, encontrou 242 alívios e
+exatamente 726 grupos. Os auxiliares caíram para 2.904 movimentos, nenhum
+início excedeu 5 mm e o máximo foi 2,199 mm. O percurso completo caiu de
+36.481 para aproximadamente 16.476 movimentos; as pequenas variações vêm
+somente da ordem equivalente de peças repetidas. O probe possui asserts para
+726 grupos, máximo de 2,4 mm e ausência total de ligações acima de 5 mm.
+
+A regressão permanente reproduz uma peça dividida em três trails e exige um
+único alívio por profundidade. Um segundo caso fornece deliberadamente uma
+âncora distante e exige bloqueio, provando que uma futura mudança não poderá
+reintroduzir a reta através da peça.
+
+Validação final: **421 testes puros** (dois opcionais ignorados), **85 testes Qt
+offscreen**, **164 testes gerais**, **151 testes direcionados**, os **15 smokes
+FreeCADCmd**, o smoke completo da UI, o smoke da bancada unificada e o probe
+integral do SVG real aprovados. Compilação e `git diff --check` sem erros.
+
+### Organização na chapa ativa — 6 de setembro de 2026
+
+Fase/entrega: manutenção de produção da Fase 6, sem avanço de fase.
+
+Reprodução: três folhas persistidas, uma peça em cada folha e a terceira
+ativa. O worker recebia os limites de `work_area` (Chapa 01), e aplicar
+substituía todos os limites e retalhos do documento. O teste FreeCADCmd novo
+falhou antes da correção com `sheet 1 moved`.
+
+Com várias folhas existentes, o escopo agora é a chapa ativa capturada no
+início da busca. Seleção explícita é intersectada com essa folha; sem seleção,
+entram suas peças reconhecíveis. O worker usa os limites globais corretos e
+o modo de uma única folha. O excesso permanece inalterado. A organização
+inicial de um documento com uma única folha conserva a expansão multi-chapa.
+Limites e retalhos das outras folhas são preservados no mesmo comando/Undo.
+Peças estacionárias da folha ativa entram na validação vetorial e no cálculo
+de retalhos; um destino conflitante não é oferecido para aplicação.
+
+Arquivos alterados: `ui.py`, organizador puro, catálogo de idioma, README,
+este relatório e regressões `test_active_sheet_organization.py` e
+`run_active_sheet_organizer_smoke.py`.
+
+Verificação: 423 testes puros (421 aprovados, dois opcionais ignorados),
+85 testes Qt offscreen, 164 testes legados, os 15 smokes FreeCADCmd existentes
+e o novo smoke da chapa ativa aprovados. O novo smoke cobre preservação das
+chapas 1/2 e retalho, transformação rígida de externo/furo na chapa 3,
+prévia sem mutação, cancelar, Undo/Redo e save/reopen com JSON idêntico.
+Os testes puros cobrem excesso sem folha adicional e conflito com peça parada.
+
+Critérios pendentes: roteiro manual no FreeCAD GUI de produção com o arquivo
+do operador; foi exercitado o fluxo equivalente na interface Qt offscreen,
+sem abrir ou modificar o FCStd original do usuário.
+
+Próximo passo: reiniciar o FreeCAD, selecionar Chapa 03, organizar, conferir a
+prévia identificada e aplicar; Ctrl+Z restaura a organização inteira.
+
+### Linha comum por peça em sentido único — 6 de setembro de 2026
+
+Fase/entrega: extensão autorizada do CAM de produção da Fase 7, sem alterar
+o Editor vetorial ou avançar suas fases pendentes de aceite manual.
+
+Reprodução: dois retângulos adjacentes, três profundidades e
+`Todas as passadas direto por peça (ex.: 3 direto)` geravam uma volta fechada
+por profundidade na primeira peça e um remanescente de três lados na segunda.
+Esse remanescente alternava direção sem retração entre profundidades. Antes
+da edição passaram 17 testes de ida/volta, 48 de plano global e 19 do adapter
+de movimentos. Foram registrados também 30 percursos completos das cinco
+estratégias anteriores, variando duas/três/quatro profundidades e rampa.
+
+Foi acrescentado `piece_unidirectional`, com o mesmo nome visível da opção
+direta acrescido de `— sentido único`. O scheduler físico existente recebe
+um parâmetro opt-in para repetir a orientação inicial em todas as profundidades.
+Os conjuntos de cobertura por Z, segmentos compartilhados únicos, ordem de
+internos, tabs, dependências e liberação continuam nos contratos existentes.
+O adapter retrai ao final de cada trail aberto e retorna em Z seguro para
+a próxima entrada. Nenhum fechamento ou conector em baixa é acrescentado.
+Perfis fechados conservam a continuidade normal entre suas voltas. Rampas
+continuam obedecendo ao tipo de entrada escolhido separadamente pelo operador.
+
+Arquivos alterados nesta entrega: `global_cut_plan.py`, `operations.py`,
+`ui.py`, catálogo `i18n.py`, novo `test_piece_unidirectional.py`, extensão do
+`run_ui_smoke.py`, README e este relatório. As alterações que já existiam no
+checkout foram preservadas.
+
+Verificação: os 30 percursos históricos ficaram integralmente idênticos ao
+baseline, inclusive metadados e movimentos. Seis regressões da variante cobrem
+mesma orientação em duas/três/quatro profundidades, retorno em Z seguro,
+rampas, retenção/liberação, fronteira fragmentada em três remanescentes e
+internos antes do externo. A suíte pura completa (429 testes, dois opcionais
+ignorados), Qt offscreen (85 testes),
+legados (164 testes) e os 16 smokes FreeCADCmd passaram. O smoke da interface
+também seleciona a opção, verifica a tradução, gera o percurso por meio da
+ponte real, salva uma operação em FCStd temporário, reabre e confirma movimentos
+e restauração da estratégia ao editar. Sintaxe e `git diff --check` aprovados.
+
+Critérios pendentes: conferência visual pelo operador no FreeCAD GUI de
+produção. Roteiro: reiniciar, ativar Linha comum, selecionar a nova opção,
+pré-visualizar duas peças adjacentes com três passadas e simular. Conferir a
+volta completa da primeira, os três lados restantes da segunda e retração/
+retorno entre suas passadas. Selecionar novamente a opção original deve
+restaurar o ida/volta. Nenhum FCStd original foi alterado nos testes.
+
+Risco/limite: os retornos adicionais aumentam a distância rápida e podem
+aumentar o tempo de usinagem; são o comportamento solicitado. O aceite manual
+na máquina não foi realizado. Próximo passo permitido: conferir a nova opção
+na prévia/simulação do arquivo de produção.
+
+### Excesso, tamanho da chapa ativa e edição/exclusão — 24 de setembro de 2026
+
+Fase/entrega: manutenção de produção da Fase 6; continuação da correção de
+organização individual, com extensão expressamente solicitada pelo operador.
+
+O bloqueio do excesso vinha de `single_sheet=True` no worker da chapa ativa.
+Além disso, a seleção usava contenção completa e excluía justamente peças
+ultrapassando a borda. O escopo agora atribui a peça inteira à chapa com maior
+interseção de seus limites (proximidade e índice como desempate), preservando seus
+internos. O worker usa um pool: chapa ativa, próximas chapas vazias e novas
+folhas depois do maior X existente. Folhas ocupadas não entram nesse pool;
+folhas vazias menores são testadas com suas próprias dimensões. Uma peça que
+não cabe nem na folha nova fica explicitamente sem colocar, sem alocação
+infinita. Prévia/aplicação remapeiam os índices locais do resultado para os
+índices persistidos; retalhos de folhas não utilizadas permanecem intactos.
+
+A mudança em Trabalho antes alterava somente `work_area`; a apresentação
+priorizava `organization_sheet_bounds` e mantinha as medidas antigas. Por
+escolha explícita do operador, mudar largura/altura passa a atualizar somente
+a chapa ativa, não todas. O serviço `application/sheet_management.py` prepara
+um único `CompositeCommand`: conserva medidas/IDs das peças, expande a folha
+ativa no próprio datum e afasta as vizinhas atingidas, movendo seus contornos,
+furos, rebaixos e marcações rigidamente. Folhas vizinhas conservam suas medidas.
+Reduzir uma folha não escala nem remove peças fora da borda. Retalhos antigos
+da folha redimensionada são invalidados; os de vizinhas deslocadas acompanham
+o movimento, inclusive suas coordenadas em metadados.
+
+O painel Chapas ganhou `Editar chapa`, com largura/altura, confirmação e
+cancelamento, e `Apagar chapa`. Exclusão aceita somente folha vazia, considera
+inclusive vetores ocultos ou cruzando a borda e mantém ao menos uma folha.
+Remove somente os retalhos auxiliares dessa folha e renumera referências das
+restantes, sem deslocar peças. Ambos os fluxos têm Undo/Redo. Selecionar uma
+chapa mostra suas dimensões atuais em Trabalho sem gravar um comando.
+
+Arquivos desta entrega: organizador puro, novo serviço de gerenciamento de
+chapas, novo `domain/sheets.py`, integração `ui.py`, painel e traduções,
+regressões puras/Qt/FreeCADCmd, README e este relatório. Alterações anteriores
+no checkout, inclusive o corte em sentido único, foram preservadas.
+
+Validação: a reprodução FreeCADCmd distribui três peças da chapa ativa,
+incluindo duas cruzando a borda, entre a própria chapa, uma vazia e uma nova,
+pulando uma ocupada. Confere furo vinculado, cancelamento sem mutação,
+Undo/Redo e save/reopen. Outro smoke altera tamanho por Trabalho e por Editar
+chapa, verifica dimensões distintas, translação rígida de peça/furo vizinhos,
+exclusão protegida e persistência. A regressão Qt aciona os botões reais e
+confere confirmação/cancelamento. Testes puros cobrem limites, folhas vazias
+menores, excesso impossível, renumeração de retalhos e reversibilidade.
+
+Critérios ainda pendentes: conferência visual no arquivo do operador após
+reiniciar o FreeCAD. O arquivo original não foi modificado. Roteiro: selecionar
+Chapa 02, aumentar suas dimensões em Trabalho, conferir que Chapa 01 conserva
+seu tamanho e que uma vizinha alcançada se afasta com as peças; editar pela
+lista, desfazer; criar e apagar uma folha vazia; organizar excesso e conferir
+as folhas de destino antes de aplicar.
+
+Resultado final desta rodada: **440 testes puros** (dois opcionais ignorados),
+**86 testes Qt offscreen**, **164 testes legados** e **18 smokes FreeCADCmd**
+aprovados. O smoke TechDraw precisou ser repetido fora do sandbox, com aprovação,
+porque o cache temporário do FreeCAD estava bloqueado; passou nessa execução.
+Sintaxe dos arquivos alterados e `git diff --check` aprovados.
+
+### Correção de exportação SVG/DXF — 2026-09-24
+
+Na manutenção do Editor 2D, foi reproduzido o caso em que selecionar DXF no
+diálogo mantinha o nome inicial `desenho_woodcam.svg` e também o serializador
+SVG. O filtro só era considerado quando não havia extensão. Agora o nome
+inicial não fixa uma extensão, e o filtro escolhido determina tanto a extensão
+final quanto o exportador. Se a correção do nome apontar para outro arquivo
+existente, o aplicativo solicita confirmação antes de substituí-lo.
+
+O novo `run_vector_export_format_smoke.py` falhou no caso original antes da
+correção e passou depois. Cobre SVG → DXF, DXF → SVG, nome sem extensão,
+extensão em maiúsculas, cancelamento e confirmação de substituição, além de
+conferir que a exportação não altera os vetores nem a revisão do documento.
+Validação: 440 testes puros (dois opcionais ignorados), 86 testes Qt offscreen,
+164 testes legados e 19 smokes FreeCADCmd aprovados, incluindo esse novo caso.
+Sintaxe e `git diff --check` também aprovados. A conferência
+visual do diálogo nativo permanece pendente: reiniciar o FreeCAD, exportar um
+vetor, trocar SVG por DXF e conferir o arquivo `.dxf` gerado.
+
+### Encaixe por contorno no caso de produção — 25 de setembro de 2026
+
+Fase: manutenção de produção, sem mudança de arquitetura ou contrato CAM.
+O arquivo `Suporte mangueira — cortando.FCStd`, em `Marcenaria/Mesa de torçao`,
+foi lido pelo XML interno em modo somente leitura. Foram reconhecidas 74 peças,
+12 delas à esquerda da chapa de 1780 × 2725 mm. O operador confirmou folga de
+4 mm e que as capturas comparavam quantidades diferentes. Não se presumiu,
+portanto, equivalência entre a captura externa e o conjunto completo do FCStd.
+
+Causas reproduzidas:
+
+- A resolução determinada pela folga podia ultrapassar o limite da grade.
+  Mesmo quando a grade cabia, as máscaras das rotações podiam exceder o segundo
+  orçamento: as 74 peças a 4 mm exigiam aproximadamente 19 milhões de células
+  de máscaras contra um limite de 12 milhões. O raster retornava `None`.
+- A dilatação horizontal era realizada antes da translação da máscara. Os bits
+  negativos da margem esquerda eram perdidos e não retornavam ao deslocar a
+  peça para dentro da chapa. No subconjunto de 62 peças, uma tentativa raster
+  chegou a gerar 30 violações de folga, posteriormente rejeitadas corretamente
+  pela validação vetorial. A queda para retângulos ocultava a causa na prévia.
+- O estágio por contorno só era tentado após dezenas/centenas de buscas por
+  retângulos. O gerador de ordens também retornava quatro ordens quando o
+  orçamento solicitado era apenas uma.
+
+Correções: a resolução agora respeita os dois orçamentos antes de rasterizar;
+translação precede dilatação, preservando a margem esquerda; contatos inviáveis
+são descartados por intervalos de colisão em bits, com cache limitado; a
+verificação exata de distância entre segmentos descarta somente pares cujo
+limite inferior por bounding box já supera a menor distância medida. Nenhuma
+folga ou tolerância vetorial foi reduzida. A interface mantém a resposta rápida
+original e compara em seguida duas ordens por contorno antes do refino pesado.
+
+Reprodução com o worker real, perfil Equilibrado, 20 segundos e folga de 4 mm:
+as mesmas 62 peças, excluindo as 12 à esquerda, produziram a primeira prévia
+em duas chapas em cerca de 5,3 s; a etapa por contorno publicou todas as 62 em
+uma chapa em cerca de 15,1 s. A busca encerrou no tempo-alvo conservando essa
+prévia, aprovada pelo validador exato. O envelope final foi aproximadamente
+1765,47 × 2682,42 mm. Com todas as 74 peças, as tentativas aferidas ainda
+usaram duas chapas; não há alegação de paridade ou ótimo global do Supernest.
+O FCStd original não foi salvo nem alterado.
+
+Regressões novas verificam a folga simétrica em máscaras transladadas, o limite
+de células em chapas grandes e em muitas rotações, o orçamento de ordens,
+contatos raster contra varredura exaustiva e distância vetorial otimizada contra
+todos os pares de segmentos. O novo `run_contour_search_smoke.py` verifica que
+o worker publica a melhoria por contorno antes do refino retangular profundo.
+Os testes de compensação cobrem os dois candidatos; a fixture de linha comum
+usa o candidato retangular que garante contatos exatos, pois um raster válido
+com folga maior não precisa ter fronteira compartilhada.
+
+Pendente: roteiro visual no FreeCAD de produção, selecionar o mesmo conjunto,
+folga 4 mm e perfil Equilibrado; conferir a prévia, aplicar, desfazer/refazer e
+salvar/reabrir uma cópia. Não avançou fase nem foi alterada a estratégia CAM.
+
+Validação: **446 testes puros** (dois opcionais ignorados), **86 testes Qt
+offscreen**, **164 testes legados**, **20 smokes FreeCADCmd**; sintaxe e
+`git diff --check` aprovados.
+O teste TechDraw precisou de repetição autorizada fora do sandbox por bloqueio
+na criação da cópia temporária do template, e passou. Os smokes de organização,
+linha comum, worker e interface foram repetidos após os ajustes finais.
+
+### Prioridade aos retalhos aproveitáveis — 25 de setembro de 2026
+
+Fase: manutenção de qualidade do organizador. O operador comparou novamente o
+layout real com o Supernest e mostrou vazios internos e um retalho de apenas
+0,38 m² apesar de caberem peças ao redor. A auditoria encontrou um viés na
+pontuação progressiva: após igualar quantidade de peças e chapas, a menor
+altura do envelope decidia antes do tamanho dos retalhos úteis. Uma orientação
+inclinada podia, portanto, vencer uma alternativa que preservava uma faixa
+inteira na borda da chapa. Na organização da chapa ativa, a alternativa somente
+ortogonal existente no organizador geral também não entrava no pool de chapas.
+
+O worker de Equilibrado e Profundo agora avalia cedo `Contornos alinhados`,
+filtrando as rotações para múltiplos de 90° apenas quando já são permitidos
+pela peça. Depois continua o contorno livre e os demais refinos. Cada etapa
+valida a geometria como antes. Na comparação entre resultados completos, a
+cobertura e o número de chapas continuam primeiro; entre soluções empatadas,
+a pontuação usa os mesmos retalhos retangulares com corte seguro já mostrados
+na prévia, incluindo o menor lado configurado pelo operador e a folga de corte.
+Ela prefere a maior área prática reaproveitável e então a soma das áreas, antes
+de avaliar altura e largura. A geração dos retalhos usa bounds conservadores,
+logo não supõe que qualquer vazio diagonal seja separável por guilhotina.
+Na etapa alinhada, o mesmo critério compara também as alternativas geradas
+por MaxRects, pontos de fronteira e raster dentro da própria busca, depois de
+priorizar a quantidade de peças; os demais estágios conservam a ordem antiga.
+
+Medição reproduzível a 4 mm no arquivo de produção, sem salvar o FCStd:
+
+- As 62 peças inicialmente junto da chapa cabiam em uma folha no contorno
+  livre, com maior retalho retangular de aproximadamente 0,256 m². A etapa
+  alinhada também as colocou em uma folha, com maior retalho de cerca de
+  0,852 m². O teste do worker real publicou essa melhora em 12,3 s.
+- Com **todas as 74 peças**, a primeira resposta usou duas chapas em 3,9 s.
+  `Contornos alinhados` colocou as 74 em **uma única chapa** em 11,3 s, com
+  folga vetorial exata de 4 mm. Uma execução Equilibrada de 20 s manteve essa
+  solução. O maior retalho retangular após acrescentar as outras 12 peças é
+  de aproximadamente 0,103 m²; ainda há vazios de formatos irregulares e não
+  se declara ótimo global do Supernest.
+
+Uma busca alinhada mais larga (oito ordens, quatro ordens raster e feixe 2)
+preservou a mesma solução completa e não aumentou o maior retalho no arquivo
+real. A execução padrão ficou com o orçamento menor, que entregou uma chapa
+dentro dos 20 s configurados. A comparação desenhada com as mesmas 74 peças
+ficou em `/tmp/woodcam-74-comparacao.png`.
+
+Regressões cobrem a preferência por uma sobra grande quando a altura favorece
+uma orientação diagonal, o respeito a rotação bloqueada/veio e a publicação
+da solução válida pelo worker. Resultado: **448 testes puros** (dois opcionais
+ignorados), **86 testes Qt offscreen**, **164 testes legados** e **20 smokes
+FreeCADCmd** aprovados. `git diff --check` aprovado. Critério manual pendente:
+reabrir o WoodCAM no FreeCAD GUI, selecionar as mesmas peças, usar folga 4 mm
+com Equilibrado e conferir prévia, aplicar, Undo/Redo e save/reopen numa cópia.
+
+### 2026-09-25 — Colar vetores sob o mouse no Editor 2D
+
+`Ctrl+V` e `Editar → Colar` usam a última posição do ponteiro na área 2D.
+O centro do envelope do conjunto copiado é levado a essa posição. Se ainda
+não houve evento de mouse na área, a colagem usa a posição global do ponteiro
+quando ela está dentro da vista e, caso contrário, o centro da vista. Mover
+ou ampliar a câmera entre `Copiar` e `Colar` não desloca incorretamente a
+cópia, pois a posição é convertida da vista para a cena no momento da colagem.
+
+O comando continua atômico e mantém grupos, relações `Piece2D`, furos e IDs
+novos; duas colagens na mesma posição ficam sobrepostas intencionalmente. O
+teste puro verifica coordenadas X/Y, IDs, snapshot e Undo. A regressão Qt
+exercita `Ctrl+C`/`Ctrl+V` com grupo e furo pelo widget real, verificando o
+centro no ponto do mouse e Undo. Validação: **449 testes puros** (dois opcionais
+ignorados), **86 testes Qt offscreen**, **164 testes legados** e **20 smokes
+FreeCADCmd** aprovados. Ainda falta a conferência visual manual no FreeCAD GUI
+de produção, com `Ctrl+V` e `Editar → Colar` após mover a câmera.
+
+### 2026-09-25 — Corte interno selecionado e diâmetro da fresa
+
+O caso reportado combinava recortes internos e furos circulares selecionados
+sem os perfis externos. A separação por paridade considerava somente a
+seleção, promovendo os recortes internos a externos; uma exceção adicional
+promovia todos os furos a perfis externos sempre que não houvesse outro perfil
+selecionado. A Linha comum recebia esses perfis pelo lado errado e mostrava
+dezenas de falsos cruzamentos próprios. Agora o Editor usa os contornos do
+desenho completo somente como referência de contenção; a usinagem continua
+limitada aos vetores selecionados. A exceção do lado de corte externo permanece
+apenas para um único círculo sem peça externa que o contenha; um furo circular
+selecionado sozinho dentro da peça continua interno.
+
+O seletor de ferramenta também podia mostrar `Fresa 4 mm MDF` com o campo
+interno restaurado em 6 mm, pois selecionar de novo o mesmo item não emite
+mudança do combo. A fresa do catálogo passou a definir o diâmetro tanto no
+CAM quanto no contrato de folga do nesting. A edição de operação e a
+restauração das preferências sincronizam o campo interno; `Personalizada`
+continua usando o valor próprio.
+
+Reprodução em leitura do arquivo `Suporte mangueira — cortando.FCStd`: a
+classificação identificou 74 peças, 125 perfis internos e 182 furos; na
+chapa ativa, o corte dos descendentes selecionados resultou em 88 perfis
+internos e 110 furos, com fresa Ø4 mm e 25.411 movimentos, sem acionar o
+plano externo de Linha comum. Nenhum FCStd de origem foi salvo. O novo smoke
+FreeCADCmd cobre recorte e dois furos selecionados juntos, fresa visível Ø4
+e valor interno obsoleto Ø6. O smoke completo da UI também confere que a
+folga de organização segue a fresa selecionada. Validação: **449 testes
+puros** (dois opcionais ignorados), **164 testes legados** e **21 smokes
+FreeCADCmd** e **86 testes Qt offscreen** aprovados; conferência manual no
+FreeCAD GUI permanece pendente.
+
+### 2026-09-25 — Seleção lenta de dados internos no FreeCAD
+
+No arquivo de reprodução `Suporte mangueira — cortando.FCStd`, a propriedade
+visível `GeometryJSON` do documento vetorial tem 1,84 MB e a `Shape` derivada
+tem 3.273 arestas. Uma das operações aplicadas expõe 378.875.948 caracteres
+em `MovesCompressedBase64`. Abrir o painel de propriedades ao selecionar esses
+objetos pode carregar os campos internos enormes. O `FreeCADDocumentStore`
+agora oculta `GeometryJSON`, `SourceMetadataJSON` e a propriedade `Shape` do
+inspetor ao salvar ou carregar; o WoodCAM oculta os JSONs e movimentos de
+operações novas e existentes ao atualizar sua lista. Os objetos, vetores,
+movimentos, simulação e exportação permanecem acessíveis ao código. A
+enumeração de operações consulta `PropertiesList` sem obter o valor do campo
+de movimentos gigantesco.
+
+Verificação em leitura do mesmo FCStd: as três operações persistidas registram
+`Fresa 4 mm MDF` com `tool_diameter = 4.0`. A migração visual dos campos foi
+aplicada em memória às três operações e ao documento vetorial, sem salvar o
+arquivo de origem. Os smokes cobrem persistência, reabertura e migração de uma
+operação antiga com campo visível. Validação: **449 testes puros** (dois
+opcionais ignorados), **86 testes Qt offscreen**, **164 testes legados** e
+**21 smokes FreeCADCmd** aprovados. A resposta da interface ao clicar nos
+objetos no FreeCAD GUI de produção ainda requer conferência manual.
+
+O operador identificou que o clique problemático foi na prévia CAM/percurso.
+Os percursos 2D são desenhados por `CoinToolpathOverlay` com
+`SoPickStyle.UNPICKABLE`; um clique na linha pode, portanto, atingir o
+`WoodCAM2D_VectorDocument` exibido por baixo. Esse objeto é um cache interno do
+Editor, não um alvo de edição nativa do FreeCAD. A vista do cache agora recebe
+`Selectable = False` tanto ao criar como ao carregar documentos existentes,
+além de permanecer fora da árvore. A seleção de peças dentro do Editor 2D e os
+movimentos CAM não mudam. O teste puro cobre a configuração da vista e o smoke
+da interface verifica a propriedade quando o FreeCAD a expõe. Ainda falta
+medir o clique na área gráfica da sessão GUI do operador após reiniciar.
+Após esse ajuste adicional, passaram **450 testes puros** (dois opcionais
+ignorados), **86 testes Qt offscreen**, **164 testes legados** e **21 smokes
+FreeCADCmd**; `git diff --check` também passou.
+
+### 2026-09-25 — Abertura lenta e clique na árvore do FCStd real
+
+A captura posterior mostrou seleção do item `Documento vetorial (interno)` na
+árvore. As proteções anteriores eram aplicadas apenas quando o WoodCAM abria o
+Editor, tarde demais para esse clique. Um observador leve registrado na
+inicialização da bancada agora configura o cache vetorial e oculta os campos
+internos das operações assim que o FreeCAD ativa o documento, sem ler os
+percurso grandes. O smoke de persistência abre um arquivo antigo com campos
+visíveis e confirma que o observador os oculta antes de `store.load()`.
+
+O FCStd salvo pelo operador cresceu para **784.576.992 bytes**; `Document.xml`
+descompactado tinha **1.056.623.439 bytes**. A operação `Corte002` registrava
+56.473 movimentos em um `MovesCompressedBase64` de **1.050.383.396
+caracteres**. A inspeção revelou a mesma lista longa de `segment_ids` e os
+nomes de perfil repetidos em cada movimento. O codec novo guarda esses
+metadados compartilhados uma vez, reconstrói integralmente os movimentos na
+leitura e continua aceitando o formato anterior. Para legados enormes, a
+leitura é incremental e não infla todo o JSON em memória.
+
+`tools/compact_woodcam_fcstd.py` produz uma cópia separada e verifica a
+contagem ao reabrir. A cópia real
+`Suporte mangueira — cortando — otimizado.FCStd` ficou com **3.389.345 bytes**;
+`Corte002` passou para **2.118.764 caracteres**. Uma segunda leitura comparou
+**cada um dos 56.473 movimentos** com o original e confirmou igualdade exata;
+`GeometryJSON`, checksum, configurações e as outras duas operações também
+coincidiram. O FCStd original manteve tamanho e data de modificação. Abertura
+isolada no FreeCADCmd: aproximadamente 11,11 s no original e 0,24 s na cópia.
+Permanece pendente conferir abertura e seleção na interface FreeCAD GUI com a
+nova versão da bancada, preservando qualquer alteração não salva da sessão do
+operador.
+
+Validação após a compactação: **451 testes puros** (dois opcionais ignorados),
+**165 testes legados**, **86 testes Qt offscreen** e **21 smokes FreeCADCmd**
+aprovados; compilação e `git diff --check` sem erros. O smoke da bancada
+unificada requer FreeCAD GUI e não roda pelo `freecadcmd` sem esse ambiente.
+
+### Exclusão do cache vetorial pela árvore do FreeCAD — 27 de setembro de 2026
+
+Reprodução: um `VectorDocument` com vetores já salvos era carregado no Editor;
+depois de remover `Documento vetorial (interno)` pela árvore do FreeCAD, o
+sincronizador chamava `FreeCADCommandSession.reload()`. Como a sessão guardava
+o documento carregado como `_empty_baseline`, `store.load() == None` restaurava
+os vetores antigos na memória. Ao trocar de documento, a persistência podia
+recriar o objeto apagado. O cache entre documentos também aceitava uma cópia
+antiga quando o objeto persistente havia desaparecido.
+
+Agora a ausência do objeto produz um `VectorDocument` vazio, preservando
+somente a área de trabalho da sessão. O cache rejeita snapshots associados a
+um objeto persistente que já não existe, e a troca de documento não salva um
+desenho vazio apenas para recriar o objeto removido. Excluir vetores no Editor
+continua sendo um comando único com Undo e atualiza a `Shape` projetada na
+vista 3D; não altera outros objetos CAM ou páginas TechDraw.
+
+Regressões: teste unitário de remoção/restauração do objeto; smoke FreeCADCmd
+de exclusão dos vetores, `Shape` vazia, Undo e exclusão pela árvore; smoke da
+UI com Delete, sincronização e troca de documento. No FCStd otimizado do caso
+real, uma cópia temporária passou de 447 vetores/3293 arestas para 0/0 e
+voltou a 447/3293 com Undo, sem modificar o arquivo de origem. Passaram 452
+testes puros (2 ignorados), 86 testes Qt, 165 testes legados e os 22 smokes
+FreeCADCmd.
+
+### Auditoria para publicação de teste — 28 de setembro de 2026
+
+Escopo: estado atual do checkout, incluindo as alterações locais anteriores a
+esta auditoria. Foram revisados Editor 2D, importação/exportação, chapas e
+organizador, CAM 2D/3D, operações persistidas, ponte PanelNest, TechDraw,
+tradução inglês/português e pacote portátil. O FCStd original do operador não
+foi editado.
+
+Dois defeitos de publicação foram corrigidos nesta revisão:
+
+- avisos recentes de CAM (inclusive a confirmação de detalhe menor que a fresa)
+  e a confirmação de substituição de SVG/DXF apareciam em português ou com
+  frases híbridas ao usar inglês; as mensagens agora usam traduções completas
+  antes de interpolar medidas/nomes, com regressões Qt e FreeCADCmd;
+- o gerador do ZIP incluía um arquivo ZIP local ignorado pelo Git, resultados
+  de experimentos e podia incluir FCStd/pesos locais; o filtro do pacote agora
+  exclui esses artefatos. O ZIP de teste contém 356 arquivos e 19.746.168 bytes,
+  com entradas verificadas para PanelNest, WoodCAM, Editor e licença dos ícones.
+
+Verificação após os ajustes: 452 testes puros do Editor (2 opcionais ignorados),
+86 testes Qt offscreen, 165 testes gerais do WoodCAM e 166 testes PanelNest
+aprovados. Os dois testes opcionais de fusão de normais passaram no runtime
+externo com OpenCV. Uma inferência real em CPU com DA2 + Metric3D sobre PNG
+sintético transparente gerou mapa 96 × 96 válido, com fundo na base. Os 21
+smokes FreeCADCmd de produção passaram; o smoke da bancada
+unificada também abriu o FreeCAD GUI offscreen, ativou PanelNest e confirmou
+PanelNest e `ui.py` vindos da mesma pasta. O mesmo smoke passou após extrair
+o ZIP de teste em `/tmp`, carregando ambos os módulos da cópia extraída.
+`compileall` e `git diff --check`
+passaram. O smoke completo da interface e o de exportação foram repetidos após
+as correções de idioma. A captura da organização na chapa ativa foi
+inspecionada visualmente.
+
+Limite desta auditoria: a sessão GUI real do operador e a máquina CNC não foram
+acionadas. O roteiro de cliques, save/reopen e simulação no FreeCAD de produção
+continua recomendado antes de usinagem; a IA opcional não foi avaliada com a
+foto real do operador nesta rodada. Avisos de inicialização de outros
+complementos do FreeCAD apareceram nos smokes, sem reprovação do WoodCAM.
+
+### Idioma inicial e revisão das estratégias de Corte — 28 de setembro de 2026
+
+Instalações sem preferência de idioma agora iniciam em inglês no PanelNest e
+no WoodCAM independente. Uma preferência salva em qualquer um dos dois módulos
+é preservada; quando as duas existem, a escolha global do PanelNest prevalece.
+Os testes de interface que verificam rótulos em português selecionam esse
+idioma explicitamente.
+
+As cinco opções de ordem de profundidades da Linha comum foram executadas com
+duas peças adjacentes, um recorte interno, três profundidades (5/10/15,5 mm)
+e chapa de 15 mm: última passada na chapa, todas as passadas por peça em
+ida/volta, todas por peça em sentido único, chapa inteira por profundidade e
+híbrido de estabilidade. Em cada plano, `validate()` confirmou cobertura única
+de cada segmento físico em cada Z e dependências válidas. O adaptador CAM
+gerou os movimentos com rampa suave e todos os G0 em XY ocorreram em Z seguro;
+o escritor produziu G-code encerrado em `M30`. Uma matriz adicional executou
+as cinco opções com tabs mantidas e liberação automática. A opção sem Linha
+comum segue o gerador histórico por peça, coberto pela regressão existente.
+
+Regressões desta rodada: 451 testes puros aprovados (2 opcionais ignorados),
+86 testes Qt offscreen, 165 testes gerais, 167 testes PanelNest, 21 smokes
+FreeCADCmd e smoke da bancada unificada no FreeCAD GUI offscreen aprovados.
+Esta verificação é de software; antes de usinagem, simular e testar o percurso
+na máquina do operador.
+
+### Folga escolhida pelo operador no nesting — 28 de setembro de 2026
+
+O diálogo de organização impunha o diâmetro efetivo da fresa como mínimo do
+campo e `_vector_editor_safe_nesting_spacing()` aumentava novamente valores
+menores recebidos por outros caminhos. Com fresa de 6 mm, 4 mm voltavam a 6 mm.
+O diálogo também reabria com a recomendação da fresa, em vez da última folga
+usada no Editor.
+
+Agora o campo aceita qualquer folga não negativa até o limite já existente e
+mantém o valor escolhido ao confirmar e ao reabrir. A organização não corrige
+o número silenciosamente e valida a geometria real das peças. A validação do
+Corte continua independente: o smoke comprovou duas peças a 4 mm e a rejeição
+de seu percurso externo com fresa de 6 mm. O FCStd de origem não é alterado
+por esse diálogo.
+
+Validação da correção: o smoke FreeCADCmd da interface reproduziu a digitação
+de 4 mm com fresa de 6 mm, confirmou o mínimo de 0 mm e o envio de 4 mm ao
+organizador. Duas peças foram colocadas a 4 mm, e o CAM recusou a fresa de
+6 mm nesse layout. Passaram
+451 testes puros (2 opcionais ignorados), 86 Qt offscreen, 165 gerais,
+167 PanelNest, os 21 smokes FreeCADCmd e o smoke da bancada no FreeCAD GUI
+offscreen. Compilação e `git diff --check` passaram.
+
+### Independência da folga do nesting em relação à fresa — 28 de setembro de 2026
+
+A revisão anterior ainda consultava a fresa preenchida automaticamente na aba
+`Corte` e mostrava um aviso vermelho de Ø6 mm no diálogo de organização, antes
+de o operador escolher uma ferramenta de usinagem. Essa inferência era indevida.
+O diálogo e o worker do nesting agora usam somente a folga informada pelo
+operador: não leem a fresa, o modo de linha comum nem o sobre-metal, e não
+aplicam compensação de ferramenta durante a busca. A prévia continua validando
+contornos e a folga real solicitada. Somente ao configurar `Corte` a fresa
+selecionada é usada para validar compensação e linhas comuns antes do G-code.
+
+O smoke da interface repetiu a captura com Ø6 mm preenchido no Corte e 4 mm
+digitados no nesting: o diálogo não exibiu aviso de fresa e entregou 4 mm ao
+organizador. A regressão completa passou com 451 testes puros (2 opcionais
+ignorados), 86 Qt offscreen, 165 gerais, 167 PanelNest, 21 smokes FreeCADCmd
+e o smoke da bancada no FreeCAD GUI offscreen. Compilação e `git diff --check`
+passaram.
+
+### Etiquetas de retalho e faces externas de painéis espelhados — 28 de setembro de 2026
+
+No Editor 2D, a etiqueta de retalho continuava visível porque era projetada
+de `organization_remnant_cuts` mesmo após a exclusão do vetor correspondente.
+Agora a linha persistida é a autoridade: a etiqueta só aparece ao selecionar
+essa linha, a medida também fica no tooltip da linha/prévia, e `Delete` remove
+o registro de metadados no mesmo comando com Undo/Redo. Metadados órfãos de
+documentos anteriores são ignorados pela cena. Trocar português/inglês atualiza
+o texto da etiqueta e do tooltip sem alterar o documento.
+
+O operador confirmou o arquivo `Suporte mangueira — MDF parametrico.FCStd` e
+que seus furos atravessam a chapa, mas o rebaixo da cabeça deve ser feito nas
+faces externas da montagem. A inspeção somente leitura mostrou pares de
+painéis alinhados para os quais o achatamento escolhia a normal positiva em
+ambas as peças. Isso fazia uma delas ser copiada pela face interna. A
+importação direta da árvore e a ponte PanelNest agora reconhecem pares
+congruentes e alinhados, escolhem a face que aponta para fora do par e projetam
+também a face inferior horizontal com o espelhamento correto. Faces com mais
+detalhes continuam tendo prioridade, para preservar rebaixos já modelados.
+O arquivo FCStd de origem não foi salvo nem modificado. Layouts 2D já salvos
+devem ser reimportados para incorporar essa orientação; a correção não muda
+vetores persistidos sem comando e prévia.
+
+Reprodução e validação: o FCStd real foi aberto somente para leitura e os
+pares `BracoPainel2/3`, `EscoraPainel0/1` e `BracoPainel0/1` foram conferidos.
+Os 59 nós do contorno externo de `BracoPainel2/3` passaram a corresponder por
+espelhamento horizontal, em vez de produzir dois contornos iguais.
+O smoke de importação contém pares sintéticos verticais e horizontais com furo
+passante excêntrico; verifica perfis/furos espelhados, ponte PanelNest e volume
+dos sólidos de origem intacto. O teste Qt cobre visibilidade da etiqueta,
+Delete e Undo; o teste puro cobre a limpeza atômica dos metadados.
+Passaram 454 testes puros (2 opcionais ignorados), 86 Qt offscreen, 165 gerais,
+167 PanelNest, 21 smokes FreeCADCmd e o smoke da bancada integrada no FreeCAD
+GUI offscreen. `compileall` e `git diff --check` também passaram.

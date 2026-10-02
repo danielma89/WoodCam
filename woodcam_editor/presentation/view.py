@@ -133,6 +133,7 @@ class VectorGraphicsView(QtWidgets.QGraphicsView):
         # feedback is rendered at frame cadence; construction previews may
         # opt into the same cadence while their confirming click stays exact.
         self._pending_cursor_display = None
+        self._last_pointer_viewport_pos = None
         self._cursor_display_timer = QtCore.QTimer(self)
         self._cursor_display_timer.setSingleShot(True)
         self._cursor_display_timer.setInterval(16)
@@ -186,6 +187,11 @@ class VectorGraphicsView(QtWidgets.QGraphicsView):
     @property
     def grid_visible(self):
         return self._grid_visible
+
+    def last_pointer_viewport_position(self):
+        """Last mouse position on the canvas, including before a menu opens."""
+        return (None if self._last_pointer_viewport_pos is None
+                else QtCore.QPoint(self._last_pointer_viewport_pos))
 
     def set_grid_spacing(self, spacing_mm):
         spacing = float(spacing_mm)
@@ -374,6 +380,7 @@ class VectorGraphicsView(QtWidgets.QGraphicsView):
         self.centerOn(center)
 
     def mousePressEvent(self, event):
+        self._last_pointer_viewport_pos = event_screen_point(event)
         # A queued visual preview must reach the exact last hover point before
         # a click consumes it. The click itself is still dispatched directly.
         self._pointer_move_timer.stop()
@@ -414,6 +421,7 @@ class VectorGraphicsView(QtWidgets.QGraphicsView):
 
     def mouseMoveEvent(self, event):
         screen = event_screen_point(event)
+        self._last_pointer_viewport_pos = screen
         scene_pos = self.mapToScene(screen)
         if self._panning and self._last_pan_pos is not None:
             delta = screen - self._last_pan_pos
@@ -428,6 +436,7 @@ class VectorGraphicsView(QtWidgets.QGraphicsView):
         event.accept()
 
     def mouseReleaseEvent(self, event):
+        self._last_pointer_viewport_pos = event_screen_point(event)
         if event.button() == RIGHT_BUTTON and self._right_canceling:
             self._right_canceling = False
             event.accept()
@@ -446,6 +455,7 @@ class VectorGraphicsView(QtWidgets.QGraphicsView):
         event.accept()
 
     def mouseDoubleClickEvent(self, event):
+        self._last_pointer_viewport_pos = event_screen_point(event)
         if event.button() == RIGHT_BUTTON:
             self._right_canceling = False
             self.cancelRequested.emit()

@@ -50,7 +50,14 @@ class FreeCADCommandSession:
                 self.document.UndoMode = 1
         except Exception:
             pass
-        self._empty_baseline = vector_document.clone()
+        # A feature can disappear after a tree deletion or host Undo.  The
+        # snapshot loaded when this session opened is not a valid fallback in
+        # that case: using it would resurrect vectors the user just removed.
+        from woodcam_editor.domain.document import VectorDocument
+
+        self._empty_baseline = VectorDocument.create_default(
+            getattr(vector_document, "work_area", None)
+        )
         self._listeners: List[Callable[[Any], None]] = []
 
     def subscribe(self, listener: Callable[[Any], None]) -> Callable[[], None]:

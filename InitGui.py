@@ -24,6 +24,17 @@ if FreeCAD.GuiUp:
         if project_root not in sys.path:
             sys.path.insert(0, project_root)
 
+        try:
+            from woodcam_editor.adapters.freecad_store import (
+                install_woodcam_display_observer,
+            )
+
+            install_woodcam_display_observer()
+        except Exception as error:
+            FreeCAD.Console.PrintWarning(
+                "WoodCAM: proteção visual dos documentos indisponível: %s\n" % error
+            )
+
         loader_module = "_panelnest_unified_initgui"
         if loader_module not in sys.modules:
             spec = importlib.util.spec_from_file_location(loader_module, init_gui)

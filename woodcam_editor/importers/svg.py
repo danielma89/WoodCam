@@ -11,10 +11,12 @@ import hashlib
 import math
 import re
 import xml.etree.ElementTree as ET
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
 from woodcam_editor.domain.primitives import Affine2D, Vec2
+from woodcam_editor.geometry.math2d import PointLocation, point_in_polygon
 from woodcam_editor.importers.part_shape import (
     ImportIssue,
     ImportLayerDescriptor,
@@ -457,6 +459,32 @@ def _path_from_points(
     return _path_entity(api, layer_id, spans, closed, metadata) if spans else None
 
 
+def _open_subpath_is_piece_marking(open_path, closed_paths) -> bool:
+    """Recognize an open stroke carried inside one closed sibling subpath."""
+
+    open_points = tuple(open_path.flatten(0.05, include_closure=False))
+    if not open_points:
+        return False
+    open_bounds = open_path.bounds()
+    containers = []
+    for closed_path in closed_paths:
+        closed_bounds = closed_path.bounds()
+        if not (
+            closed_bounds.min_x <= open_bounds.min_x + 1.0e-7
+            and closed_bounds.min_y <= open_bounds.min_y + 1.0e-7
+            and closed_bounds.max_x >= open_bounds.max_x - 1.0e-7
+            and closed_bounds.max_y >= open_bounds.max_y - 1.0e-7
+        ):
+            continue
+        polygon = tuple(closed_path.flatten(0.05, include_closure=False))
+        if all(
+            point_in_polygon(point, polygon, 1.0e-7) is not PointLocation.OUTSIDE
+            for point in open_points
+        ):
+            containers.append(closed_path)
+    return len(containers) == 1
+
+
 def import_svg(path: str | Path, *, layer_id: str) -> ImportResult:
     source_path = Path(path)
     root = ET.parse(str(source_path)).getroot()
@@ -574,10 +602,16 @@ def import_svg(path: str | Path, *, layer_id: str) -> ImportResult:
             source_layer_name,
             color,
         )
+        if tag in geometry_tags:
+            metadata["svg_source_element"] = ".".join(
+                str(index) for index in trail
+            )
         try:
             if tag == "path":
                 for spans, closed in _parse_path(element.get("d", ""), api, matrix):
-                    entities.append(_path_entity(api, layer_id, spans, closed, metadata))
+                    entities.append(
+                        _path_entity(api, layer_id, spans, closed, metadata)
+                    )
             elif tag == "line":
                 points = [
                     Vec2(float(element.get("x1", 0.0)), float(element.get("y1", 0.0))),
@@ -701,6 +735,35 @@ def import_svg(path: str | Path, *, layer_id: str) -> ImportResult:
                 )
 
     visit(root, root_matrix)
+    paths_by_source_element = {}
+    for entity_index, entity in enumerate(entities):
+        metadata = dict(getattr(entity, "metadata", {}) or {})
+        source_element = str(metadata.get("svg_source_element", "") or "")
+        if (
+            source_element
+            and metadata.get("svg_tag") == "path"
+            and hasattr(entity, "closed")
+        ):
+            paths_by_source_element.setdefault(source_element, []).append(
+                (entity_index, entity)
+            )
+    for siblings in paths_by_source_element.values():
+        closed_paths = tuple(entity for _index, entity in siblings if entity.closed)
+        if not closed_paths:
+            continue
+        for entity_index, entity in siblings:
+            if entity.closed or not _open_subpath_is_piece_marking(
+                entity,
+                closed_paths,
+            ):
+                continue
+            entities[entity_index] = replace(
+                entity,
+                metadata={
+                    **dict(entity.metadata or {}),
+                    "woodcam_role": "piece_marking",
+                },
+            )
     file_bytes = source_path.read_bytes()
     return ImportResult(
         tuple(entity for entity in entities if entity is not None),

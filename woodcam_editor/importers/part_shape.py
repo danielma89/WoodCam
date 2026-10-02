@@ -281,6 +281,14 @@ def _plane_projection(face: Any, normal: tuple[float, float, float]) -> _PlanePr
         origin = _point3(vertices[0].Point)
     else:
         origin = _point3(getattr(face, "CenterOfMass"))
+    if abs(normal[2]) >= 1.0 - 1.0e-8:
+        # Preserve the model X direction for horizontal boards. The underside
+        # then mirrors Y instead of unexpectedly swapping length and width.
+        return _PlaneProjection(
+            origin,
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0 if normal[2] > 0.0 else -1.0, 0.0),
+        )
     reference = min(
         ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
         key=lambda axis: abs(_dot(axis, normal)),
@@ -417,7 +425,10 @@ def _manufacturing_surface_face(
     )[0]
 
 
-def _select_panel_face(solid: Any):
+def _select_panel_face(
+    solid: Any,
+    preferred_normal: tuple[float, float, float] | None = None,
+):
     """Choose the useful broad face of a panel, never one thickness side.
 
     First keep only faces close to the largest planar face.  This discards
@@ -460,6 +471,7 @@ def _select_panel_face(solid: Any):
         key=lambda candidate: (
             len(list(getattr(candidate[1], "Wires", []) or [])),
             len(list(getattr(candidate[1], "Edges", []) or [])),
+            _dot(candidate[2], preferred_normal) if preferred_normal else 0.0,
             # For coplanar top/bottom alternatives, retain the upper face.
             # It is where OCC keeps the fused manufacturing outline for
             # compound panel features such as dogbones.  Area remains the
@@ -1154,6 +1166,74 @@ def _mark_tree_result_instance(
     return ImportResult(entities, result.issues, result.source_metadata, result.layers)
 
 
+def paired_panel_face_normals(sources: Iterable[Any]) -> dict[str, tuple[float, float, float]]:
+    """Face normals pointing away from an aligned, opposite assembly panel.
+
+    Only an unambiguous pair of congruent, parallel boards is eligible.  A
+    lone panel or a board with face-specific pockets keeps the importer's
+    existing detailed-face choice.  This prevents two opposing through-drilled
+    boards from both being flattened from the same physical side.
+    """
+
+    records = []
+    for source in sources or ():
+        shape = getattr(source, "shape", None) or getattr(source, "Shape", None)
+        solids = list(getattr(shape, "Solids", ()) or ())
+        if len(solids) != 1:
+            continue
+        selected = _select_panel_face(solids[0])
+        if selected is None:
+            continue
+        normal = selected[2]
+        axis = max(range(3), key=lambda index: abs(normal[index]))
+        if abs(normal[axis]) < 1.0 - 1.0e-5:
+            continue
+        bounds = getattr(shape, "BoundBox", None)
+        if bounds is None:
+            continue
+        minima = (float(bounds.XMin), float(bounds.YMin), float(bounds.ZMin))
+        maxima = (float(bounds.XMax), float(bounds.YMax), float(bounds.ZMax))
+        center = tuple((lo + hi) / 2.0 for lo, hi in zip(minima, maxima))
+        dimensions = tuple(hi - lo for lo, hi in zip(minima, maxima))
+        name = str(getattr(source, "name", "") or getattr(source, "Name", ""))
+        if name and dimensions[axis] > 1.0e-6:
+            records.append((name, axis, normal, center, dimensions))
+
+    matches = {}
+    for index, first in enumerate(records):
+        _name, axis, _normal, center, dimensions = first
+        candidates = []
+        for other_index, second in enumerate(records):
+            if index == other_index or axis != second[1]:
+                continue
+            if any(abs(a - b) > 0.05 for a, b in zip(dimensions, second[4])):
+                continue
+            if any(
+                abs(center[coordinate] - second[3][coordinate]) > 0.05
+                for coordinate in range(3) if coordinate != axis
+            ):
+                continue
+            separation = abs(center[axis] - second[3][axis])
+            if separation <= dimensions[axis] + 0.05:
+                continue
+            candidates.append((separation, other_index))
+        if candidates:
+            candidates.sort()
+            if len(candidates) == 1 or candidates[1][0] - candidates[0][0] > 0.05:
+                matches[index] = candidates[0][1]
+
+    result = {}
+    for index, partner_index in matches.items():
+        if matches.get(partner_index) != index:
+            continue
+        name, axis, normal, center, _dimensions = records[index]
+        direction = 1.0 if center[axis] > records[partner_index][3][axis] else -1.0
+        result[name] = tuple(
+            direction if coordinate == axis else 0.0 for coordinate in range(3)
+        )
+    return result
+
+
 def import_freecad_tree(
     sources: Iterable[Any],
     *,
@@ -1169,6 +1249,7 @@ def import_freecad_tree(
     """
 
     tree_sources = _collect_tree_shape_sources(sources)
+    face_preferences = paired_panel_face_normals(tree_sources)
     imported = tuple(
         _mark_tree_result_instance(
             import_part_shape(
@@ -1176,6 +1257,7 @@ def import_freecad_tree(
             layer_id=layer_id,
             flatten_solids=flatten_solids,
             compound_groups=compound_groups,
+            preferred_face_normal=face_preferences.get(source.name),
             ),
             source,
             index,
@@ -1204,6 +1286,7 @@ def import_part_shape(
     placement: Any = None,
     flatten_solids: bool = False,
     compound_groups: bool = False,
+    preferred_face_normal: tuple[float, float, float] | None = None,
     _projection: Optional[_PlaneProjection] = None,
     _stage_projection: bool = True,
 ) -> ImportResult:
@@ -1248,12 +1331,16 @@ def import_part_shape(
     if solids:
         solid_faces = []
         for solid_index, solid in enumerate(solids):
-            selected = _select_panel_face(solid)
+            selected = _select_panel_face(solid, preferred_face_normal)
             if selected is None:
                 continue
             _index, face, normal, _area = selected
             projection = None
-            if abs(abs(normal[2]) - 1.0) > 1.0e-8:
+            needs_projection = (
+                abs(abs(normal[2]) - 1.0) > 1.0e-8
+                or (preferred_face_normal is not None and normal[2] < -1.0 + 1.0e-8)
+            )
+            if needs_projection:
                 if not flatten_solids:
                     source_issues.append(
                         ImportIssue(

@@ -141,6 +141,36 @@ dialog.show()
 app.processEvents()
 widget = dialog.vector_editor_widget
 assert widget is not None
+# A saved operation can retain a hidden Ø6 value while the visible cutter is
+# Ø4. CAM uses the selected catalog cutter; nesting does not read either one.
+cut_tool_combo = dialog.operation_tool_combos["cut"]
+cut_diameter_field = dialog.operation_fields["cut"]["tool_diameter"]
+original_tool_index = cut_tool_combo.currentIndex()
+original_diameter_text = cut_diameter_field.text()
+original_operation_tab = dialog.operation_tabs.currentIndex()
+original_common_line = dialog.cut_common_line_enabled.isChecked()
+original_cut_side = dialog.operation_combo.currentIndex()
+dialog._restoring_operation_preferences = True
+try:
+    catalog_index = next(
+        index for index in range(cut_tool_combo.count())
+        if cut_tool_combo.itemText(index) in dialog.tool_database
+    )
+    cut_tool_combo.setCurrentIndex(catalog_index)
+    cutter_name = cut_tool_combo.currentText()
+    cutter_diameter = dialog._tool_values_for_name(cutter_name)["tool_diameter"]
+    cut_diameter_field.setText(str(cutter_diameter + 2.0))
+    dialog.operation_tabs.setCurrentIndex(dialog._operation_tab_index("cut"))
+    assert dialog._collect_settings()["tool_diameter"] == cutter_diameter
+    dialog.cut_common_line_enabled.setChecked(True)
+    dialog.operation_combo.setCurrentIndex(0)
+finally:
+    cut_tool_combo.setCurrentIndex(original_tool_index)
+    cut_diameter_field.setText(original_diameter_text)
+    dialog.operation_tabs.setCurrentIndex(original_operation_tab)
+    dialog.cut_common_line_enabled.setChecked(original_common_line)
+    dialog.operation_combo.setCurrentIndex(original_cut_side)
+    dialog._restoring_operation_preferences = False
 # Ocultar a bancada não pode deixar o polling de Undo/Redo competindo com a
 # viewport do FreeCAD. Reexibir retoma a mesma instância e o mesmo timer.
 sync_timer = dialog._vector_editor_sync_timer
@@ -371,6 +401,7 @@ assert dialog.cut_tabs_best_fixation.isChecked()
 assert "quatro regiões" in dialog.cut_tabs_best_fixation.toolTip()
 assert "obrigatórias" in dialog.cut_tabs_best_fixation.toolTip()
 assert dialog.cut_depth_strategy_combo.findData("piece_bidirectional") >= 0
+assert dialog.cut_depth_strategy_combo.findData("piece_unidirectional") >= 0
 assert dialog.cut_depth_strategy_combo.findData("global_by_depth") >= 0
 assert dialog.cut_depth_strategy_combo.findData("hybrid_stability") >= 0
 assert dialog.cut_depth_strategy_combo.findData("hybrid_piece_bidirectional") >= 0
@@ -569,6 +600,54 @@ assert all(
     for start, end in pocket_preview_components["cut"]
 )
 
+# Regressão visual da furação: com mais de 4.000 segmentos, a projeção antiga
+# agrupava a retração vertical e o rápido XY numa reta do fundo do furo até o
+# próximo ponto. O overlay integral conserva duas pernas: sobe em Z e somente
+# então atravessa XY na altura segura.
+dense_drill_moves = []
+for drill_index in range(2001):
+    dense_drill_moves.extend(
+        (
+            {
+                "type": "rapid",
+                "x": float(drill_index * 10),
+                "y": 0.0,
+                "z": 8.0,
+            },
+            {
+                "type": "feed_drill",
+                "x": float(drill_index * 10),
+                "y": 0.0,
+                "z": -5.0,
+            },
+            {
+                "type": "rapid",
+                "x": None,
+                "y": None,
+                "z": 8.0,
+            },
+        )
+    )
+holes_preview_limit = (
+    None
+    if dialog._uses_lightweight_toolpath_overlay({"operation_mode": "holes"})
+    else 4000
+)
+holes_preview_components = dialog._toolpath_components(
+    dense_drill_moves,
+    max_display_segments=holes_preview_limit,
+)
+assert len(holes_preview_components["rapid"]) == 4001
+assert all(
+    (
+        start[0] == end[0] and start[1] == end[1]
+    )
+    or (
+        start[2] == end[2] == 8.0
+    )
+    for start, end in holes_preview_components["rapid"]
+), holes_preview_components["rapid"][:5]
+
 
 class _FakeActiveView:
     def __init__(self):
@@ -597,12 +676,14 @@ assert cut_line_set.numVertices[0] == len(large_moves)
 overlay.clear()
 assert fake_gui_document.ActiveView.scene.getNumChildren() == 0
 
-# Desbaste, acabamento, Corte e Preenchimento usam o overlay integral tanto na
-# prévia quanto na simulação; somente a posição animada da fresa é amostrada.
-# Furo conserva o rastro progressivo tradicional. Em particular, o rebaixo não
-# pode voltar à projeção reduzida que religava pontos por diagonais falsas.
+# Desbaste, acabamento, Corte, Furo e Preenchimento usam o overlay integral
+# tanto na prévia quanto na simulação. Em particular, nenhum deles pode voltar
+# à projeção reduzida que religa pontos por diagonais falsas.
 assert dialog._uses_lightweight_toolpath_overlay(
     {"operation_mode": "pocket"}
+)
+assert dialog._uses_lightweight_toolpath_overlay(
+    {"operation_mode": "holes"}
 )
 assert dialog._simulation_uses_exact_static_path(
     {"operation_mode": "finish3d"}
@@ -613,7 +694,7 @@ assert dialog._simulation_uses_exact_static_path(
 assert dialog._simulation_uses_exact_static_path(
     {"operation_mode": "cut"}
 )
-assert not dialog._simulation_uses_exact_static_path(
+assert dialog._simulation_uses_exact_static_path(
     {"operation_mode": "holes"}
 )
 assert dialog._simulation_uses_exact_static_path(
@@ -797,6 +878,10 @@ assert applied_3d.MoveCount == len(large_moves)
 assert applied_3d.EstimatedMachiningSeconds >= 0.0
 assert decode_moves(applied_3d.MovesCompressedBase64) == large_moves
 assert list(applied_3d.Group) == []
+assert all(
+    "Hidden" in applied_3d.getEditorMode(name)
+    for name in ("SettingsJSON", "MovesJSON", "MovesCompressedBase64", "SelectionJSON")
+)
 
 # A lista de Simulação e Salvar é também o gerenciador persistente das
 # operações. Sua ordem visual é a ordem do arquivo único, e renomear/excluir
@@ -811,8 +896,11 @@ applied_holes = dialog._create_applied_operation(
     selection_snapshot=[],
 )
 applied_holes_name = applied_holes.Name
+applied_holes.setEditorMode("MovesCompressedBase64", 0)
+assert "Hidden" not in applied_holes.getEditorMode("MovesCompressedBase64")
 dialog.operation_tabs.setCurrentIndex(dialog._tab_index(ui.ACTION_TAB_TITLE))
 dialog._refresh_applied_operation_list()
+assert "Hidden" in applied_holes.getEditorMode("MovesCompressedBase64")
 original_ui_decode_moves = ui.decode_moves
 try:
     ui.decode_moves = lambda *_args, **_kwargs: (_ for _ in ()).throw(
@@ -840,6 +928,50 @@ assert [
 assert [
     entry[2] for entry in dialog._all_applied_entries()
 ] == ["Furos smoke", "Acabamento smoke"]
+
+# Simulação é uma inspeção de segurança de um percurso por vez. A seleção
+# múltipla continua válida para exportar, mas não pode misturar Corte/Furo/3D
+# e apresentar os movimentos do primeiro como se fossem todos do mesmo tipo.
+for row in range(dialog.applied_toolpath_list.count()):
+    dialog.applied_toolpath_list.item(row).setSelected(True)
+try:
+    dialog._selected_applied_simulation()
+except ValueError as error:
+    assert "somente uma operação" in str(error), error
+else:
+    raise AssertionError("Simulação múltipla deveria ser recusada")
+
+dialog._refresh_applied_operation_list(
+    select_operation_name=applied_holes.Name,
+)
+assert [
+    item.data(QtCore.Qt.UserRole)
+    for item in dialog.applied_toolpath_list.selectedItems()
+] == [applied_holes.Name]
+assert dialog._operation_geometry_is_stale(
+    applied_holes,
+    settings={
+        "operation_mode": "holes",
+        "_geometry_source": "editor_2d",
+    },
+)
+assert dialog._operation_geometry_is_stale(
+    applied_holes,
+    settings={
+        "operation_mode": "cut",
+        "common_line_enabled": True,
+        "_geometry_source": "editor_2d",
+    },
+)
+assert dialog._operation_geometry_is_stale(
+    applied_holes,
+    settings={
+        "operation_mode": "cut",
+        "_editor_cut_path_version": 1,
+        "common_line_enabled": False,
+        "_geometry_source": "editor_2d",
+    },
+)
 
 for row in range(dialog.applied_toolpath_list.count()):
     dialog.applied_toolpath_list.item(row).setSelected(False)
@@ -1234,6 +1366,109 @@ assert any(
     and abs(float(move["x"]) - 78.0) < 1.0e-6
     for move in common_narrow_moves
 )
+
+# Regressão do SVG real: um Dogbone de 3,175 mm selecionado com fresa Ø4 não
+# pode ser convertido nos micropercursos de limpeza que pareciam furações. O
+# alívio é uma excursão contínua do perfil externo, no mesmo Z e sem G0/mergulho.
+dogbone_relief_geometry = {
+    "contours": [[
+        (0.0, 0.0), (0.0, 15.5), (47.754936, 15.5),
+        (48.032867, 15.278357), (48.35315, 15.124117),
+        (48.699724, 15.045014), (49.055212, 15.045014),
+        (49.401786, 15.124117), (49.722069, 15.278357),
+        (50.0, 15.5), (50.221643, 15.777931),
+        (50.375883, 16.098214), (50.454986, 16.444788),
+        (50.454986, 16.800276), (50.375883, 17.14685),
+        (50.221643, 17.467133), (50.0, 17.745064),
+        (50.0, 28.754936), (50.221643, 29.032867),
+        (50.375883, 29.35315), (50.454986, 29.699724),
+        (50.454986, 30.055212), (50.375883, 30.401786),
+        (50.221643, 30.722069), (50.0, 31.0),
+        (49.722069, 31.221643), (49.401786, 31.375883),
+        (49.055212, 31.454986), (48.699724, 31.454986),
+        (48.35315, 31.375883), (48.032867, 31.221643),
+        (47.754936, 31.0), (0.0, 31.0), (0.0, 46.5),
+        (100.0, 46.5), (100.0, 0.0), (0.0, 0.0),
+    ]],
+    "holes": [],
+}
+dogbone_relief_settings = dict(editor_cut_settings)
+dogbone_relief_settings.update(
+    outer_cut_side=ui.CUT_SIDE_OUTSIDE,
+    cut_side=ui.CUT_SIDE_OUTSIDE,
+    tool_diameter=4.0,
+    cut_allowance_offset=0.0,
+    common_line_enabled=False,
+    allow_narrow_feature_overcut=False,
+)
+try:
+    dialog._active_geometry = lambda _operation_mode=None: dogbone_relief_geometry
+    dialog._use_vector_editor_for_cam = True
+    dialog._vector_editor_document = widget.document
+    try:
+        dialog._build_moves_from_selection(dogbone_relief_settings)
+        raise AssertionError("Dogbone menor que a fresa não pediu confirmação")
+    except ValueError as error:
+        assert str(error).startswith(
+            "__WOODCAM_CONFIRM_NARROW_FEATURE_OVERCUT__"
+        ), error
+    dogbone_relief_settings["allow_narrow_feature_overcut"] = True
+    dogbone_relief_moves = dialog._build_moves_from_selection(
+        dogbone_relief_settings
+    )
+finally:
+    dialog._active_geometry = original_active_geometry
+    dialog._use_vector_editor_for_cam = original_editor_source
+    dialog._vector_editor_document = original_vector_document
+assert dogbone_relief_settings["_editor_cut_path_version"] == 3
+assert dogbone_relief_settings["_narrow_feature_cleanup_paths"] == []
+assert len(dogbone_relief_settings["_inline_corner_relief_paths"]) == 2
+assert not any(move.get("narrow_feature_cleanup") for move in dogbone_relief_moves)
+dogbone_inline_moves = [
+    move for move in dogbone_relief_moves if move.get("inline_corner_relief")
+]
+assert dogbone_inline_moves
+assert all(move["type"] == "feed_cut" for move in dogbone_inline_moves)
+assert all(float(move["z"]) < 0.0 for move in dogbone_inline_moves)
+assert any(move.get("profile_id") == "external-0001" for move in dogbone_relief_moves)
+for move_index, move in enumerate(dogbone_relief_moves):
+    if not move.get("inline_corner_relief"):
+        continue
+    previous_move = dogbone_relief_moves[move_index - 1]
+    assert previous_move["type"] == "feed_cut", previous_move
+    assert abs(float(previous_move["z"]) - float(move["z"])) < 1.0e-9
+
+# A mesma garantia vale para o plano global usado pela Linha comum: T-bone não
+# abre uma nova operação e não ganha descida Z própria.
+dogbone_common_settings = dict(dogbone_relief_settings)
+dogbone_common_settings.update(
+    common_line_enabled=True,
+    common_line_mode="preserve_dimensions",
+    cut_depth_strategy="per_piece",
+)
+try:
+    dialog._active_geometry = lambda _operation_mode=None: dogbone_relief_geometry
+    dialog._use_vector_editor_for_cam = True
+    dialog._vector_editor_document = widget.document
+    dogbone_common_moves = dialog._build_moves_from_selection(
+        dogbone_common_settings
+    )
+finally:
+    dialog._active_geometry = original_active_geometry
+    dialog._use_vector_editor_for_cam = original_editor_source
+    dialog._vector_editor_document = original_vector_document
+assert dogbone_common_settings["_global_safe_entry_version"] == 8
+assert dogbone_common_settings["_narrow_feature_cleanup_paths"] == []
+assert len(dogbone_common_settings["_inline_corner_relief_paths"]) == 2
+assert not any(move.get("narrow_feature_cleanup") for move in dogbone_common_moves)
+assert any(move.get("inline_corner_relief") for move in dogbone_common_moves)
+for move_index, move in enumerate(dogbone_common_moves):
+    if not move.get("inline_corner_relief"):
+        continue
+    previous_move = dogbone_common_moves[move_index - 1]
+    assert previous_move["type"] == "feed_cut", previous_move
+    assert abs(float(previous_move["z"]) - float(move["z"])) < 1.0e-9
+
 assert feed_xy
 assert min(point[0] for point in feed_xy) == 140.0
 assert max(point[0] for point in feed_xy) == 240.0
@@ -1711,6 +1946,8 @@ internal_vector_document = first.getObject("WoodCAM2D_VectorDocument")
 assert internal_vector_document in list(parts_group.Group)
 if hasattr(internal_vector_document.ViewObject, "ShowInTree"):
     assert internal_vector_document.ViewObject.ShowInTree is False
+if hasattr(internal_vector_document.ViewObject, "Selectable"):
+    assert internal_vector_document.ViewObject.Selectable is False
 
 line_id = widget.controller.add_line(
     widget.controller.vec(10.0, 20.0),
@@ -1916,6 +2153,26 @@ assert all(
     for piece in restored_widget.document.pieces_by_id.values()
 )
 assert "aberto(s) não entraram" in restored_widget.mode_label.text()
+
+# Regressão da ação que parecia impossível de marcar: escolher o Editor como
+# fonte não é uma operação CAM e não pode ser recusado por uma linha aberta
+# solta. Sem seleção, o Corte valida e consome somente as Piece2D reconhecidas;
+# o vetor aberto continua intacto e visível no diagnóstico.
+previous_editor_source = dialog._use_vector_editor_for_cam
+restored_widget.controller.selection.clear()
+dialog._use_vector_editor_for_cam = False
+restored_widget.set_cam_source_active(False)
+restored_widget.use_cam_action.trigger()
+assert dialog._use_vector_editor_for_cam
+assert restored_widget.use_cam_action.isChecked()
+recognized_geometry_with_open_path = dialog._vector_editor_geometry_for_cam(
+    "cut",
+    ignore_selection=True,
+)
+assert recognized_geometry_with_open_path["contours"]
+assert open_entity_ids_before <= set(restored_widget.document.entities_by_id)
+dialog._use_vector_editor_for_cam = previous_editor_source
+restored_widget.set_cam_source_active(previous_editor_source)
 
 # O envio precisa reconstruir as relações Piece2D imediatamente antes de
 # materializar. Um desenho pode ganhar novas chapas/furos depois do último
@@ -2210,36 +2467,55 @@ except ValueError as error:
     assert "contornos originais são válidos" in message
     assert "diâmetro efetivo de 6.00 mm" in message
 
-# O mesmo contrato é aplicado antes do nesting. Assim, organizar e cortar em
-# seguida não produz um layout aceito no desenho e recusado após a compensação.
+# A folga do nesting é uma escolha do operador. Mesmo com um valor padrão de
+# Ø6 na aba Corte, o diálogo de organização não deve consultar essa fresa.
 original_common_enabled = dialog.cut_common_line_enabled.isChecked()
 original_common_mode = dialog.cut_common_line_mode_combo.currentIndex()
 original_cut_side = dialog.operation_combo.currentIndex()
+original_tool_index = dialog.operation_tool_combos["cut"].currentIndex()
 original_tool_diameter = dialog.operation_fields["cut"]["tool_diameter"].text()
 original_allowance = dialog.operation_fields["cut"]["cut_allowance_offset"].text()
 try:
     dialog.cut_common_line_enabled.setChecked(True)
     dialog.operation_combo.setCurrentIndex(0)
-    dialog.operation_fields["cut"]["tool_diameter"].setText("6")
+    six_mm_tool = next(
+        name for name, values in dialog.tool_database.items()
+        if abs(float(values["tool_diameter"]) - 6.0) <= 1.0e-9
+    )
+    dialog.operation_tool_combos["cut"].setCurrentText(six_mm_tool)
     dialog.operation_fields["cut"]["cut_allowance_offset"].setText("0")
     preserve_index = dialog.cut_common_line_mode_combo.findData("preserve_dimensions")
     dialog.cut_common_line_mode_combo.setCurrentIndex(preserve_index)
-    contract = dialog._vector_editor_nesting_cut_contract()
-    assert contract["recommended_spacing"] == 6.0
-    adjusted_spacing, adjustment = dialog._vector_editor_safe_nesting_spacing(0.0)
-    assert adjusted_spacing == 6.0
-    assert "ajustada" in adjustment
 
-    on_vector_index = dialog.cut_common_line_mode_combo.findData("on_vector")
-    dialog.cut_common_line_mode_combo.setCurrentIndex(on_vector_index)
-    contract = dialog._vector_editor_nesting_cut_contract()
-    assert contract["recommended_spacing"] == 0.0
-    assert dialog._vector_editor_safe_nesting_spacing(0.0)[0] == 0.0
-    assert dialog._vector_editor_safe_nesting_spacing(3.0)[0] == 6.0
+    # Reproduz o campo do diálogo: Ø6 mm selecionado, operador digita 4 mm,
+    # nenhum aviso de fresa aparece e a confirmação envia exatamente 4 mm.
+    original_organize = dialog._vector_editor_organize_pieces
+    organization_calls = []
+    dialog._vector_editor_organize_pieces = lambda *args, **kwargs: organization_calls.append((args, kwargs))
+    try:
+        def choose_four_mm():
+            choice_dialog = QtWidgets.QApplication.activeModalWidget()
+            assert isinstance(choice_dialog, QtWidgets.QDialog)
+            field = choice_dialog.findChildren(QtWidgets.QDoubleSpinBox)[0]
+            assert field.minimum() == 0.0
+            field.setValue(4.0)
+            assert field.value() == 4.0
+            assert not any(
+                "fresa" in label.text().lower() or "6.00 mm" in label.text()
+                for label in choice_dialog.findChildren(QtWidgets.QLabel)
+            )
+            choice_dialog.accept()
+
+        QtCore.QTimer.singleShot(0, choose_four_mm)
+        dialog._vector_editor_request_organize("fast")
+        assert organization_calls[0][1]["spacing"] == 4.0
+    finally:
+        dialog._vector_editor_organize_pieces = original_organize
 finally:
     dialog.cut_common_line_enabled.setChecked(original_common_enabled)
     dialog.cut_common_line_mode_combo.setCurrentIndex(original_common_mode)
     dialog.operation_combo.setCurrentIndex(original_cut_side)
+    dialog.operation_tool_combos["cut"].setCurrentIndex(original_tool_index)
     dialog.operation_fields["cut"]["tool_diameter"].setText(original_tool_diameter)
     dialog.operation_fields["cut"]["cut_allowance_offset"].setText(original_allowance)
 
@@ -2288,6 +2564,150 @@ flow_moves = dialog._build_common_line_outer_moves(
     (0.0, 0.0),
 )
 assert flow_moves
+
+# A opção de 4 mm realmente permite encaixar a 4 mm; a fresa atual de 6 mm
+# continua sujeita à validação do Corte, sem alterar o layout escolhido.
+tight_result = organize_pieces(
+    flow_pieces,
+    (0.0, 0.0, 178.0, 52.0),
+    spacing=4.0,
+    rotations={"flow-a": (0.0,), "flow-b": (0.0,)},
+    search_mode="fast",
+    toolpath_offset=0.0,
+)
+assert len(tight_result.placements) == 2
+tight_contours = [
+    [(x + placement.dx, y + placement.dy)
+     for x, y in flow_by_id[placement.piece_id].outer_points]
+    for placement in tight_result.placements
+]
+try:
+    dialog._build_common_line_outer_moves(
+        tight_contours, preserve_common_settings, 6.0, (0.0, 0.0)
+    )
+    raise AssertionError("a fresa de 6 mm aceitou peças separadas por 4 mm")
+except ValueError as error:
+    assert "diâmetro efetivo de 6.00 mm" in str(error)
+
+# Uma fronteira de Linha comum interrompida repetidamente por rasgos/dogbones
+# não pode desativar a deduplicação da chapa inteira nem transformar cada
+# alívio em uma nova entrada insegura. Os trechos compartilhados são cortados
+# uma vez; remanescentes desconectados retraem e reposicionam em Z seguro.
+interrupted_a = [
+    (0.0, 0.0), (100.0, 0.0),
+    (100.0, 80.0), (90.0, 80.0), (90.0, 100.0), (100.0, 100.0),
+    (100.0, 180.0), (90.0, 180.0), (90.0, 200.0), (100.0, 200.0),
+    (100.0, 300.0), (0.0, 300.0),
+]
+interrupted_b = [
+    (104.0, 0.0), (204.0, 0.0), (204.0, 300.0), (104.0, 300.0),
+    (104.0, 200.0), (114.0, 200.0), (114.0, 180.0), (104.0, 180.0),
+    (104.0, 100.0), (114.0, 100.0), (114.0, 80.0), (104.0, 80.0),
+]
+interrupted_settings = dict(editor_cut_settings)
+interrupted_settings.update(
+    common_line_enabled=True,
+    common_line_mode="preserve_dimensions",
+    common_line_tolerance=0.2,
+    outer_cut_side=ui.CUT_SIDE_OUTSIDE,
+    cut_side=ui.CUT_SIDE_OUTSIDE,
+    cut_depth_strategy="piece_bidirectional",
+    cut_tabs_enabled=False,
+    tool_diameter=4.0,
+    final_depth=16.2,
+    material_thickness=15.0,
+    start_depth=0.0,
+    pass_depths=(5.4, 5.4, 5.4),
+    return_to_start=False,
+    use_ramp=False,
+    ramp_length=0.0,
+)
+interrupted_moves = dialog._build_global_cut_stage_moves(
+    [interrupted_a, interrupted_b],
+    [],
+    interrupted_settings,
+    4.0,
+    (0.0, 0.0),
+)
+interrupted_summary = interrupted_settings["_global_cut_plan_summary"]
+assert interrupted_summary["common_line_fragmented_pairs"]
+assert interrupted_summary["shared_segment_count"] == 3
+assert len(interrupted_summary["operation_sequence"]) == 12
+assert all(
+    metric["shared_cut_savings"] == 272.0
+    and metric["shared_segments_reused"] == 3
+    and metric["duplicate_physical_segment_count"] == 0
+    for metric in interrupted_summary["route_metrics"]
+)
+interrupted_entries = [
+    move
+    for move in interrupted_moves
+    if move.get("type") == "rapid"
+    and move.get("x") is not None
+    and move.get("y") is not None
+    and move.get("global_cut")
+]
+assert len(interrupted_entries) == 4, interrupted_entries
+assert all(
+    abs(float(move.get("z")) - float(interrupted_settings["safe_height"])) < 1.0e-9
+    for move in interrupted_entries
+)
+assert not any(move.get("cleared_path_link") for move in interrupted_moves)
+assert sum(
+    move.get("type") == "rapid" and move.get("x") is None
+    for move in interrupted_moves
+) == 4
+
+# Um alívio pertence à peça e à profundidade, não a cada trail fragmentado
+# dessa peça. Inserir o mesmo Dogbone em todos os três remanescentes criava
+# cordas de avanço atravessando a peça inteira.
+fragment_relief_settings = dict(interrupted_settings)
+fragment_relief_settings["_inline_corner_relief_paths"] = [
+    {
+        "contour_index": 1,
+        "points": [[102.0, 98.0], [110.0, 98.0]],
+        "mode": "inline_corner_relief",
+    }
+]
+fragment_relief_moves = dialog._insert_inline_corner_relief_moves(
+    interrupted_moves,
+    fragment_relief_settings,
+)
+fragment_relief_starts = []
+previous_xy = None
+previous_inline = False
+for move in fragment_relief_moves:
+    if move.get("x") is None or move.get("y") is None:
+        continue
+    current_xy = (float(move["x"]), float(move["y"]))
+    if move.get("inline_corner_relief") and not previous_inline:
+        assert previous_xy is not None
+        fragment_relief_starts.append(
+            math.hypot(
+                current_xy[0] - previous_xy[0],
+                current_xy[1] - previous_xy[1],
+            )
+        )
+    previous_xy = current_xy
+    previous_inline = bool(move.get("inline_corner_relief"))
+assert len(fragment_relief_starts) == 3, fragment_relief_starts
+assert max(fragment_relief_starts) <= 8.0 + 1.0e-6, fragment_relief_starts
+far_fragment_relief_settings = dict(interrupted_settings)
+far_fragment_relief_settings["_inline_corner_relief_paths"] = [
+    {
+        "contour_index": 1,
+        "points": [[10000.0, 10000.0], [10008.0, 10000.0]],
+        "mode": "inline_corner_relief",
+    }
+]
+try:
+    dialog._insert_inline_corner_relief_moves(
+        interrupted_moves,
+        far_fragment_relief_settings,
+    )
+    raise AssertionError("alívio distante criou uma corda de avanço")
+except ValueError as error:
+    assert "não será ligado por uma reta através da peça" in str(error)
 assert any(move.get("tab") for move in flow_moves)
 
 # Reproduz a topologia da captura relatada dentro do diálogo real: painel com
@@ -2300,7 +2720,10 @@ reported_result = organize_pieces(
     spacing=4.0,
     rotations={piece.piece_id: (0.0,) for piece in reported_pieces},
     search_mode="fast",
-    search_budget=(4, 2, 1, 1),
+    # Este trecho exercita especificamente a geração por linha comum; o
+    # comparador retangular conserva os contatos exatos de 4 mm da fixture.
+    # O raster pode vencer com folgas maiores e legitimamente não ter contato.
+    search_budget=(4, 0, 1, 1),
     toolpath_offset=2.0,
 )
 assert len(reported_result.placements) == 11
@@ -2912,6 +3335,28 @@ try:
     workflow_widget.controller.execute(ui.DeleteEntitiesCommand((remnant_cut.id,)))
     workflow_widget.controller.selection.select_only(manual_tab_group.id)
 
+    # A linha interna destacada pelo diagnóstico não pode impedir a ativação
+    # da fonte CAM. A seleção da marcação só volta a importar quando uma
+    # operação explícita for criada.
+    diagnostic_marking = ui.PathEntity.from_points(
+        workflow_widget.document.active_layer_id,
+        (ui.Vec2(20.0, 20.0), ui.Vec2(40.0, 20.0)),
+        metadata={"woodcam_role": "piece_marking"},
+    )
+    workflow_widget.controller.execute(
+        ui.AddEntitiesCommand((diagnostic_marking,))
+    )
+    workflow_widget.controller.selection.select_only(diagnostic_marking.id)
+    dialog._use_vector_editor_for_cam = False
+    workflow_widget.set_cam_source_active(False)
+    workflow_widget.use_cam_action.trigger()
+    assert dialog._use_vector_editor_for_cam
+    assert workflow_widget.use_cam_action.isChecked()
+    workflow_widget.controller.execute(
+        ui.DeleteEntitiesCommand((diagnostic_marking.id,))
+    )
+    workflow_widget.controller.selection.select_only(manual_tab_group.id)
+
     # Reproduz a chapa inteira mostrada na captura: três marcas em uma peça
     # continuam três tabs físicas, sem serem projetadas sobre cada perfil.
     manual_sheet_moves = build_external_cut_job(
@@ -2965,7 +3410,7 @@ finally:
 
 dialog.operation_tabs.setCurrentIndex(dialog._tab_index("Corte"))
 dialog.operation_combo.setCurrentIndex(0)
-dialog.operation_fields["cut"]["tool_diameter"].setText("6")
+dialog.operation_tool_combos["cut"].setCurrentText(six_mm_tool)
 dialog.operation_fields["cut"]["cut_allowance_offset"].setText("0")
 dialog.operation_fields["cut"]["start_depth"].setText("0")
 dialog.operation_fields["cut"]["cut_depth"].setText("15.5")
@@ -2997,7 +3442,7 @@ dialog.operation_fields["cut"]["tab_length"].setText("8")
 dialog.operation_fields["cut"]["tab_thickness"].setText("3")
 dialog._vector_editor_organize_pieces(
     search_mode="fast",
-    spacing=0.0,
+    spacing=6.0,
     time_budget_seconds=2,
 )
 assert wait_until(lambda: workflow_widget.workflow_preview_bar.is_active)
@@ -3095,12 +3540,13 @@ first_intermediate_ramp_end = next(
     if move.get("entry_ramp")
     and move.get("routing_mode") == "piece_bidirectional"
 )
-# A aproximação segura da rampa suave começa adiante no trail; quem deve
-# permanecer ancorado à origem configurada é o fim da rampa/início do corte.
+# A entrada otimizada não pode voltar ao vértice de origem só porque ele é o
+# ponto mais próximo. O primeiro movimento da rampa já pertence à reta segura
+# escolhida no meio do perfil.
 assert math.hypot(
     float(first_intermediate_ramp_end["x"]),
     float(first_intermediate_ramp_end["y"]),
-) < 10.0, (
+) > 12.0, (
     first_intermediate_ramp_end
 )
 ramp_end_by_operation = {}
@@ -3262,6 +3708,41 @@ assert any(
 )
 assert any(move.get("ramp_fallback") for move in direct_ramps)
 
+# Variante opt-in: os remanescentes repetem a direção e retornam em Z seguro.
+previous_direction_index = dialog.cut_depth_strategy_combo.currentIndex()
+try:
+    dialog.cut_depth_strategy_combo.setCurrentIndex(
+        dialog.cut_depth_strategy_combo.findData("piece_unidirectional")
+    )
+    assert dialog.cut_depth_strategy_combo.currentText().endswith("sentido único")
+    assert dialog._collect_settings()["cut_depth_strategy"] == "piece_unidirectional"
+finally:
+    dialog.cut_depth_strategy_combo.setCurrentIndex(previous_direction_index)
+one_way_settings = dict(direct_settings)
+one_way_settings["cut_depth_strategy"] = "piece_unidirectional"
+one_way_settings["use_ramp"] = False
+previous_editor_source = dialog._use_vector_editor_for_cam
+try:
+    dialog._use_vector_editor_for_cam = True
+    one_way_moves = dialog._build_moves_with_intersection_confirmation(one_way_settings)
+finally:
+    dialog._use_vector_editor_for_cam = previous_editor_source
+assert one_way_settings["_global_cut_plan_summary"]["strategy"] == "piece_unidirectional"
+one_way_open = {}
+for move in one_way_moves:
+    if move.get("routing_mode") == "piece_unidirectional" and not move.get("physical_trail_closed"):
+        one_way_open.setdefault(move["cut_operation_id"], []).append(move)
+assert one_way_open
+one_way_signatures = {}
+for group in one_way_open.values():
+    assert group[0]["type"] == "rapid" and group[0]["x"] is not None
+    assert group[-1]["type"] == "rapid" and group[-1]["x"] is None
+    assert group[0]["z"] == group[-1]["z"]
+    key = tuple(sorted(group[0]["segment_ids"]))
+    signature = (group[0]["x"], group[0]["y"], group[0]["trail_reversed"], tuple(group[0]["segment_ids"]))
+    assert one_way_signatures.setdefault(key, signature) == signature
+assert not any(move.get("cleared_path_link") for move in one_way_moves)
+
 for previous, current in zip(workflow_moves, workflow_moves[1:]):
     assert not (
         previous.get("type") == current.get("type") == "feed_plunge"
@@ -3295,9 +3776,9 @@ workflow_widget.view.centerOn(QtCore.QPointF(89.0, 49.0))
 app.processEvents()
 assert workflow_widget.grab().save("/tmp/woodcam_hybrid_editor_flow.png")
 
-# Regressão relatada pelo operador: depois de aplicar um Corte, voltar ao
-# Editor 2D e pedir Percursos 2D deve reutilizar os movimentos persistidos.
-# A seleção vetorial atual pode ter mudado e não deve disparar um recálculo.
+# Uma operação persistida pode continuar selecionada na lista invisível depois
+# de aplicar. No Editor 2D, pedir Percursos 2D significa calcular a configuração
+# e a geometria atuais; somente a página Simulação/G-code lê a lista aplicada.
 persisted_workflow_operation = dialog._create_applied_operation(
     workflow_settings,
     workflow_moves,
@@ -3315,22 +3796,75 @@ assert sum(
 dialog._refresh_applied_operation_list()
 previous_workflow_tab = dialog.operation_tabs.currentIndex()
 original_workflow_builder = dialog._build_moves_with_intersection_confirmation
+fresh_preview_calls = []
+fresh_preview_moves = [
+    {"type": "rapid", "x": 123.0, "y": 45.0, "z": 8.0},
+    {"type": "feed_plunge", "x": 123.0, "y": 45.0, "z": -1.0},
+    {"type": "feed_cut", "x": 124.0, "y": 45.0, "z": -1.0},
+]
 try:
     dialog.operation_tabs.setCurrentIndex(dialog._tab_index("Editor 2D"))
-    dialog._build_moves_with_intersection_confirmation = lambda _settings: (
-        (_ for _ in ()).throw(
-            AssertionError("Percurso aplicado foi recalculado pela seleção atual")
-        )
+    dialog._build_moves_with_intersection_confirmation = lambda settings: (
+        fresh_preview_calls.append(dict(settings)) or fresh_preview_moves
     )
-    persisted_settings, persisted_moves = (
+    current_settings, current_moves = (
         dialog._operation_settings_and_moves_for_editor_preview("cut")
     )
 finally:
     dialog._build_moves_with_intersection_confirmation = original_workflow_builder
     dialog.operation_tabs.setCurrentIndex(previous_workflow_tab)
-assert persisted_settings["operation_mode"] == "cut"
-assert persisted_moves == json.loads(json.dumps(workflow_moves))
+assert current_settings["operation_mode"] == "cut"
+assert current_moves == fresh_preview_moves
+assert len(fresh_preview_calls) == 1
 assert persisted_workflow_operation.MoveCount == len(workflow_moves)
+
+# O mesmo contrato vale quando o tipo pedido não é o último formulário CAM:
+# nem uma operação antiga daquele tipo pode ser reaproveitada fora da página
+# Simulação/G-code; o diálogo visita a aba correta e calcula a prévia corrente.
+stale_hole_settings = dict(workflow_settings)
+stale_hole_settings.update(
+    operation_mode="holes",
+    _geometry_stale=True,
+)
+stale_hole_moves = [
+    {"type": "rapid", "x": 900.0, "y": 900.0, "z": 8.0},
+    {"type": "feed_plunge", "x": 900.0, "y": 900.0, "z": -1.0},
+]
+original_all_applied_entries = dialog._all_applied_entries
+original_selected_applied_entries = dialog._selected_applied_entries
+original_workflow_builder = dialog._build_moves_with_intersection_confirmation
+fresh_hole_calls = []
+fresh_hole_moves = [
+    {"type": "rapid", "x": 80.0, "y": 80.0, "z": 8.0},
+    {"type": "feed_plunge", "x": 80.0, "y": 80.0, "z": -1.0},
+]
+previous_workflow_tab = dialog.operation_tabs.currentIndex()
+try:
+    dialog.operation_tabs.setCurrentIndex(dialog._tab_index("Editor 2D"))
+    dialog._all_applied_entries = lambda: [
+        (stale_hole_settings, stale_hole_moves, "Furo antigo")
+    ]
+    dialog._selected_applied_entries = lambda: []
+    dialog._build_moves_with_intersection_confirmation = lambda settings: (
+        fresh_hole_calls.append(dict(settings)) or fresh_hole_moves
+    )
+    current_hole_settings, current_hole_moves = (
+        dialog._operation_settings_and_moves_for_editor_preview("holes")
+    )
+    dialog.operation_tabs.setCurrentIndex(dialog._tab_index(ui.ACTION_TAB_TITLE))
+    simulation_hole_settings, simulation_hole_moves = (
+        dialog._operation_settings_and_moves_for_editor_preview("holes")
+    )
+finally:
+    dialog._all_applied_entries = original_all_applied_entries
+    dialog._selected_applied_entries = original_selected_applied_entries
+    dialog._build_moves_with_intersection_confirmation = original_workflow_builder
+    dialog.operation_tabs.setCurrentIndex(previous_workflow_tab)
+assert current_hole_settings["operation_mode"] == "holes"
+assert current_hole_moves == fresh_hole_moves
+assert simulation_hole_settings["operation_mode"] == "holes"
+assert simulation_hole_moves == fresh_hole_moves
+assert len(fresh_hole_calls) == 2
 
 if getattr(dialog, "_vector_editor_nesting_session", None) is not None:
     dialog._cancel_vector_editor_nesting_search(keep_preview=True)
@@ -3401,6 +3935,101 @@ assert len(circle_as_hole["holes"]) == 1, circle_as_hole
 assert not circle_as_hole["contours"], circle_as_hole
 assert not circle_as_pocket["holes"], circle_as_pocket
 assert len(circle_as_pocket["contours"]) == 1, circle_as_pocket
+
+# O SVG LR4 importa seus furos circulares como PathEntity. Selecionar todos os
+# vetores ou somente o contorno externo da Piece2D precisa encontrar o mesmo
+# furo; uma marcação aberta vinculada não pertence à operação de Furo.
+selected_piece_outer = ui.PathEntity.from_points(
+    workflow_widget.document.active_layer_id,
+    (
+        ui.Vec2(1020.0, 900.0),
+        ui.Vec2(1080.0, 900.0),
+        ui.Vec2(1080.0, 940.0),
+        ui.Vec2(1020.0, 940.0),
+    ),
+    closed=True,
+)
+selected_piece_hole = ui.PathEntity.from_points(
+    workflow_widget.document.active_layer_id,
+    tuple(
+        ui.Vec2(
+            1050.0 + 5.0 * math.cos(math.tau * index / 16.0),
+            920.0 + 5.0 * math.sin(math.tau * index / 16.0),
+        )
+        for index in range(16)
+    ),
+    closed=True,
+)
+selected_piece_marking = ui.PathEntity.from_points(
+    workflow_widget.document.active_layer_id,
+    (ui.Vec2(1035.0, 920.0), ui.Vec2(1042.0, 920.0)),
+    metadata={"woodcam_role": "piece_marking"},
+)
+dogbone_circle_candidate = ui.PathEntity.from_points(
+    workflow_widget.document.active_layer_id,
+    tuple(
+        ui.Vec2(
+            1100.0 + 1.5875 * math.cos(math.tau * index / 16.0),
+            920.0 + 1.5875 * math.sin(math.tau * index / 16.0),
+        )
+        for index in range(16)
+    ),
+    closed=True,
+)
+workflow_widget.controller.execute(
+    ui.AddEntitiesCommand(
+        (
+            selected_piece_outer,
+            selected_piece_hole,
+            selected_piece_marking,
+            dogbone_circle_candidate,
+        )
+    )
+)
+existing_pieces = tuple(workflow_widget.document.pieces_by_id.values())
+workflow_widget.controller.execute(
+    ui.ReplacePiecesCommand(
+        existing_pieces
+        + (
+            ui.Piece2D(
+                "Peça com furo SVG",
+                selected_piece_outer.id,
+                (selected_piece_hole.id,),
+                metadata={"marking_path_ids": [selected_piece_marking.id]},
+            ),
+            ui.Piece2D(
+                "Alívio circular externo",
+                dogbone_circle_candidate.id,
+            ),
+        )
+    )
+)
+workflow_widget.controller.selection.select_only(selected_piece_outer.id)
+selected_piece_geometry = dialog._vector_editor_geometry_for_cam("holes")
+assert len(selected_piece_geometry["holes"]) == 1, selected_piece_geometry
+assert not selected_piece_geometry["contours"], selected_piece_geometry
+
+workflow_widget.controller.selection.replace(
+    (
+        selected_piece_outer.id,
+        selected_piece_hole.id,
+        selected_piece_marking.id,
+        dogbone_circle_candidate.id,
+    )
+)
+selected_svg_paths_geometry = dialog._vector_editor_geometry_for_cam("holes")
+assert len(selected_svg_paths_geometry["holes"]) == 1, selected_svg_paths_geometry
+assert not selected_svg_paths_geometry["contours"], selected_svg_paths_geometry
+workflow_widget.controller.selection.clear()
+all_piece_holes_geometry = dialog._vector_editor_geometry_for_cam("holes")
+assert all_piece_holes_geometry["holes"], all_piece_holes_geometry
+assert not all_piece_holes_geometry["contours"], all_piece_holes_geometry
+all_piece_hole_centres = {
+    (round(float(hole["x"]), 4), round(float(hole["y"]), 4))
+    for hole in all_piece_holes_geometry["holes"]
+}
+assert (1050.0, 920.0) in all_piece_hole_centres, all_piece_hole_centres
+assert (1100.0, 920.0) not in all_piece_hole_centres, all_piece_hole_centres
 workflow_widget.controller.selection.select_only(pocket_entity.id)
 dialog._vector_editor_configure_toolpath("pocket")
 assert float(dialog.operation_fields["pocket"]["cut_depth"].text()) == 5.0
@@ -3415,6 +4044,9 @@ assert dialog.cut_depth_strategy_combo.itemText(
 assert dialog.cut_depth_strategy_combo.itemText(
     dialog.cut_depth_strategy_combo.findData("hybrid_piece_bidirectional")
 ).startswith("Final pass at the end")
+assert dialog.cut_depth_strategy_combo.itemText(
+    dialog.cut_depth_strategy_combo.findData("piece_unidirectional")
+).endswith("single direction")
 assert workflow_widget.properties_panel.apply_scale_button.text() == "Apply scale"
 advisor_settings = dialog._collect_settings()
 advisor_report = dialog._update_cam_advisor_summary(advisor_settings)
@@ -3453,6 +4085,78 @@ finally:
     QtWidgets.QMessageBox.critical = original_critical
     QtWidgets.QMessageBox.warning = original_warning
     QtWidgets.QMessageBox.information = original_information
+# Save/reopen and Edit preserve the new choice and the exact applied moves.
+import tempfile
+with tempfile.TemporaryDirectory(prefix="woodcam-one-way-") as tmp:
+    saved_doc = FreeCAD.newDocument("OneWayPersistence")
+    saved_operation = dialog._create_applied_operation(
+        one_way_settings, one_way_moves, selection_snapshot=[])
+    saved_name = saved_operation.Name
+    saved_path = str(Path(tmp) / "one-way.FCStd")
+    saved_doc.recompute()
+    saved_doc.saveAs(saved_path)
+    FreeCAD.closeDocument(saved_doc.Name)
+    reopened = FreeCAD.openDocument(saved_path)
+    restored = reopened.getObject(saved_name)
+    assert json.loads(restored.SettingsJSON)["cut_depth_strategy"] == "piece_unidirectional"
+    assert decode_moves(restored.MovesCompressedBase64) == json.loads(json.dumps(one_way_moves))
+    dialog._load_selected_operation_for_editing(restored)
+    assert dialog.cut_depth_strategy_combo.currentData() == "piece_unidirectional"
+    assert dialog._collect_settings()["cut_depth_strategy"] == "piece_unidirectional"
+    dialog._cancel_operation_editing()
+    FreeCAD.closeDocument(reopened.Name)
+FreeCAD.setActiveDocument(workflow_doc.Name)
+# Excluir o cache vetorial pela árvore deve limpar o Editor e continuar limpo
+# depois de trocar de documento. O switch não pode recriar o objeto removido.
+deleted_feature_doc = FreeCAD.newDocument("DeletedVectorFeatureSmoke")
+FreeCAD.setActiveDocument(deleted_feature_doc.Name)
+assert dialog._reload_vector_editor_for_active_document(deleted_feature_doc)
+deleted_feature_widget = dialog.vector_editor_widget
+deleted_line = deleted_feature_widget.controller.add_line(
+    deleted_feature_widget.controller.vec(0.0, 0.0),
+    deleted_feature_widget.controller.vec(50.0, 0.0),
+)
+assert deleted_line in deleted_feature_widget.document.entities_by_id
+deleted_feature = deleted_feature_doc.getObject("WoodCAM2D_VectorDocument")
+assert deleted_feature is not None and len(deleted_feature.Shape.Edges) == 1
+deleted_feature_widget.controller.selection.select_only(deleted_line)
+assert deleted_feature_widget.delete_selected()
+assert not deleted_feature_widget.document.entities_by_id
+assert not deleted_feature_doc.getObject("WoodCAM2D_VectorDocument").Shape.Edges
+deleted_feature_widget.undo()
+assert deleted_line in deleted_feature_widget.document.entities_by_id
+deleted_feature_doc.openTransaction("Remove WoodCAM vector feature")
+deleted_feature_doc.removeObject(deleted_feature.Name)
+deleted_feature_doc.commitTransaction()
+dialog._sync_vector_editor_from_freecad_history()
+app.processEvents()
+assert not deleted_feature_widget.document.entities_by_id
+FreeCAD.setActiveDocument(workflow_doc.Name)
+assert dialog._reload_vector_editor_for_active_document(workflow_doc)
+assert deleted_feature_doc.getObject("WoodCAM2D_VectorDocument") is None
+FreeCAD.setActiveDocument(deleted_feature_doc.Name)
+assert dialog._reload_vector_editor_for_active_document(deleted_feature_doc)
+assert not dialog.vector_editor_widget.document.entities_by_id
+assert deleted_feature_doc.getObject("WoodCAM2D_VectorDocument") is None
+# The feature can also be deleted while its editor is inactive.  Its cached
+# prior snapshot must not be used when the document becomes active again.
+inactive_line = dialog.vector_editor_widget.controller.add_line(
+    dialog.vector_editor_widget.controller.vec(0.0, 10.0),
+    dialog.vector_editor_widget.controller.vec(50.0, 10.0),
+)
+assert inactive_line in dialog.vector_editor_widget.document.entities_by_id
+FreeCAD.setActiveDocument(workflow_doc.Name)
+assert dialog._reload_vector_editor_for_active_document(workflow_doc)
+deleted_feature_doc.openTransaction("Remove inactive vector feature")
+deleted_feature_doc.removeObject("WoodCAM2D_VectorDocument")
+deleted_feature_doc.commitTransaction()
+FreeCAD.setActiveDocument(deleted_feature_doc.Name)
+assert dialog._reload_vector_editor_for_active_document(deleted_feature_doc)
+assert not dialog.vector_editor_widget.document.entities_by_id
+assert deleted_feature_doc.getObject("WoodCAM2D_VectorDocument") is None
+FreeCAD.setActiveDocument(workflow_doc.Name)
+assert dialog._reload_vector_editor_for_active_document(workflow_doc)
+FreeCAD.closeDocument(deleted_feature_doc.Name)
 dialog.hide()
 app.processEvents()
 FreeCAD.closeDocument(workflow_doc.Name)

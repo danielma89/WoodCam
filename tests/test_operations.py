@@ -262,6 +262,71 @@ class OperationsTest(unittest.TestCase):
         ]
         self.assertIsNone(external_compensation_detail_loss(wide_slot, 4.0))
 
+    def test_external_compensation_keeps_svg_dogbone_on_main_profile(self):
+        # Reduced copy of the 3.175 mm Dogbone used by the reported table SVG.
+        # With a Ø4 cutter it must not become an independent plunge/cleanup
+        # cycle; the caller splices its residual stroke into the engaged
+        # outside profile at the same Z.
+        dogbone_relief = [
+            (0.0, 0.0), (0.0, 15.5), (47.754936, 15.5),
+            (48.032867, 15.278357), (48.35315, 15.124117),
+            (48.699724, 15.045014), (49.055212, 15.045014),
+            (49.401786, 15.124117), (49.722069, 15.278357),
+            (50.0, 15.5), (50.221643, 15.777931),
+            (50.375883, 16.098214), (50.454986, 16.444788),
+            (50.454986, 16.800276), (50.375883, 17.14685),
+            (50.221643, 17.467133), (50.0, 17.745064),
+            (50.0, 28.754936), (50.221643, 29.032867),
+            (50.375883, 29.35315), (50.454986, 29.699724),
+            (50.454986, 30.055212), (50.375883, 30.401786),
+            (50.221643, 30.722069), (50.0, 31.0),
+            (49.722069, 31.221643), (49.401786, 31.375883),
+            (49.055212, 31.454986), (48.699724, 31.454986),
+            (48.35315, 31.375883), (48.032867, 31.221643),
+            (47.754936, 31.0), (0.0, 31.0), (0.0, 46.5),
+            (100.0, 46.5), (100.0, 0.0),
+        ]
+
+        issue = external_compensation_detail_loss(dogbone_relief, 4.0)
+
+        self.assertIsNotNone(issue)
+        self.assertEqual(issue["cleanup_paths"], ())
+        self.assertEqual(len(issue["profile_relief_paths"]), 2)
+        self.assertTrue(
+            all(
+                len(path) == 2
+                and sum(
+                    math.hypot(
+                        path[index + 1][0] - path[index][0],
+                        path[index + 1][1] - path[index][1],
+                    )
+                    for index in range(len(path) - 1)
+                ) < 2.0
+                for path in issue["profile_relief_paths"]
+            )
+        )
+
+    def test_external_compensation_still_reports_short_straight_slot(self):
+        short_slot = [
+            (0.0, 0.0),
+            (100.0, 0.0),
+            (100.0, 100.0),
+            (52.0, 100.0),
+            (52.0, 99.0),
+            (50.0, 99.0),
+            (50.0, 100.0),
+            (0.0, 100.0),
+        ]
+
+        issue = external_compensation_detail_loss(short_slot, 4.0)
+
+        self.assertIsNotNone(issue)
+        self.assertEqual(issue["cleanup_modes"], ("slot_centerline",))
+        self.assertEqual(
+            issue["cleanup_paths"],
+            (((51.0, 100.0), (51.0, 99.0)),),
+        )
+
     def test_drilling_ignores_hole_diameter_and_uses_center(self):
         holes = [
             {"x": 20.0, "y": 30.0, "diameter_mm": 3.0, "depth_mm": 10.0},
@@ -328,6 +393,23 @@ class OperationsTest(unittest.TestCase):
         )
         self.assertAlmostEqual(max_radius, 2.0, places=6)
         self.assertAlmostEqual(min(move["z"] for move in cutting_moves), -6.0)
+
+    def test_nominal_import_rounding_does_not_create_microscopic_helix(self):
+        moves = build_drill_moves(
+            [{"x": 20.0, "y": 30.0, "diameter_mm": 3.1755}],
+            final_depth=10.0,
+            stepdown=3.0,
+            safe_height=8.0,
+            tool_diameter=3.175,
+            material_thickness=10.0,
+            use_helical=True,
+        )
+
+        self.assertFalse(any(move["type"] == "feed_helix" for move in moves))
+        self.assertEqual(
+            [(move["x"], move["y"]) for move in moves if move["type"] == "feed_drill"],
+            [(20.0, 30.0)],
+        )
 
     def test_equal_or_larger_tool_keeps_vertical_stepdown(self):
         holes = [
@@ -630,6 +712,14 @@ class OperationsTest(unittest.TestCase):
         external, internal = split_nested_contours([outer, hole, separate])
 
         self.assertEqual(external, [outer, separate])
+        self.assertEqual(internal, [hole])
+
+        # Cutting only the slot must retain its role from the full drawing;
+        # otherwise CAM offsets it outward and treats it as a separate piece.
+        external, internal = split_nested_contours(
+            [hole], reference_contours=[outer, hole, separate]
+        )
+        self.assertEqual(external, [])
         self.assertEqual(internal, [hole])
 
     def test_offset_pocket_clears_area_at_every_depth_layer(self):

@@ -2,6 +2,7 @@ import FreeCAD
 import Part
 import os
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(
     0,
@@ -367,6 +368,101 @@ tree_classification = classify_document_pieces(_TreeImportDocument(tree_result.e
 assert len(tree_classification.pieces) == 2, tree_classification
 assert all(len(piece.inner_ids) == 1 for piece in tree_classification.pieces), tree_classification
 FreeCAD.closeDocument(tree_document.Name)
+
+# Painéis opostos com furos passantes devem ser projetados a partir das faces
+# externas. Um rebaixo gerado depois pelo CAM precisa cair na face correta de
+# cada peça; usar +Y para ambos faz duas cópias visuais do mesmo lado.
+mirrored_document = FreeCAD.newDocument("WoodCAMMirroredFacesSmoke")
+mirrored_root = mirrored_document.addObject("App::DocumentObjectGroup", "MirroredPair")
+for suffix, y_start in (("Left", -35.0), ("Right", 20.0)):
+    leaf = mirrored_document.addObject("PartDesign::Feature", "Panel" + suffix)
+    blank = Part.makeBox(100, 15, 200, FreeCAD.Vector(0, y_start, 0))
+    through_hole = Part.makeCylinder(
+        2, 15, FreeCAD.Vector(20, y_start, 50), FreeCAD.Vector(0, 1, 0)
+    )
+    leaf.Shape = blank.cut(through_hole)
+    mirrored_root.addObject(leaf)
+mirrored_document.recompute()
+volumes_before = tuple(round(float(obj.Shape.Volume), 8) for obj in mirrored_root.Group)
+mirrored_result = import_freecad_tree(
+    (mirrored_root,), layer_id="layer", flatten_solids=True
+)
+mirrored_holes = {
+    entity.metadata["source_tree_instance_id"].split(":")[1]: entity
+    for entity in mirrored_result.entities
+    if type(entity).__name__ == "CircleEntity"
+}
+mirrored_outlines = {
+    entity.metadata["source_tree_instance_id"].split(":")[1]: entity
+    for entity in mirrored_result.entities
+    if type(entity).__name__ == "PathEntity" and entity.closed
+}
+assert set(mirrored_holes) == {"PanelLeft", "PanelRight"}, mirrored_result
+assert set(mirrored_outlines) == set(mirrored_holes), mirrored_result
+left_hole_x = mirrored_holes["PanelLeft"].center.x - mirrored_outlines["PanelLeft"].bounds().min_x
+right_hole_x = mirrored_holes["PanelRight"].center.x - mirrored_outlines["PanelRight"].bounds().min_x
+assert sorted((round(left_hole_x, 5), round(right_hole_x, 5))) == [50.0, 150.0], (
+    left_hole_x, right_hole_x
+)
+assert tuple(round(float(obj.Shape.Volume), 8) for obj in mirrored_root.Group) == volumes_before
+panelnest_exact = WoodCAM2DDialog._panelnest_exact_source_entities(
+    (SimpleNamespace(object_name="PanelLeft"), SimpleNamespace(object_name="PanelRight")),
+    layer_id="layer",
+)
+assert set(panelnest_exact) == {"PanelLeft", "PanelRight"}, panelnest_exact
+panelnest_hole_offsets = []
+for name in ("PanelLeft", "PanelRight"):
+    entities = panelnest_exact[name]
+    hole = next(entity for entity in entities if type(entity).__name__ == "CircleEntity")
+    outline = next(
+        entity for entity in entities
+        if type(entity).__name__ == "PathEntity" and entity.closed
+    )
+    panelnest_hole_offsets.append(round(hole.center.x - outline.bounds().min_x, 5))
+assert sorted(panelnest_hole_offsets) == [50.0, 150.0], panelnest_hole_offsets
+FreeCAD.closeDocument(mirrored_document.Name)
+
+# O mesmo contrato vale para painéis horizontais: a face inferior precisa de
+# projeção espelhada, embora o sólido já esteja paralelo ao XY global.
+horizontal_document = FreeCAD.newDocument("WoodCAMHorizontalFacesSmoke")
+horizontal_root = horizontal_document.addObject("App::DocumentObjectGroup", "HorizontalPair")
+for suffix, z_start in (("Lower", -35.0), ("Upper", 20.0)):
+    leaf = horizontal_document.addObject("PartDesign::Feature", "Board" + suffix)
+    blank = Part.makeBox(100, 200, 15, FreeCAD.Vector(0, 0, z_start))
+    through_hole = Part.makeCylinder(
+        2, 15, FreeCAD.Vector(20, 50, z_start), FreeCAD.Vector(0, 0, 1)
+    )
+    leaf.Shape = blank.cut(through_hole)
+    horizontal_root.addObject(leaf)
+horizontal_document.recompute()
+horizontal_result = import_freecad_tree(
+    (horizontal_root,), layer_id="layer", flatten_solids=True
+)
+horizontal_holes = {
+    entity.metadata["source_tree_instance_id"].split(":")[1]: entity
+    for entity in horizontal_result.entities
+    if type(entity).__name__ == "CircleEntity"
+}
+horizontal_outlines = {
+    entity.metadata["source_tree_instance_id"].split(":")[1]: entity
+    for entity in horizontal_result.entities
+    if type(entity).__name__ == "PathEntity" and entity.closed
+}
+assert set(horizontal_holes) == {"BoardLower", "BoardUpper"}, horizontal_result
+relative_holes = [
+    (
+        round(hole.center.x - horizontal_outlines[name].bounds().min_x, 5),
+        round(hole.center.y - horizontal_outlines[name].bounds().min_y, 5),
+    )
+    for name, hole in horizontal_holes.items()
+]
+assert sorted(relative_holes) == [(20.0, 50.0), (20.0, 150.0)], relative_holes
+assert all(
+    round(outline.bounds().width, 5) == 100.0
+    and round(outline.bounds().height, 5) == 200.0
+    for outline in horizontal_outlines.values()
+), horizontal_outlines
+FreeCAD.closeDocument(horizontal_document.Name)
 
 # Um único nó gerado pode conter várias chapas físicas.  Se duas delas têm o
 # mesmo XY mas estão em alturas Z distintas, a importação precisa estacioná-las

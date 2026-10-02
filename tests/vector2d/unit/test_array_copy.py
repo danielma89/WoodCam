@@ -156,6 +156,25 @@ class ArrayCopyCommandTests(unittest.TestCase):
         self.assertEqual(second.center, Vec2(30, 10))
         self.assertNotEqual(first.id, second.id)
 
+    def test_paste_at_target_centres_snapshot_without_cascading(self):
+        circle = CircleEntity(self.document.active_layer_id, Vec2(10, 10), 2,
+                              id="target-source")
+        self.history.execute(AddEntitiesCommand((circle,)))
+        controller = EditorController(self.document, history=self.history)
+        controller.selection.select_only(circle.id)
+        self.assertEqual(controller.copy_selection(), 1)
+        self.assertEqual(controller.paste_copied(Vec2(73, 41)), 1)
+        first_id = controller.selection.primary_id
+        self.assertEqual(self.document.get_entity(first_id).center, Vec2(73, 41))
+        self.assertEqual(controller.paste_copied(Vec2(73, 41)), 1)
+        second_id = controller.selection.primary_id
+        self.assertNotEqual(first_id, second_id)
+        self.assertEqual(self.document.get_entity(second_id).center, Vec2(73, 41))
+        self.history.undo()
+        self.assertNotIn(second_id, self.document.entities_by_id)
+        self.assertEqual(self.document.get_entity(first_id).center, Vec2(73, 41))
+        self.assertEqual(self.document.get_entity(circle.id).center, Vec2(10, 10))
+
     def test_clipboard_snapshot_does_not_clone_unrelated_cabinet_vectors(self):
         selected = CircleEntity(
             self.document.active_layer_id, Vec2(10, 10), 2, id="selected"

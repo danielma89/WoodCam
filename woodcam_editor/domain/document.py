@@ -18,6 +18,7 @@ LAYER_PURPOSES = frozenset(("design", "construction", "reference", "cut", "pocke
 NON_CAM_LAYER_PURPOSES = frozenset(("construction", "reference"))
 POCKET_REGION_ROLES = frozenset(("pocket_region", "pocket_island"))
 REMNANT_CUT_ROLE = "remnant_cut"
+PIECE_MARKING_ROLE = "piece_marking"
 
 
 def entity_manufacturing_role(entity: Any) -> str:
@@ -48,6 +49,18 @@ def entity_is_remnant_cut(entity: Any) -> bool:
         or ""
     ).strip().lower()
     return role == REMNANT_CUT_ROLE
+
+
+def entity_is_piece_marking(entity: Any) -> bool:
+    """Return whether an imported open path is an explicit piece marking."""
+
+    metadata = dict(getattr(entity, "metadata", {}) or {})
+    role = str(
+        metadata.get("woodcam_role", "")
+        or metadata.get("import_role", "")
+        or ""
+    ).strip().lower()
+    return role == PIECE_MARKING_ROLE
 
 
 def pocket_feature_owner_key(entity: Any) -> Tuple[str, ...]:

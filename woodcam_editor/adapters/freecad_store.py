@@ -31,6 +31,11 @@ PROPERTY_SPECS = (
     ("App::PropertyString", "LastMigration"),
     ("App::PropertyString", "SourceMetadataJSON"),
 )
+_INTERNAL_DISPLAY_PROPERTIES = ("GeometryJSON", "SourceMetadataJSON", "Shape")
+_OPERATION_DISPLAY_PROPERTIES = (
+    "SettingsJSON", "MovesJSON", "MovesCompressedBase64", "SelectionJSON"
+)
+_display_observer = None
 
 
 def _freecad_modules():
@@ -348,16 +353,38 @@ class FreeCADDocumentStore(VectorDocumentStore):
             feature = self.document.addObject("Part::FeaturePython", VECTOR_DOCUMENT_FEATURE_NAME)
             feature.Label = "Documento vetorial (interno)"
             self._ensure_group().addObject(feature)
-            view_object = getattr(feature, "ViewObject", None)
-            if view_object is not None and hasattr(view_object, "ShowInTree"):
-                try:
-                    view_object.ShowInTree = False
-                except Exception:
-                    pass
+        self._configure_internal_view(feature)
         for property_type, property_name in PROPERTY_SPECS:
             if property_name not in list(getattr(feature, "PropertiesList", []) or []):
                 feature.addProperty(property_type, property_name, PROPERTY_GROUP)
+        self._hide_internal_display_properties(feature)
         return feature
+
+    @staticmethod
+    def _hide_internal_display_properties(feature):
+        """Keep large persistence/cache fields out of FreeCAD's property pane."""
+        available = set(getattr(feature, "PropertiesList", ()) or ())
+        for name in _INTERNAL_DISPLAY_PROPERTIES:
+            if name not in available:
+                continue
+            try:
+                if "Hidden" not in feature.getEditorMode(name):
+                    feature.setEditorMode(name, 2)
+            except (AttributeError, RuntimeError, ValueError):
+                pass
+
+    @staticmethod
+    def _configure_internal_view(feature):
+        """The Editor owns vector selection; the FreeCAD cache is display-only."""
+        view_object = getattr(feature, "ViewObject", None)
+        if view_object is None:
+            return
+        for name in ("ShowInTree", "Selectable"):
+            if hasattr(view_object, name):
+                try:
+                    setattr(view_object, name, False)
+                except (AttributeError, RuntimeError, ValueError):
+                    pass
 
     @contextmanager
     def _transaction(self, label: str, enabled: bool):
@@ -382,16 +409,12 @@ class FreeCADDocumentStore(VectorDocumentStore):
         feature = self._feature()
         if feature is None:
             return None
+        self._hide_internal_display_properties(feature)
         # Abrir um FCStd antigo já compacta apenas a organização visual. A
         # Shape/GeometryJSON de origem permanece intocada.
         feature.Label = "Documento vetorial (interno)"
         self._ensure_group().addObject(feature)
-        view_object = getattr(feature, "ViewObject", None)
-        if view_object is not None and hasattr(view_object, "ShowInTree"):
-            try:
-                view_object.ShowInTree = False
-            except Exception:
-                pass
+        self._configure_internal_view(feature)
         geometry_json = str(getattr(feature, "GeometryJSON", "") or "").strip()
         if not geometry_json:
             return None
@@ -504,3 +527,71 @@ def find_vector_feature(freecad_document: Any = None):
     FreeCAD, _Part = _freecad_modules()
     document = freecad_document or FreeCAD.ActiveDocument
     return document.getObject(VECTOR_DOCUMENT_FEATURE_NAME) if document is not None else None
+
+
+def hide_operation_payload_properties(operation: Any) -> None:
+    """Keep persisted CAM payloads out of FreeCAD's native property editor."""
+    available = set(getattr(operation, "PropertiesList", ()) or ())
+    for name in _OPERATION_DISPLAY_PROPERTIES:
+        if name not in available:
+            continue
+        try:
+            if "Hidden" not in operation.getEditorMode(name):
+                operation.setEditorMode(name, 2)
+        except (AttributeError, RuntimeError, ValueError):
+            pass
+
+
+def protect_woodcam_document_view(document: Any) -> None:
+    """Apply display metadata on open without reading any large payload."""
+    feature = document.getObject(VECTOR_DOCUMENT_FEATURE_NAME)
+    if feature is not None:
+        FreeCADDocumentStore._hide_internal_display_properties(feature)
+        FreeCADDocumentStore._configure_internal_view(feature)
+    for obj in getattr(document, "Objects", ()) or ():
+        properties = set(getattr(obj, "PropertiesList", ()) or ())
+        if "SettingsJSON" in properties and (
+            "MovesCompressedBase64" in properties or "MovesJSON" in properties
+        ):
+            hide_operation_payload_properties(obj)
+
+
+class _WoodCAMDisplayObserver:
+    def slotActivateDocument(self, document):
+        protect_woodcam_document_view(document)
+        # GUI view providers may restore their saved Selectable flag after the
+        # App document becomes active. Apply it again on the next event tick.
+        try:
+            try:
+                from PySide6 import QtCore
+            except ImportError:
+                from PySide2 import QtCore
+            if QtCore.QCoreApplication.instance() is not None:
+                name = document.Name
+                QtCore.QTimer.singleShot(
+                    0, lambda: _protect_open_document_by_name(name)
+                )
+        except (ImportError, AttributeError, RuntimeError):
+            pass
+
+
+def _protect_open_document_by_name(name):
+    import FreeCAD
+
+    try:
+        document = FreeCAD.getDocument(name)
+    except (NameError, RuntimeError):
+        return
+    if document is not None:
+        protect_woodcam_document_view(document)
+
+
+def install_woodcam_display_observer() -> None:
+    """Protect old FCStd files as soon as FreeCAD activates them."""
+    global _display_observer
+    import FreeCAD
+    if _display_observer is None:
+        _display_observer = _WoodCAMDisplayObserver()
+        FreeCAD.addDocumentObserver(_display_observer)
+    for document in FreeCAD.listDocuments().values():
+        protect_woodcam_document_view(document)

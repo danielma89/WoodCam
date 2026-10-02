@@ -352,22 +352,40 @@ class EditorController:
         self._paste_generation = 0
         return len(roots)
 
-    def paste_copied(self) -> int:
-        """Paste the clipboard snapshot as one command and select its roots."""
+    def paste_copied(self, target=None) -> int:
+        """Paste the snapshot as one command, centred on ``target`` if given."""
 
         if self._clipboard_document is None or not self._clipboard_root_ids:
             return 0
-        from woodcam_editor.domain import ArrayCopyCommand
+        from woodcam_editor.domain import ArrayCopyCommand, Vec2
 
         generation = self._paste_generation + 1
-        offset = self.PASTE_CASCADE_MM * generation
+        if target is None:
+            step_x = self.PASTE_CASCADE_MM * generation
+            step_y = 0.0
+        else:
+            target_x, target_y = _xy(target)
+            if not (math.isfinite(target_x) and math.isfinite(target_y)):
+                raise ValueError("A posição de colagem precisa ser finita.")
+            bounds = [entity.bounds() for entity in
+                      self._clipboard_document.entities_by_id.values()
+                      if callable(getattr(entity, "bounds", None))]
+            if not bounds:
+                return 0
+            centre_x = (min(box.min_x for box in bounds) +
+                        max(box.max_x for box in bounds)) * 0.5
+            centre_y = (min(box.min_y for box in bounds) +
+                        max(box.max_y for box in bounds)) * 0.5
+            step_x = target_x - centre_x
+            step_y = target_y - centre_y
         command = ArrayCopyCommand(
             self._clipboard_root_ids,
             2,
             1,
-            offset,
+            0.0,
             0.0,
             source_document=self._clipboard_document,
+            origin_offset=Vec2(step_x, step_y),
         )
         self.execute(command)
         self._paste_generation = generation

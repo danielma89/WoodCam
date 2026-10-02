@@ -3,6 +3,7 @@ import unittest
 from woodcam_editor.adapters.freecad_store import (
     FreeCADDocumentStore,
     _recompute_derived_feature,
+    protect_woodcam_document_view,
 )
 
 
@@ -73,6 +74,46 @@ class FreeCADStoredInfoTests(unittest.TestCase):
         self.assertEqual(info.document_uuid, "doc-legacy")
         self.assertEqual(info.revision, 3)
         self.assertEqual(info.checksum, "")
+
+    def test_internal_vector_cache_is_not_selectable_in_freecad_view(self):
+        class View:
+            ShowInTree = True
+            Selectable = True
+
+        class Feature:
+            ViewObject = View()
+
+        FreeCADDocumentStore._configure_internal_view(Feature())
+        self.assertFalse(Feature.ViewObject.ShowInTree)
+        self.assertFalse(Feature.ViewObject.Selectable)
+
+    def test_open_document_hides_payload_without_reading_it(self):
+        class Operation:
+            PropertiesList = ("SettingsJSON", "MovesCompressedBase64")
+
+            def __init__(self):
+                self.modes = {}
+
+            @property
+            def MovesCompressedBase64(self):
+                raise AssertionError("opening a document must not read moves")
+
+            def getEditorMode(self, name):
+                return self.modes.get(name, [])
+
+            def setEditorMode(self, name, mode):
+                self.modes[name] = ["Hidden"] if mode == 2 else []
+
+        operation = Operation()
+
+        class Document:
+            Objects = (operation,)
+
+            def getObject(self, _name):
+                return None
+
+        protect_woodcam_document_view(Document())
+        self.assertEqual(operation.getEditorMode("MovesCompressedBase64"), ["Hidden"])
 
 
 if __name__ == "__main__":

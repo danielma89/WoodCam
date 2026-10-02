@@ -23,6 +23,7 @@ except ImportError:  # pragma: no cover - exercised by FreeCAD/PySide2
 
 
 _PARAMETER_PATH = "User parameter:BaseApp/Preferences/WoodCAM2D"
+_HOST_PARAMETER_PATH = "User parameter:BaseApp/Preferences/PanelNest"
 _LANGUAGE_KEY = "language"
 _ITEM_SOURCE_ROLE = int(QtCore.Qt.UserRole) + 1000
 
@@ -39,10 +40,59 @@ PT_EN = {
     "Chapas": "Sheets",
     "Chapa": "Sheet",
     "Enquadrar chapa": "Fit sheet",
+    "+ Nova chapa vazia": "+ New empty sheet",
+    "Cria uma chapa vazia com as dimensões da chapa ativa, sem mover nem duplicar vetores. Ctrl+Z desfaz.": "Creates an empty sheet with the active sheet dimensions without moving or duplicating vectors. Ctrl+Z undoes it.",
+    "Configure a área de Trabalho antes de criar uma chapa.": "Configure the Job area before creating a sheet.",
+    "Nova chapa vazia criada; Ctrl+Z desfaz.": "New empty sheet created; Ctrl+Z undoes it.",
     "Origem local da chapa: X0  Y0": "Local sheet origin: X0 Y0",
     "Origem local: X0 Y0  (global %.1f, %.1f)": "Local origin: X0 Y0  (global %.1f, %.1f)",
     "Chapa %02d  —  %.1f × %.1f mm": "Sheet %02d  —  %.1f × %.1f mm",
     "Chapa %02d  ·  X0 Y0": "Sheet %02d  ·  X0 Y0",
+    "Chapa %02d": "Sheet %02d",
+    "Organizar peças da Chapa %02d; o excesso usará as próximas chapas vazias ou novas. Chapas ocupadas serão preservadas.": "Organize parts from Sheet %02d; overflow will use the next empty or new sheets. Occupied sheets will be preserved.",
+    "Apagar chapa": "Delete sheet",
+    "Editar chapa": "Edit sheet",
+    "Apaga a chapa vazia selecionada. Peças não são apagadas; Ctrl+Z desfaz.": "Deletes the selected empty sheet. Parts are preserved; Ctrl+Z undoes.",
+    "Altera somente a largura e a altura da chapa ativa, sem escalar peças. Ctrl+Z desfaz.": "Changes only the active sheet width and height without scaling parts. Ctrl+Z undoes.",
+    "Chapa vazia apagada; Ctrl+Z desfaz.": "Empty sheet deleted; Ctrl+Z undoes.",
+    "A chapa contém vetores. Mova as peças para outra chapa antes de apagá-la.": "The sheet contains vectors. Move its parts to another sheet before deleting it.",
+    "Mantenha ao menos uma chapa no documento.": "Keep at least one sheet in the document.",
+    "Selecione uma chapa para apagar.": "Select a sheet to delete.",
+    "Selecione uma chapa para editar.": "Select a sheet to edit.",
+    "Somente esta chapa muda de tamanho. Peças mantêm suas medidas; chapas vizinhas são afastadas se necessário. Ao reduzir, peças podem ficar fora da borda.": "Only this sheet changes size. Parts keep their dimensions; neighbouring sheets move apart if needed. Shrinking may leave parts outside the boundary.",
+    "O documento mudou; abra Editar chapa novamente.": "The document changed; open Edit sheet again.",
+    "Tamanho da chapa atualizado; Ctrl+Z desfaz.": "Sheet size updated; Ctrl+Z undoes.",
+    "Largura X (mm)": "Width X (mm)",
+    "Altura Y (mm)": "Height Y (mm)",
+    "Organizar somente a Chapa %02d; as demais serão preservadas.": "Organize only Sheet %02d; the others will be preserved.",
+    "Nenhuma peça cabe na chapa ativa com a folga informada.": "No piece fits on the active sheet with the specified clearance.",
+    "Nenhuma peça selecionada na chapa ativa.": "No selected piece on the active sheet.",
+    "O destino conflita com peças que permanecem na chapa ativa; selecione todas as peças dessa chapa para organizar.": "The destination conflicts with pieces remaining on the active sheet; select all pieces on this sheet to organize.",
+    "Organizadas %d peça(s); %d permaneceram sem mover na chapa ativa.": "Organized %d piece(s); %d remained unmoved on the active sheet.",
+    "A chapa ativa não contém nenhuma Peça 2D reconhecida.": "The active sheet has no recognized 2D part.",
+    "Nenhum furo pertencente às peças foi encontrado no escopo ativo.": "No holes belonging to parts were found in the active scope.",
+    "A chapa ativa não contém vetores para esta operação CAM.": "The active sheet has no vectors for this CAM operation.",
+    "Editor não pode ser usado no CAM: o Editor 2D ainda não possui vetores.": "The 2D Editor cannot be used for CAM because it has no vectors yet.",
+    "Substituir arquivo?": "Replace file?",
+    "O arquivo %s já existe. Deseja substituí-lo?": "The file %s already exists. Replace it?",
+    "Alívio de canto bloqueado: não foi encontrado um ponto local do contorno compensado a até %.3f mm. O percurso não será ligado por uma reta através da peça.": "Corner relief blocked: no local point on the compensated contour was found within %.3f mm. The toolpath will not be connected by a line across the part.",
+    "Selecione somente uma operação para simular. Corte e Furo não podem ser misturados numa prévia única.": "Select only one operation to simulate. Cut and Drill cannot be combined in one preview.",
+    "Esta operação usa um percurso antigo ou geometria desatualizada. Edite e aplique novamente antes de simular.": "This operation uses an old toolpath or outdated geometry. Edit and apply it again before simulating.",
+    "Selecione somente uma operação de %s.": "Select only one %s operation.",
+    "Abra a configuração de %s antes de visualizá-la.": "Open the %s settings before previewing it.",
+    "A operação obtida não corresponde a %s.": "The selected operation is not %s.",
+    "%s não produziu movimentos para visualizar.": "%s produced no moves to preview.",
+    "Esta operação usa um percurso antigo ou geometria desatualizada. Edite e aplique novamente antes de mostrar o percurso.": "This operation uses an old toolpath or outdated geometry. Edit and apply it again before showing the toolpath.",
+    "%s aberto para configurar/criar; a geometria do Editor 2D é a fonte CAM.%s": "%s opened for setup or creation; the 2D Editor geometry is the CAM source.%s",
+    "Configuração de %s não encontrada.": "%s settings were not found.",
+    " Profundidade importada: %.3f mm; confirme antes de aplicar.": " Imported depth: %.3f mm; confirm it before applying.",
+    " A seleção contém rebaixos com profundidades diferentes; configure um nível por operação.": " The selection contains pockets with different depths; set one depth per operation.",
+    "Percurso de %s alinhado ao desenho; cinza = usinagem, magenta = rápido e setas = sentido. Nada foi alterado.": "%s toolpath aligned with the drawing; gray = cutting, magenta = rapid moves, arrows = direction. Nothing was changed.",
+    "Não foi possível mostrar o percurso de %s: %s": "Could not show the %s toolpath: %s",
+    "Não foi possível montar o percurso de %s.": "Could not build the %s toolpath.",
+    "Não há deslocamentos XY neste percurso.": "This toolpath has no XY moves.",
+    "Percurso de Corte ocultado no Editor 2D; vetores e operação CAM foram preservados.": "Cut toolpath hidden in the 2D Editor; vectors and the CAM operation were preserved.",
+    "A fresa Ø %.2f mm não alcança todos os detalhes de %d peça(s). A compensação externa fechou uma região estreita; o primeiro ponto está próximo de X %.2f / Y %.2f.\n\nCortar mesmo assim mantém o contorno externo compensado. Dogbones e T-bones continuam no próprio percurso externo: a fresa entra e retorna pelo mesmo kerf, sem retração nem novo mergulho. Em uma fenda aberta, a fresa segue o eixo médio local para retirar o mínimo possível de cada lateral. A abertura final nunca pode ser menor que o diâmetro da ferramenta. Confira a prévia antes de gerar o G-code.": "The Ø %.2f mm cutter cannot reach every detail of %d part(s). Outside compensation closed a narrow region; the first point is near X %.2f / Y %.2f.\n\nProceeding keeps the outside contour compensated. Dogbones and T-bones stay on the outside toolpath: the cutter enters and returns along the same kerf, without retracting or plunging again. In an open slot, the cutter follows the local medial axis to remove as little as possible from each side. The final opening cannot be narrower than the tool diameter. Check the preview before generating G-code.",
     "Chapa %02d — prévia  ·  X0 Y0": "Sheet %02d — preview  ·  X0 Y0",
     "Nenhuma chapa configurada.": "No sheet configured.",
     "Selecione a chapa ativa; as coordenadas passam a usar o canto inferior esquerdo dela como X0 Y0.": "Select the active sheet; coordinates then use its lower-left corner as X0 Y0.",
@@ -124,11 +174,14 @@ PT_EN = {
     "Organização progressiva": "Progressive nesting",
     "O WoodCAM mostrará a primeira solução rapidamente e continuará testando encaixes melhores até o tempo-alvo.": "WoodCAM will show the first solution quickly and keep testing better layouts until the target time.",
     "Folga mínima entre peças": "Minimum clearance between parts",
+    "O valor mínimo vem do diâmetro efetivo da fresa atual. Escolha uma fresa menor ou altere o modo de linha comum para liberar uma folga inferior sem perder medidas.": "The minimum comes from the current cutter's effective diameter. Choose a smaller cutter or change the common-line mode to allow a smaller gap without losing dimensions.",
     "Tempo-alvo de busca": "Search target time",
     "Preparando a primeira solução…": "Preparing the first solution…",
     "Preparando a primeira solução": "Preparing the first solution",
     "Parar e manter a melhor prévia": "Stop and keep the best preview",
     "Resposta rápida": "Quick result",
+    "Encaixe por contorno": "Contour packing",
+    "Contornos alinhados": "Aligned contours",
     "Busca equilibrada": "Balanced search",
     "Refino profundo": "Deep refinement",
     "Refino adicional": "Additional refinement",
@@ -154,6 +207,8 @@ PT_EN = {
     "; a busca continua": "; the search continues",
     "Prévia do nesting inteligente: magenta = destino, azul = posição atual. %d peça(s) em %d chapa(s); %d não couberam. Eficiência %.1f%%; %s venceu entre %d layouts%s%s.": "Smart nesting preview: magenta = destination, blue = current position. %d part(s) on %d sheet(s); %d did not fit. Efficiency %.1f%%; %s won among %d layouts%s%s.",
     "contorno real": "real contour",
+    "arranjo atual preservado": "current arrangement preserved",
+    "ângulos ortogonais": "orthogonal angles",
     "MaxRects — folga vetorial segura": "MaxRects — safe vector clearance",
     "encaixe": "layout",
     "; %d ocorrência(s) extra serão replicadas pelo PanelNest": "; %d extra occurrence(s) will be replicated by PanelNest",
@@ -164,9 +219,6 @@ PT_EN = {
     "Organizadas %d peça(s) em %d chapa(s), sempre com seus furos, recortes e marcações%s.": "%d part(s) organized on %d sheet(s), always with their holes, cutouts, and markings%s.",
     "; quantidades extras seguem para o PanelNest": "; extra quantities will be sent to PanelNest",
     "Aplicar organização": "Apply nesting",
-    "Linha comum preservando medidas: a folga não pode ser menor que o Ø efetivo de %.2f mm. O valor recomendado faz os percursos externos vizinhos coincidirem.": "Dimension-preserving common line: clearance cannot be smaller than the %.2f mm effective diameter. The recommended value makes neighboring outside toolpaths coincide.",
-    "Linha comum sobre o vetor: use 0 mm para encostar as bordas. Uma folga intermediária entre 0 e %.2f mm não comporta a fresa.": "On-vector common line: use 0 mm to make the edges touch. An intermediate clearance between 0 and %.2f mm cannot accommodate the cutter.",
-    "A folga foi ajustada de %.2f para %.2f mm para comportar o percurso externo da fresa.": "Clearance was adjusted from %.2f to %.2f mm to accommodate the cutter's outside toolpath.",
     "Usar Editor 2D como fonte": "Use 2D Editor as source",
     "Configurar/criar Corte…": "Configure/create Cut…",
     "Configurar/criar Furos…": "Configure/create Holes…",
@@ -434,6 +486,7 @@ PT_EN = {
     "Preservar medidas — folga = Ø efetivo": "Preserve dimensions — gap = effective Ø",
     "Aproveitar fronteiras por linha comum": "Use common-line boundaries",
     "Chapa inteira por profundidade": "Whole sheet by depth",
+    "Todas as passadas direto por peça (ex.: 3 direto) — sentido único": "All passes directly per part (e.g. 3 straight through) — single direction",
     "Todas as passadas direto por peça (ex.: 3 direto)": "All passes directly per part (e.g. 3 straight through)",
     "Híbrido — estabilidade": "Hybrid — stability",
     "Última passada no final (ex.: 2 + última geral)": "Final pass at the end (e.g. 2 + final sheet pass)",
@@ -728,7 +781,7 @@ PT_EN.update({
     "Colar": "Paste",
     "Selecione uma peça ou vetor antes de copiar.": "Select a part or vector before copying.",
     "Nada copiado ainda. Selecione e use Ctrl+C primeiro.": "Nothing has been copied yet. Select an object and press Ctrl+C first.",
-    "%d objeto(s) copiado(s). Ctrl+V cola a cópia com deslocamento visível.": "%d object(s) copied. Ctrl+V pastes with a visible offset.",
+    "%d objeto(s) copiado(s). Ctrl+V cola a cópia sob o mouse.": "%d object(s) copied. Ctrl+V pastes the copy under the pointer.",
     "%d objeto(s) colado(s). A peça inteira foi preservada; Ctrl+Z desfaz.": "%d object(s) pasted. The whole part was preserved; Ctrl+Z undoes it.",
     "Copiar matriz": "Copy array",
     "Colunas": "Columns",
@@ -887,10 +940,13 @@ def _stored_language():
     try:
         import FreeCAD
 
-        value = FreeCAD.ParamGet(_PARAMETER_PATH).GetString(_LANGUAGE_KEY, "pt")
-        return value if value in {"pt", "en"} else "pt"
+        for path in (_HOST_PARAMETER_PATH, _PARAMETER_PATH):
+            value = FreeCAD.ParamGet(path).GetString(_LANGUAGE_KEY, "")
+            if value in {"pt", "en"}:
+                return value
     except Exception:
-        return "pt"
+        pass
+    return "en"
 
 
 _language = _stored_language()
@@ -1520,6 +1576,15 @@ def set_language(code):
     # captured by WoodCAM instead of mistaking that intermediate host text for
     # a newly-created dynamic label.
     _refresh_registered_widgets(force=True, sync_sources=False)
+    for reference in tuple(_roots):
+        try:
+            root = reference()
+            adapter = getattr(root, "adapter", None)
+            refresh_language = getattr(adapter, "refresh_language", None)
+            if callable(refresh_language):
+                refresh_language()
+        except (RuntimeError, AttributeError, TypeError):
+            continue
 
 
 __all__ = ["language", "register_widget", "set_language", "translate_text", "translate_widget_tree"]

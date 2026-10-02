@@ -116,6 +116,29 @@ class FreeCADCommandSessionTest(unittest.TestCase):
         session.execute(command)
         self.assertIn(entity.id, vector_document.entities_by_id)
 
+    def test_removed_host_feature_does_not_restore_opening_snapshot(self):
+        vector_document = VectorDocument.create_default()
+        entity = PathEntity.from_points(
+            vector_document.active_layer_id,
+            (Vec2(0, 0), Vec2(10, 0)),
+        )
+        vector_document.add_entities((entity,))
+        store = _Store()
+        store.saved = vector_document.clone()
+        saved_before_delete = store.saved.clone()
+        session = FreeCADCommandSession(vector_document, store)
+
+        # Deleting the internal feature in FreeCAD makes load() return None.
+        store.saved = None
+        session.reload()
+        self.assertFalse(vector_document.entities_by_id)
+        self.assertFalse(vector_document.pieces_by_id)
+
+        # Undo of that host deletion restores the persisted snapshot exactly.
+        store.saved = saved_before_delete
+        session.reload()
+        self.assertIn(entity.id, vector_document.entities_by_id)
+
 
 if __name__ == "__main__":
     unittest.main()

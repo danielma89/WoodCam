@@ -105,6 +105,115 @@ def assert_raster_replay_has_no_collision(
 
 
 class RasterContourPackingTests(unittest.TestCase):
+    def test_reusable_side_strip_outranks_slightly_lower_diagonal_envelope(self):
+        sheet = ((0.0, 0.0, 1000.0, 1000.0),)
+        def candidate(angle, bounds):
+            return organizer.OrganizationResult(
+                placements=[organizer.PiecePlacement(
+                    "rail", 1, 0.0, 0.0, angle, bounds, ("rail",),
+                )], sheet_bounds=sheet, used_bounds=bounds,
+            )
+        diagonal = candidate(45.0, (4.0, 4.0, 647.5, 647.5))
+        aligned = candidate(0.0, (4.0, 4.0, 14.0, 904.0))
+        self.assertLess(organizer.organization_result_score(diagonal),
+                        organizer.organization_result_score(aligned))
+        self.assertLess(organizer.organization_remnant_score(aligned),
+                        organizer.organization_remnant_score(diagonal))
+
+    def test_aligned_search_keeps_explicit_rotation_constraints(self):
+        options = {"free": (0.0, 30.0, 90.0, 150.0),
+                   "locked": (30.0,), "grain": (0.0, 180.0)}
+        aligned = organizer.orthogonal_nesting_rotations(options)
+        self.assertEqual(aligned["free"], (0.0, 90.0))
+        self.assertEqual(aligned["locked"], (30.0,))
+        self.assertEqual(aligned["grain"], (0.0, 180.0))
+
+    def test_clearance_pruning_matches_all_segment_pairs(self):
+        import random
+        randomizer = random.Random(917)
+        for _ in range(30):
+            contours = []
+            for offset in (0, 25):
+                points = tuple(Vec2(offset + randomizer.uniform(-10, 10),
+                                    randomizer.uniform(-10, 10)) for _ in range(8))
+                contours.append(organizer.CommonLineContour(str(offset), points))
+            first, second = contours
+            distances = []
+            for a, b in zip(first.points, first.points[1:]+first.points[:1]):
+                for c, d in zip(second.points, second.points[1:]+second.points[:1]):
+                    distances.extend(organizer._point_segment_clearance(*args)[0]
+                                     for args in ((a,c,d), (b,c,d), (c,a,b), (d,a,b)))
+            distance, a, b = organizer._contour_clearance(first, second)
+            self.assertAlmostEqual(distance, min(distances), places=10)
+            self.assertAlmostEqual(a.distance_to(b), distance, places=10)
+
+    def test_many_large_rotated_masks_stay_within_search_budget(self):
+        pieces = classify_document_pieces(_Document(tuple(
+            _Path(str(i), shifted(((0, 0), (1400, 0), (0, 2000)), i*2500))
+            for i in range(6)
+        ))).pieces
+        bounds = (0, 0, 1780, 2725)
+        rotations = {p.piece_id: (0, 90, 180, 270) for p in pieces}
+        resolution = organizer._bounded_raster_resolution(pieces, bounds, 4, rotations)
+        cells = sum(math.ceil(o.width/resolution)*math.ceil(o.height/resolution)
+                    for p in pieces for o in organizer._rotation_options(p, rotations[p.piece_id]))
+        self.assertLessEqual(cells, 12000000)
+        self.assertLessEqual(int(1780/resolution)*int(2725/resolution), 1500000)
+
+    def test_spacing_halo_extends_to_the_left_of_a_translated_piece(self):
+        mask = organizer._RasterOrientation(0, (15, 15), 2, 4, 8, 4, 2, 0, 0, 1)
+        sheet = [0] * 12
+        organizer._stamp_raster_mask(sheet, 12, 24, mask, 4, 8, 2)
+        # A left-hand neighbour with only one empty pixel between contours
+        # must collide with the two-pixel clearance halo, just like a right one.
+        self.assertFalse(organizer._raster_mask_fits(sheet, mask, 4, 3))
+        self.assertFalse(organizer._raster_mask_fits(sheet, mask, 4, 13))
+        self.assertTrue(organizer._raster_mask_fits(sheet, mask, 4, 2))
+        self.assertTrue(organizer._raster_mask_fits(sheet, mask, 4, 14))
+
+    def test_frontier_intervals_match_exhaustive_collision_checks(self):
+        import random
+        randomizer = random.Random(1947)
+        for _ in range(100):
+            sheet = tuple(randomizer.getrandbits(20) for _ in range(8))
+            rows = tuple(randomizer.getrandbits(5) for _ in range(3))
+            mask = organizer._RasterOrientation(0, rows, 3, 5, 0, 5, 3, 0, 0, 1)
+            for row in range(6):
+                feasible = {col for col in range(2, 15)
+                            if organizer._raster_mask_fits(sheet, mask, row, col)}
+                expected = {col for col in feasible
+                            if col-1 not in feasible or col+1 not in feasible}
+                actual = organizer._raster_candidate_cols(sheet, mask, row, 2, 14)
+                self.assertEqual(set(actual), expected)
+
+    def test_large_sheet_keeps_contour_search_with_small_clearance(self):
+        triangle = ((0, 0), (600, 0), (0, 600))
+        pieces = classify_document_pieces(_Document((
+            _Path("large-a", triangle),
+            _Path("large-b", shifted(triangle, 1000)),
+        ))).pieces
+        bounds = (0.0, 0.0, 1780.0, 2725.0)
+        rotations = {piece.piece_id: (0, 90, 180, 270) for piece in pieces}
+        result = organizer._organize_pieces_raster(
+            pieces, bounds, 3.175, {}, rotations, max_orders=1,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result.placements), 2)
+        self.assertFalse(organizer.validate_organization_result_geometry(
+            pieces, result, minimum_clearance=3.175,
+        ))
+        self.assertTrue(boxes_overlap(*(v.placed_bounds for v in result.placements)))
+
+    def test_one_order_budget_does_not_run_four_full_searches(self):
+        pieces = classify_document_pieces(_Document(tuple(
+            _Path(str(i), ((i*100, 0), (i*100+w, 0), (i*100+w, h), (i*100, h)))
+            for i, (w, h) in enumerate(((70, 10), (20, 60), (35, 40), (50, 30)))
+        ))).pieces
+        instances = tuple(organizer._PackInstance(
+            p, 1, p.bounds[2]-p.bounds[0], p.bounds[3]-p.bounds[1],
+        ) for p in pieces)
+        self.assertEqual(len(organizer._candidate_orders(instances, max_orders=1)), 1)
+
     def test_final_gate_moves_conflicting_piece_to_next_sheet_instead_of_aborting(self):
         square = ((0, 0), (20, 0), (20, 20), (0, 20))
         classified = classify_document_pieces(
@@ -459,7 +568,11 @@ class RasterContourPackingTests(unittest.TestCase):
             search_mode="thorough",
         )
 
-        self.assertGreater(len(fast.sheet_bounds), 1)
+        # The corrected clearance halo can improve even the shallow search.
+        self.assertLessEqual(
+            organizer.organization_result_score(balanced),
+            organizer.organization_result_score(fast),
+        )
         self.assertEqual(len(balanced.sheet_bounds), 1)
         self.assertEqual(len(balanced.placements), len(classified.pieces))
         self.assertFalse(balanced.unplaced_piece_ids)

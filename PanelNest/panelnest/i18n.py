@@ -24,6 +24,7 @@ except ImportError:  # pragma: no cover - FreeCAD/PySide2 installations
 
 
 PARAMETER_PATH = "User parameter:BaseApp/Preferences/PanelNest"
+WOODCAM_PARAMETER_PATH = "User parameter:BaseApp/Preferences/WoodCAM2D"
 LANGUAGE_KEY = "language"
 ITEM_SOURCE_ROLE = int(QtCore.Qt.UserRole) + 1100
 
@@ -224,10 +225,13 @@ def _stored_language():
     try:
         import FreeCAD
 
-        value = FreeCAD.ParamGet(PARAMETER_PATH).GetString(LANGUAGE_KEY, "pt")
-        return value if value in {"pt", "en"} else "pt"
+        for path in (PARAMETER_PATH, WOODCAM_PARAMETER_PATH):
+            value = FreeCAD.ParamGet(path).GetString(LANGUAGE_KEY, "")
+            if value in {"pt", "en"}:
+                return value
     except Exception:
-        return "pt"
+        pass
+    return "en"
 
 
 _language = _stored_language()

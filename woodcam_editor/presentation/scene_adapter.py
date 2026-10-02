@@ -57,8 +57,10 @@ class SceneAdapter:
         self.preview_sheet_label_items = []
         self.remnant_cut_items = []
         self.remnant_label_items = []
+        self.remnant_labels_by_entity_id = {}
         self.preview_remnant_cut_items = []
         self.preview_remnant_label_items = []
+        self._preview_remnant_values = ()
         self.work_area_item = QtWidgets.QGraphicsRectItem()
         pen = QtGui.QPen(QtGui.QColor("#0ea5e9"), 1.5)
         pen.setCosmetic(True)
@@ -133,6 +135,15 @@ class SceneAdapter:
             removed_ids = tuple(getattr(change_set, "removed", ()) or ())
             sync_ids = set(getattr(change_set, "added", ()) or ())
             sync_ids.update(getattr(change_set, "changed", ()) or ())
+        remnant_entities_changed = any(
+            str(entity_id) in self.remnant_labels_by_entity_id
+            or str(
+                (getattr(current.get(str(entity_id)), "metadata", {}) or {}).get(
+                    "woodcam_role", ""
+                )
+            ).strip().lower() == "remnant_cut"
+            for entity_id in set(removed_ids) | sync_ids
+        )
         changed_layers = (
             set()
             if change_set is None
@@ -160,7 +171,7 @@ class SceneAdapter:
             is_group = type(entity).__name__ == "GroupEntity"
             item.setVisible(not is_group and bool(getattr(layer, "visible", True)))
             item.editor_locked = bool(getattr(layer, "locked", False))
-        if work_area_changed:
+        if work_area_changed or remnant_entities_changed:
             # Metadata and entity creation may arrive in the same composite
             # command. Re-evaluate after new EntityGraphicsItems exist so a
             # persisted remnant vector is not drawn twice as an overlay line.
@@ -217,6 +228,11 @@ class SceneAdapter:
             if item is not None:
                 item.set_editor_selected(entity_id in selected)
         self._rendered_selection = selected
+        for entity_id, label in self.remnant_labels_by_entity_id.items():
+            item = self.items_by_id.get(entity_id)
+            label.setVisible(
+                entity_id in selected and item is not None and item.isVisible()
+            )
 
     def _expanded_selection_ids(self, entity_ids):
         """Map selected persistent groups to their visible leaf vectors."""
@@ -409,6 +425,10 @@ class SceneAdapter:
         if values is None:
             return
         start, end, bounds, area = values
+        rect = self._work_area_rect(bounds)
+        label_text = translate_text("Retalho %.0f × %.0f mm · %.2f m²") % (
+            rect.width(), rect.height(), area / 1_000_000.0
+        )
         if draw_line:
             line = QtWidgets.QGraphicsLineItem(
                 start[0], start[1], end[0], end[1]
@@ -417,6 +437,8 @@ class SceneAdapter:
             pen.setCosmetic(True)
             pen.setStyle(DASH_LINE)
             line.setPen(pen)
+            line.setToolTip(label_text)
+            line.setAcceptHoverEvents(True)
             line.setZValue(3.0)
             line.setAcceptedMouseButtons(
                 QtCore.Qt.NoButton
@@ -429,11 +451,7 @@ class SceneAdapter:
         if isinstance(raw, dict) and not bool(raw.get("show_label", True)):
             return
 
-        rect = self._work_area_rect(bounds)
-        label = QtWidgets.QGraphicsSimpleTextItem(
-            translate_text("Retalho %.0f × %.0f mm · %.2f m²")
-            % (rect.width(), rect.height(), area / 1_000_000.0)
-        )
+        label = QtWidgets.QGraphicsSimpleTextItem(label_text)
         label.setBrush(QtGui.QBrush(QtGui.QColor(color)))
         font = label.font()
         font.setBold(True)
@@ -456,10 +474,13 @@ class SceneAdapter:
         )
         self.scene.addItem(label)
         label_items.append(label)
+        label.setVisible(False)
+        return label
 
     def _sync_remnant_cuts(self):
         self._clear_rect_items(self.remnant_cut_items)
         self._clear_rect_items(self.remnant_label_items)
+        self.remnant_labels_by_entity_id.clear()
         values = (getattr(self.document, "metadata", {}) or {}).get(
             "organization_remnant_cuts", ()
         ) or ()
@@ -469,17 +490,30 @@ class SceneAdapter:
                 if isinstance(raw, dict)
                 else ""
             )
-            self._append_remnant_cut(
+            # The vector is authoritative. Old metadata must not resurrect a
+            # deleted cut or leave its label behind after Undo/Redo/reload.
+            item = self.items_by_id.get(entity_id)
+            if item is None:
+                continue
+            entity = (getattr(self.document, "entities_by_id", {}) or {}).get(entity_id)
+            if str((getattr(entity, "metadata", {}) or {}).get("woodcam_role", "")).strip().lower() != "remnant_cut":
+                continue
+            label = self._append_remnant_cut(
                 raw,
                 self.remnant_cut_items,
                 self.remnant_label_items,
                 "#ea580c",
-                draw_line=entity_id not in self.items_by_id,
+                draw_line=False,
             )
+            if label is not None:
+                self.remnant_labels_by_entity_id[entity_id] = label
+                item.setToolTip(label.text())
+                item.setAcceptHoverEvents(True)
 
     def show_preview_remnant_cuts(self, values):
         self.clear_preview_remnant_cuts()
-        for raw in tuple(values or ()):
+        self._preview_remnant_values = tuple(values or ())
+        for raw in self._preview_remnant_values:
             self._append_remnant_cut(
                 raw,
                 self.preview_remnant_cut_items,
@@ -490,6 +524,16 @@ class SceneAdapter:
     def clear_preview_remnant_cuts(self):
         self._clear_rect_items(self.preview_remnant_cut_items)
         self._clear_rect_items(self.preview_remnant_label_items)
+        self._preview_remnant_values = ()
+
+    def refresh_language(self):
+        """Rebuild only presentation text when WoodCAM changes language."""
+
+        preview_values = self._preview_remnant_values
+        self._sync_remnant_cuts()
+        if preview_values:
+            self.show_preview_remnant_cuts(preview_values)
+        self.update_selection()
 
     def _append_sheet_label(self, rect, label_items, color, label):
         """Add an upright, non-interactive label to an existing page rect."""

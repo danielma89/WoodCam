@@ -5,7 +5,10 @@ from __future__ import annotations
 import math
 from typing import Any, Iterable, Optional, Sequence
 
-from woodcam_editor.domain.document import entity_is_remnant_cut
+from woodcam_editor.domain.document import (
+    entity_is_piece_marking,
+    entity_is_remnant_cut,
+)
 
 
 class GeometryAdapterError(ValueError):
@@ -363,10 +366,14 @@ def document_to_woodcam_geometry(
     if deflection <= 0.0:
         raise ValueError("A deflexão CAM precisa ser maior que zero.")
     entities = getattr(vector_document, "entities_by_id", {}) or {}
+    pieces = getattr(vector_document, "pieces_by_id", {}) or {}
+    piece_outer_ids = {
+        str(getattr(piece, "outer_path_id", "") or "")
+        for piece in pieces.values()
+    }
     result = {"contours": [], "holes": []}
 
     if piece_ids is not None:
-        pieces = getattr(vector_document, "pieces_by_id", {}) or {}
         for piece_id in piece_ids:
             if piece_id not in pieces:
                 raise GeometryAdapterError(f"Peça 2D inexistente: {piece_id}")
@@ -408,6 +415,11 @@ def document_to_woodcam_geometry(
         if entity_is_remnant_cut(entity):
             # Open stock-separation paths use the dedicated centerline bridge.
             continue
+        if entity_ids is None and entity_is_piece_marking(entity):
+            # A whole-document CAM source consumes closed manufacturing
+            # contours. Open engraving/assembly marks remain attached to the
+            # piece but are opt-in geometry, never broken cut contours.
+            continue
         if entity_ids is None and (
             "group" in type(entity).__name__.lower()
             or (
@@ -435,7 +447,11 @@ def document_to_woodcam_geometry(
             deflection=deflection,
             circle_as_hole=(
                 classify_small_circles_as_holes
-                and _entity_kind(entity) == "circle"
+                and _entity_kind(entity) in {"circle", "path"}
+                # Piece ownership is authoritative. A small round external
+                # contour may be a part or a dogbone/helper contour; shape
+                # similarity alone must never turn it into a drilling cycle.
+                and entity_id not in piece_outer_ids
             ),
             strict=strict,
         )

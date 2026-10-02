@@ -629,6 +629,38 @@ class TopologyAndValidationTests(unittest.TestCase):
         report = validate_document(document)
         self.assertEqual(len(report.by_code("INNER_OUTSIDE_PIECE")), 1)
 
+    def test_open_piece_marking_is_not_reported_as_broken_contour(self):
+        document = VectorDocument.create_default(WorkArea(0, 0, 100, 100))
+        outer = path(
+            document,
+            (Vec2(0, 0), Vec2(80, 0), Vec2(80, 40), Vec2(0, 40)),
+            True,
+            "outer",
+        )
+        marking = path(
+            document,
+            (Vec2(20, 20), Vec2(60, 20)),
+            False,
+            "marking",
+        )
+        document.add_entities((outer, marking), bump_revision=False)
+        document.add_pieces(
+            (
+                Piece2D(
+                    "P",
+                    outer.id,
+                    (),
+                    id="piece",
+                    metadata={"marking_path_ids": [marking.id]},
+                ),
+            ),
+            bump_revision=False,
+        )
+
+        report = validate_document(document)
+
+        self.assertFalse(report.by_code("OPEN_PATH"))
+
 
 if __name__ == "__main__":
     unittest.main()

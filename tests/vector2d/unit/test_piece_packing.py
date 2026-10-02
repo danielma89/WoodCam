@@ -375,37 +375,42 @@ class CompactPackingTests(unittest.TestCase):
         )
 
     def test_picture_like_panel_and_tapered_rails_organize_then_compensate(self):
-        pieces = picture_like_pieces()
-        result = organize_pieces(
-            pieces,
-            (0, 0, 1000, 2050),
-            spacing=4.0,
-            rotations={piece.piece_id: (0.0,) for piece in pieces},
-            search_mode="fast",
-            search_budget=(4, 2, 1, 1),
-            toolpath_offset=2.0,
-        )
-
-        self.assertEqual(len(result.placements), len(pieces))
-        self.assertFalse(result.unplaced_piece_ids)
-        by_id = {piece.piece_id: piece for piece in pieces}
-        compensated = []
-        for placement in result.placements:
-            source = by_id[placement.piece_id]
-            placed = tuple(
-                (x_value + placement.dx, y_value + placement.dy)
-                for x_value, y_value in source.outer_points
+        for raster_orders in (0, 2):
+            pieces = picture_like_pieces()
+            result = organize_pieces(
+                pieces,
+                (0, 0, 1000, 2050),
+                spacing=4.0,
+                rotations={piece.piece_id: (0.0,) for piece in pieces},
+                search_mode="fast",
+                search_budget=(4, raster_orders, 1, 1),
+                toolpath_offset=2.0,
             )
-            compensated.append(
-                CommonLineContour(
-                    placement.piece_id,
-                    round_offset_closed_polygon(placed, 2.0),
+
+            self.assertEqual(len(result.placements), len(pieces))
+            self.assertFalse(result.unplaced_piece_ids)
+            by_id = {piece.piece_id: piece for piece in pieces}
+            compensated = []
+            for placement in result.placements:
+                source = by_id[placement.piece_id]
+                placed = tuple(
+                    (x_value + placement.dx, y_value + placement.dy)
+                    for x_value, y_value in source.outer_points
                 )
-            )
-        plan = plan_common_line_cut(compensated, tolerance=0.02)
+                compensated.append(
+                    CommonLineContour(
+                        placement.piece_id,
+                        round_offset_closed_polygon(placed, 2.0),
+                    )
+                )
+            plan = plan_common_line_cut(compensated, tolerance=0.02)
 
-        self.assertTrue(plan.is_valid)
-        self.assertGreaterEqual(len(plan.shared_segments), 1)
+            self.assertTrue(plan.is_valid)
+            if raster_orders == 0:
+                self.assertGreaterEqual(len(plan.shared_segments), 1)
+            self.assertFalse(validate_organization_result_geometry(
+                pieces, result, minimum_clearance=4.0, toolpath_offset=2.0,
+            ))
 
     def test_exact_vector_gate_rejects_crossing_placements_and_accepts_t_junction(self):
         pieces = (

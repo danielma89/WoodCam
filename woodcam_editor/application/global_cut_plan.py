@@ -35,6 +35,7 @@ from .common_line import (
 class CutDepthStrategy(str, Enum):
     PER_PIECE = "per_piece"
     PIECE_BIDIRECTIONAL = "piece_bidirectional"
+    PIECE_UNIDIRECTIONAL = "piece_unidirectional"
     GLOBAL_BY_DEPTH = "global_by_depth"
     HYBRID_STABILITY = "hybrid_stability"
     HYBRID_PIECE_BIDIRECTIONAL = "hybrid_piece_bidirectional"
@@ -617,6 +618,7 @@ class GlobalCutPlan:
 
         if self.strategy in {
             CutDepthStrategy.PIECE_BIDIRECTIONAL,
+            CutDepthStrategy.PIECE_UNIDIRECTIONAL,
             CutDepthStrategy.HYBRID_STABILITY,
             CutDepthStrategy.HYBRID_PIECE_BIDIRECTIONAL,
         }:
@@ -634,6 +636,7 @@ class GlobalCutPlan:
                     "fast",
                     "per_piece_common_line",
                     "piece_bidirectional",
+                    "piece_unidirectional",
                     "final_sheet_pass",
                     "stability",
                 }:
@@ -678,6 +681,11 @@ class GlobalCutPlan:
                     raise GlobalCutPlanError(
                         "a camada por peça não usa a visita bidirecional"
                     )
+                elif (
+                    self.strategy == CutDepthStrategy.PIECE_UNIDIRECTIONAL
+                    and operation.routing_mode != "piece_unidirectional"
+                ):
+                    raise GlobalCutPlanError("a visita por peça não usa sentido único")
                 elif (
                     self.strategy == CutDepthStrategy.HYBRID_STABILITY
                     and operation.routing_mode != self.hybrid_intermediate_mode
@@ -1982,6 +1990,77 @@ def _paths_to_segments(
     return tuple(result)
 
 
+def _split_trails_for_safe_entry(
+    segments: Sequence[PhysicalCutSegment],
+    tolerance: float,
+    tool_diameter: float,
+) -> Tuple[PhysicalCutSegment, ...]:
+    """Create straight, corner-clear nodes usable by every routed trail.
+
+    ``GlobalCutTrail`` can start only at a physical segment boundary. Source
+    SVG paths often start inside a flattened Dogbone arc, so retaining the
+    source boundary as the first trail node made the cutter plunge in the
+    relief. Split each sufficiently long non-tab edge at its midpoint instead.
+    The new physical atoms preserve exactly the same geometry and total
+    coverage while giving the router safe candidates around the whole profile.
+    This happens before shared/exclusive ownership separates one piece
+    perimeter into open fragments, so reconstructed owner trails retain the
+    safe nodes too.
+    """
+
+    segments = tuple(segments)
+    if not segments:
+        return ()
+    minimum_clearance = max(abs(float(tool_diameter)) * 2.0, 12.0)
+    split_ids = {
+        segment.segment_id
+        for segment in segments
+        if not segment.retains_tab
+        and segment.kind != PhysicalSegmentKind.SHARED
+        and segment.length >= minimum_clearance * 2.0 - 1.0e-9
+    }
+    if not split_ids:
+        return segments
+
+    result = []
+    used_ids = {
+        segment.segment_id
+        for segment in segments
+        if segment.segment_id not in split_ids
+    }
+    for segment in segments:
+        if segment.segment_id not in split_ids:
+            result.append(segment)
+            continue
+        midpoint = segment.start.lerp(segment.end, 0.5)
+        for start, end in ((segment.start, midpoint), (midpoint, segment.end)):
+            segment_id = _segment_id(
+                segment.kind,
+                segment.owner_ids,
+                start,
+                end,
+                tolerance,
+            )
+            if segment_id in used_ids:
+                raise GlobalCutPlanError(
+                    "segmento físico duplicado ao criar entrada segura"
+                )
+            used_ids.add(segment_id)
+            result.append(
+                PhysicalCutSegment(
+                    segment_id,
+                    start,
+                    end,
+                    segment.kind,
+                    segment.owner_ids,
+                    segment.retains_tab,
+                    segment.waste_id,
+                    segment.tab_height_override,
+                )
+            )
+    return tuple(result)
+
+
 def _rings_touch_or_cross(first, second, tolerance):
     for first_index, first_start in enumerate(first):
         first_end = first[(first_index + 1) % len(first)]
@@ -2760,21 +2839,32 @@ def _route_variants(
     variants = []
     if trail.closed:
         edge_count = len(trail.segment_ids)
-        if geometric_vertices_only:
-            offsets = []
-            for index in range(edge_count):
-                previous = trail.points[index - 1]
-                current = trail.points[index]
-                following = trail.points[index + 1]
-                incoming = current - previous
-                outgoing = following - current
-                scale = max(incoming.length() * outgoing.length(), 1.0e-12)
-                cross_ratio = abs(incoming.cross(outgoing)) / scale
-                dot_ratio = incoming.dot(outgoing) / scale
-                if cross_ratio > 1.0e-7 or dot_ratio < 1.0 - 1.0e-7:
-                    offsets.append(index)
-            if not offsets:
-                offsets = list(range(edge_count))
+        safe_offsets = []
+        for index in range(edge_count):
+            previous = trail.points[index - 1]
+            current = trail.points[index]
+            following = trail.points[index + 1]
+            incoming = current - previous
+            outgoing = following - current
+            scale = max(incoming.length() * outgoing.length(), 1.0e-12)
+            cross_ratio = abs(incoming.cross(outgoing)) / scale
+            dot_ratio = incoming.dot(outgoing) / scale
+            if (
+                cross_ratio <= 1.0e-7
+                and dot_ratio >= 1.0 - 1.0e-7
+                and min(incoming.length(), outgoing.length()) >= 12.0 - 1.0e-9
+            ):
+                safe_offsets.append(index)
+        if safe_offsets:
+            # Midpoints inserted by ``_split_trails_for_safe_entry``
+            # are collinear and have real clearance on both sides. Never
+            # trade them for a nearer Dogbone chord or geometric corner.
+            offsets = safe_offsets
+        elif geometric_vertices_only:
+            # A tiny all-curved contour may have no straight entry at all.
+            # Keep it machinable, but do not pretend one of its corners is a
+            # preferred/safe geometric entry.
+            offsets = list(range(edge_count))
         elif edge_count <= 48:
             offsets = list(range(edge_count))
         else:
@@ -2807,15 +2897,22 @@ def _route_variants(
             )
         if trail.reversible:
             for offset in offsets:
+                # ``oriented`` reverses the edge list before applying its
+                # rotation. The same numeric offset therefore names a
+                # different physical vertex after reversal. Map the original
+                # safe vertex into reversed-edge coordinates; otherwise a
+                # midpoint chosen on a straight can silently become the SVG's
+                # first Dogbone chord when the bidirectional router reverses.
+                reverse_offset = (-offset) % edge_count
                 prepared = trail.oriented(
                     reverse=True,
-                    start_edge_index=offset,
+                    start_edge_index=reverse_offset,
                 )
                 variants.append(
                     TrailRoute(
                         trail.trail_id,
                         True,
-                        offset,
+                        reverse_offset,
                         prepared.points[0],
                         prepared.points[-1],
                     )
@@ -3454,6 +3551,8 @@ def _schedule_piece_bidirectional_depths(
     depths: Sequence[float],
     start: Vec2,
     tolerance: float,
+    *,
+    single_direction: bool = False,
 ):
     """Cut every piece's pending network at all non-through Z levels.
 
@@ -3461,7 +3560,8 @@ def _schedule_piece_bidirectional_depths(
     trail is kept as one machining visit: depth 1 goes to the far endpoint,
     depth 2 returns on the same remaining trail, and so on.  Shared atoms
     executed by an earlier owner are absent from every later owner's trail at
-    every paired depth.
+    every paired depth. With single_direction, each depth repeats the initial
+    traversal; the CAM adapter retracts and returns between open passes.
     """
 
     depths = tuple(abs(float(depth)) for depth in depths)
@@ -3508,7 +3608,7 @@ def _schedule_piece_bidirectional_depths(
             snapshots[0],
             tolerance,
             prefix,
-            allow_bidirectional=True,
+            allow_bidirectional=not single_direction,
         )
         if not trails:
             return None
@@ -3522,7 +3622,9 @@ def _schedule_piece_bidirectional_depths(
             travel += route_position.distance_to(route.start)
             # An even number of passes ends where the trail visit began; an
             # odd number ends at its far endpoint.
-            route_position = route.end if len(depths) % 2 else route.start
+            route_position = (
+                route.end if single_direction or len(depths) % 2 else route.start
+            )
         pending_shared = tuple(
             segment
             for segment in segments
@@ -3588,7 +3690,9 @@ def _schedule_piece_bidirectional_depths(
                     # An open common-line remainder ends at the opposite node.
                     # Alternate only these paths so the next depth starts
                     # without retracting and traversing the sheet again.
-                    reverse = bool(initial_route.reverse) ^ bool(depth_index % 2)
+                    reverse = bool(initial_route.reverse) ^ bool(
+                        depth_index % 2 and not single_direction
+                    )
                     start_edge_index = 0
                 prepared = trail.oriented(
                     reverse=reverse,
@@ -3743,7 +3847,11 @@ def _schedule_operations(
     sequence = []
     additional_trails = []
     coverage = []
-    if strategy == CutDepthStrategy.PIECE_BIDIRECTIONAL:
+    if strategy in {
+        CutDepthStrategy.PIECE_BIDIRECTIONAL,
+        CutDepthStrategy.PIECE_UNIDIRECTIONAL,
+    }:
+        single_direction = strategy == CutDepthStrategy.PIECE_UNIDIRECTIONAL
         current = (
             start_xy if isinstance(start_xy, Vec2) else Vec2.from_sequence(start_xy)
         )
@@ -3753,6 +3861,7 @@ def _schedule_operations(
                 depths,
                 current,
                 tolerance,
+                single_direction=single_direction,
             )
         )
         additional_trails.extend(created)
@@ -3763,7 +3872,7 @@ def _schedule_operations(
                 depth,
                 _operation_phase(trail),
                 route,
-                "piece_bidirectional",
+                "piece_unidirectional" if single_direction else "piece_bidirectional",
                 owner,
             )
             for trail, depth, route, owner in scheduled
@@ -4008,25 +4117,37 @@ def _schedule_operations(
     else:
         owners = sorted({owner for trail in trails for owner in trail.owner_ids})
         scheduled = set()
+        current = (
+            start_xy if isinstance(start_xy, Vec2) else Vec2.from_sequence(start_xy)
+        )
         for owner in owners:
-            owner_trails = [trail for trail in trails if owner in trail.owner_ids]
             for depth in depths:
                 for phase in (CutPhase.INTERNAL, CutPhase.SHARED, CutPhase.EXTERNAL):
-                    for trail in owner_trails:
+                    pending = [
+                        trail
+                        for trail in trails
+                        if owner in trail.owner_ids
+                        and _operation_phase(trail) == phase
+                        and (trail.trail_id, depth) not in scheduled
+                    ]
+                    for trail, route in _route_piece_trails(
+                        pending,
+                        current,
+                        geometric_entries_only=True,
+                    ):
                         key = (trail.trail_id, depth)
-                        if key in scheduled or _operation_phase(trail) != phase:
-                            continue
                         scheduled.add(key)
                         sequence.append(
                             (
                                 trail,
                                 depth,
                                 phase,
-                                None,
+                                route,
                                 "defined",
                                 owner,
                             )
                         )
+                        current = route.end
 
     if strategy == CutDepthStrategy.GLOBAL_BY_DEPTH:
         sequence = [
@@ -4045,6 +4166,7 @@ def _schedule_operations(
         is_final = abs(depth - depths[-1]) <= 1.0e-9
         if strategy not in {
             CutDepthStrategy.PIECE_BIDIRECTIONAL,
+            CutDepthStrategy.PIECE_UNIDIRECTIONAL,
             CutDepthStrategy.HYBRID_STABILITY,
             CutDepthStrategy.HYBRID_PIECE_BIDIRECTIONAL,
         } or routing_mode == "stability":
@@ -4056,6 +4178,7 @@ def _schedule_operations(
                 )
         if strategy in {
             CutDepthStrategy.PIECE_BIDIRECTIONAL,
+            CutDepthStrategy.PIECE_UNIDIRECTIONAL,
             CutDepthStrategy.HYBRID_STABILITY,
             CutDepthStrategy.HYBRID_PIECE_BIDIRECTIONAL,
         }:
@@ -4092,6 +4215,7 @@ def _schedule_operations(
         phase_at_depth.setdefault((round(depth, 9), phase), []).append(operation_id)
         if strategy in {
             CutDepthStrategy.PIECE_BIDIRECTIONAL,
+            CutDepthStrategy.PIECE_UNIDIRECTIONAL,
             CutDepthStrategy.HYBRID_STABILITY,
             CutDepthStrategy.HYBRID_PIECE_BIDIRECTIONAL,
         }:
@@ -4662,6 +4786,13 @@ def build_global_cut_plan(
     if not segments:
         raise GlobalCutPlanError("nenhum segmento físico foi produzido")
 
+    segments = list(
+        _split_trails_for_safe_entry(
+            tuple(segments),
+            tolerance,
+            tool_diameter,
+        )
+    )
     trails = _build_trails(tuple(segments), tolerance)
     tabs = _tabs_from_segments(tuple(segments), tab_thickness)
     reports = (
@@ -4730,7 +4861,9 @@ def build_global_cut_plan(
         segment_depth_coverage=coverage,
         route_metrics=route_metrics,
         hybrid_intermediate_mode=(
-            "piece_bidirectional"
+            "piece_unidirectional"
+            if strategy == CutDepthStrategy.PIECE_UNIDIRECTIONAL
+            else "piece_bidirectional"
             if strategy in {
                 CutDepthStrategy.PIECE_BIDIRECTIONAL,
                 CutDepthStrategy.HYBRID_PIECE_BIDIRECTIONAL,

@@ -17,6 +17,7 @@ from woodcam_editor.application.global_cut_plan import (
     TabRetentionKind,
     build_global_cut_plan,
     optimize_fast_trails,
+    _route_variants,
     _schedule_operations,
     _balanced_waste_tab_placements,
 )
@@ -55,6 +56,41 @@ def plan_for(contours, **overrides):
 
 
 class GlobalCutPlanTests(unittest.TestCase):
+    def test_reversed_closed_route_keeps_the_same_safe_physical_vertex(self):
+        trail = GlobalCutTrail(
+            "reversible-safe-entry",
+            (
+                Vec2(0, 0),
+                Vec2(50, 0),
+                Vec2(100, 0),
+                Vec2(100, 10),
+                Vec2(0, 10),
+                Vec2(0, 0),
+            ),
+            ("a", "b", "c", "d", "e"),
+            (False, False, False, False, False),
+            PhysicalSegmentKind.EXTERNAL,
+            ("A",),
+            True,
+        )
+
+        reverse_routes = [route for route in _route_variants(trail) if route.reverse]
+        self.assertTrue(reverse_routes)
+        self.assertEqual(
+            {route.start for route in reverse_routes},
+            {Vec2(50, 0)},
+        )
+        for route in reverse_routes:
+            routed = trail.oriented(
+                reverse=True,
+                start_edge_index=route.start_edge_index,
+            )
+            incoming = routed.points[0] - routed.points[-2]
+            outgoing = routed.points[1] - routed.points[0]
+            scale = incoming.length() * outgoing.length()
+            self.assertAlmostEqual(incoming.cross(outgoing) / scale, 0.0)
+            self.assertAlmostEqual(incoming.dot(outgoing) / scale, 1.0)
+
     def test_common_line_tolerance_does_not_erase_compensated_relief_arcs(self):
         document = VectorDocument.create_default()
         notched = PathEntity.from_points(
@@ -99,6 +135,21 @@ class GlobalCutPlanTests(unittest.TestCase):
 
                 self.assertEqual(len(plan.trails), 1)
                 self.assertTrue(plan.trails[0].closed)
+                operation = next(
+                    operation
+                    for operation in plan.operations
+                    if operation.phase == CutPhase.EXTERNAL
+                )
+                routed = plan.trails[0].oriented(
+                    start_edge_index=operation.start_edge_index,
+                )
+                incoming = routed.points[0] - routed.points[-2]
+                outgoing = routed.points[1] - routed.points[0]
+                scale = incoming.length() * outgoing.length()
+                self.assertGreaterEqual(incoming.length(), 12.0)
+                self.assertGreaterEqual(outgoing.length(), 12.0)
+                self.assertAlmostEqual(incoming.cross(outgoing) / scale, 0.0)
+                self.assertAlmostEqual(incoming.dot(outgoing) / scale, 1.0)
                 actual_length = sum(segment.length for segment in plan.segments)
                 self.assertAlmostEqual(actual_length, expected_length, places=6)
                 moves = build_global_cut_plan_moves(
@@ -361,7 +412,10 @@ class GlobalCutPlanTests(unittest.TestCase):
                 for segment in plan.segments
             )
         )
-        self.assertEqual(len(plan.segments), 8)
+        # Four perimeter edges remain independent per rectangle. Each long
+        # edge is split once so routing can choose a straight midpoint around
+        # the profile instead of forcing a plunge on a corner.
+        self.assertEqual(len(plan.segments), 16)
 
     def test_partial_common_line_splits_normal_shared_normal(self):
         plan = plan_for(

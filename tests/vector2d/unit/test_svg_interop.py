@@ -11,6 +11,7 @@ from woodcam_editor.domain.entities import (
 )
 from woodcam_editor.domain.primitives import Vec2
 from woodcam_editor.domain.spans import ArcSpan
+from woodcam_editor.domain.validation import validate_document
 from woodcam_editor.exporters.svg import export_svg
 from woodcam_editor.importers.svg import import_svg
 from woodcam_editor.importers.layers import remap_import_layers
@@ -22,6 +23,33 @@ FIXTURE = os.path.abspath(
 
 
 class SvgInteropTests(unittest.TestCase):
+    def test_open_subpath_inside_closed_sibling_is_imported_as_piece_marking(self):
+        svg = """<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="50mm" viewBox="0 0 100 50">
+          <path d="M0 0H100V50H0Z M20 25H80" fill="none" stroke="#000"/>
+        </svg>"""
+        handle = tempfile.NamedTemporaryFile(
+            suffix=".svg",
+            mode="w",
+            encoding="utf-8",
+            delete=False,
+        )
+        try:
+            handle.write(svg)
+            handle.close()
+            document = VectorDocument.create_default()
+            imported = import_svg(
+                handle.name,
+                layer_id=document.active_layer_id,
+            )
+        finally:
+            os.unlink(handle.name)
+
+        self.assertEqual(len(imported.entities), 2)
+        marking = next(entity for entity in imported.entities if not entity.closed)
+        self.assertEqual(marking.metadata.get("woodcam_role"), "piece_marking")
+        document.add_entities(imported.entities)
+        self.assertFalse(validate_document(document).by_code("OPEN_PATH"))
+
     def test_selected_compound_expands_all_children_once(self):
         document = VectorDocument.create_default()
         contour_layer = Layer(

@@ -18,6 +18,7 @@ from .document import (
     VectorDocument,
     WorkArea,
     entity_is_cam_eligible,
+    entity_is_piece_marking,
     entity_is_pocket_feature,
     entity_is_remnant_cut,
     pocket_feature_owner_key,
@@ -630,10 +631,26 @@ def validate_document(
             # Metadata is auxiliary projection state; malformed legacy values
             # must not crash a read-only diagnostic.
             continue
+    piece_marking_ids = frozenset(
+        {
+            marking_id
+            for piece in document.pieces_by_id.values()
+            for marking_id in piece.marking_path_ids
+        }
+        | {
+            entity.id
+            for entity in all_cam_entities
+            if entity_is_piece_marking(entity)
+        }
+    )
     redundant_overline_ids = frozenset(
         redundant_open_overline_entity_ids(
             document,
-            entity_ids=(entity.id for entity in all_cam_entities),
+            entity_ids=(
+                entity.id
+                for entity in all_cam_entities
+                if entity.id not in piece_marking_ids
+            ),
             geometric_tolerance=geometric_tolerance,
             deflection=deflection,
         )
@@ -659,7 +676,7 @@ def validate_document(
 
     for entity in cam_entities:
         if isinstance(entity, PathEntity):
-            if not entity.closed:
+            if not entity.closed and entity.id not in piece_marking_ids:
                 nodes = entity.nodes()
                 issues.append(
                     _make_issue(

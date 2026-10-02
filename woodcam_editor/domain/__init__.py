@@ -28,6 +28,7 @@ from .document import (
     VectorDocument,
     WorkArea,
     entity_is_cam_eligible,
+    entity_is_piece_marking,
     entity_is_remnant_cut,
     layer_is_cam_eligible,
 )
@@ -133,6 +134,7 @@ __all__ = [
     "VectorDocument",
     "WorkArea",
     "entity_is_cam_eligible",
+    "entity_is_piece_marking",
     "entity_is_remnant_cut",
     "layer_is_cam_eligible",
     "AddEntitiesCommand",

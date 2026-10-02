@@ -113,6 +113,74 @@ def regular_polygon(identifier, center, radius, sides=16, layer_id="design"):
 
 
 class GeometryAdapterTests(unittest.TestCase):
+    def test_whole_document_ignores_open_piece_marking(self):
+        outer = rectangle()
+        marking = PathEntity(
+            "marking",
+            "design",
+            (LineSpan(Point(10, 20), Point(30, 20)),),
+            False,
+            {"woodcam_role": "piece_marking"},
+        )
+        document = Document(
+            {outer.id: outer, marking.id: marking},
+            {"design": Layer("design")},
+        )
+
+        geometry = document_to_woodcam_geometry(document)
+
+        self.assertEqual(len(geometry["contours"]), 1)
+        with self.assertRaises(GeometryAdapterError):
+            document_to_woodcam_geometry(
+                document,
+                entity_ids=(marking.id,),
+            )
+
+    def test_selected_imported_polyline_circle_is_a_drill_hole(self):
+        imported_hole = regular_polygon(
+            "selected-hole-polyline",
+            Point(20, 25),
+            5,
+        )
+        document = Document(
+            {imported_hole.id: imported_hole},
+            {"design": Layer("design")},
+        )
+
+        geometry = document_to_woodcam_geometry(
+            document,
+            entity_ids=(imported_hole.id,),
+        )
+
+        self.assertEqual(len(geometry["holes"]), 1)
+        self.assertEqual(geometry["contours"], [])
+        self.assertAlmostEqual(geometry["holes"][0]["diameter_mm"], 10.0, places=3)
+
+    def test_piece_outer_circle_is_never_promoted_to_drill_hole(self):
+        dogbone_like_outer = regular_polygon(
+            "dogbone-like-piece-outer",
+            Point(20, 25),
+            1.5875,
+        )
+        piece = Piece(
+            "round-external-feature",
+            dogbone_like_outer.id,
+            (),
+        )
+        document = Document(
+            {dogbone_like_outer.id: dogbone_like_outer},
+            {"design": Layer("design")},
+            {piece.id: piece},
+        )
+
+        geometry = document_to_woodcam_geometry(
+            document,
+            entity_ids=(dogbone_like_outer.id,),
+        )
+
+        self.assertEqual(geometry["holes"], [])
+        self.assertEqual(len(geometry["contours"]), 1)
+
     def test_remnant_cut_is_reserved_for_the_open_centerline_bridge(self):
         remnant = PathEntity(
             "remnant",

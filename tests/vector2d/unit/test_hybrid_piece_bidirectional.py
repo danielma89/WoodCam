@@ -132,10 +132,15 @@ class HybridPieceBidirectionalTests(unittest.TestCase):
             [operation.reverse_trail for operation in intermediate],
             [False, False, False, True, False, True],
         )
-        self.assertEqual(
-            [len(operation.segment_ids) for operation in intermediate],
-            [4, 4, 3, 3, 3, 3],
-        )
+        # Safe mid-edge entry nodes split long physical atoms without changing
+        # coverage. Both depths of one visit must still traverse the exact
+        # same atom set once.
+        for first, second in zip(intermediate[::2], intermediate[1::2]):
+            self.assertEqual(
+                set(first.segment_ids),
+                set(second.segment_ids),
+            )
+            self.assertEqual(len(first.segment_ids), len(set(first.segment_ids)))
 
     def test_open_remainder_goes_out_at_z1_and_returns_on_same_edges_at_z2(self):
         plan = experimental(
@@ -450,7 +455,7 @@ class HybridPieceBidirectionalTests(unittest.TestCase):
                 owner_order.append(owner)
         self.assertEqual(owner_order, ["A", "B", "C"])
 
-    def test_best_fixation_does_not_create_intermediate_mid_edge_entry(self):
+    def test_best_fixation_keeps_closed_entry_on_a_clear_straight_segment(self):
         plan = experimental(
             (
                 rectangle("A", 0, 0, 80, 40),
@@ -464,10 +469,6 @@ class HybridPieceBidirectionalTests(unittest.TestCase):
             tool_diameter=6.0,
         )
         trails = {trail.trail_id: trail for trail in plan.trails}
-        original_corners = {
-            "A": {(0.0, 0.0), (80.0, 0.0), (80.0, 40.0), (0.0, 40.0)},
-            "B": {(80.0, 0.0), (160.0, 0.0), (160.0, 40.0), (80.0, 40.0)},
-        }
         first_by_owner = {}
         for operation in plan.operations:
             if operation.routing_mode != "piece_bidirectional":
@@ -478,7 +479,13 @@ class HybridPieceBidirectionalTests(unittest.TestCase):
                 reverse=operation.reverse_trail,
                 start_edge_index=operation.start_edge_index,
             )
-            self.assertIn(prepared.points[0].to_tuple(), original_corners[owner])
+            if prepared.closed:
+                incoming = prepared.points[0] - prepared.points[-2]
+                outgoing = prepared.points[1] - prepared.points[0]
+                scale = incoming.length() * outgoing.length()
+                self.assertGreaterEqual(min(incoming.length(), outgoing.length()), 12.0)
+                self.assertAlmostEqual(incoming.cross(outgoing) / scale, 0.0)
+                self.assertAlmostEqual(incoming.dot(outgoing) / scale, 1.0)
         self.assertTrue(
             all(
                 operation.routing_mode == "final_sheet_pass"
@@ -511,7 +518,7 @@ class HybridPieceBidirectionalTests(unittest.TestCase):
         ]
         self.assertEqual(
             [(move["x"], move["y"]) for move in xy_entries],
-            [(0.0, 0.0), (80.0, 0.0), (160.0, 0.0)],
+            [(0.0, 20.0), (80.0, 0.0), (160.0, 0.0)],
         )
         for entry in xy_entries:
             entry_index = moves.index(entry)

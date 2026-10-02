@@ -56,6 +56,9 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
     def setUp(self):
+        from woodcam_editor.presentation.i18n import set_language
+
+        set_language("pt")
         document = self.VectorDocument.create_default(self.WorkArea(0.0, 0.0, 300.0, 200.0))
         path = self.PathEntity.from_points(
             document.active_layer_id,
@@ -656,6 +659,15 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         self.widget._menu_actions["Arquivo"]["Vetorizar imagem…"].trigger()
         self.assertEqual(trace_spy.count(), 1)
 
+    def test_nesting_spacing_accepts_three_decimal_cutter_values(self):
+        self.assertEqual(self.widget.nesting_spacing.decimals(), 3)
+        self.assertAlmostEqual(
+            self.widget.nesting_spacing.singleStep(),
+            0.125,
+        )
+        self.widget.nesting_spacing.setValue(3.175)
+        self.assertAlmostEqual(self.widget.nesting_spacing.value(), 3.175)
+
     def test_language_menu_translates_presentation_and_keeps_actions(self):
         from woodcam_editor.presentation.i18n import (
             language,
@@ -861,6 +873,29 @@ class EditorWidgetInteractionTests(unittest.TestCase):
                 translate_text("Fresa maior que 2 região(ões) selecionada(s)"),
                 "Tool larger than 2 selected region(s)",
             )
+            self.assertEqual(
+                translate_text(
+                    "Selecione somente uma operação para simular. "
+                    "Corte e Furo não podem ser misturados numa prévia única."
+                ),
+                "Select only one operation to simulate. Cut and Drill cannot "
+                "be combined in one preview.",
+            )
+            narrow_warning = translate_text(
+                "A fresa Ø %.2f mm não alcança todos os detalhes de %d peça(s). "
+                "A compensação externa fechou uma região estreita; o primeiro "
+                "ponto está próximo de X %.2f / Y %.2f.\n\nCortar mesmo assim "
+                "mantém o contorno externo compensado. Dogbones e T-bones "
+                "continuam no próprio percurso externo: a fresa entra e retorna "
+                "pelo mesmo kerf, sem retração nem novo mergulho. Em uma fenda "
+                "aberta, a fresa segue o eixo médio local para retirar o mínimo "
+                "possível de cada lateral. A abertura final nunca pode ser menor "
+                "que o diâmetro da ferramenta. Confira a prévia antes de gerar "
+                "o G-code."
+            ) % (4.0, 1, 12.5, 7.0)
+            self.assertIn("The Ø 4.00 mm cutter cannot reach", narrow_warning)
+            self.assertIn("without retracting or plunging again", narrow_warning)
+            self.assertNotIn("A fresa", narrow_warning)
             # Switching language is presentation-only; it cannot create an
             # editor command or alter the document revision.
             self.assertEqual(self.document.revision, revision_before)
@@ -952,6 +987,72 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         self.widget.adapter.clear_preview_sheet_bounds()
         self.assertFalse(self.widget.adapter.preview_sheet_label_items)
 
+    def test_sheet_panel_creates_one_empty_undoable_sheet(self):
+        before_entities = dict(self.document.entities_by_id)
+        self.widget.controller.execute(
+            self.SetDocumentMetadataCommand(
+                "organization_sheet_bounds",
+                [[0.0, 0.0, 300.0, 200.0], [350.0, 0.0, 650.0, 200.0]],
+            )
+        )
+        self.widget.sheet_panel.list.setCurrentRow(1)
+
+        self.widget.sheet_panel.add_button.click()
+        self.app.processEvents()
+
+        self.assertEqual(self.document.entities_by_id, before_entities)
+        self.assertEqual(
+            self.document.metadata["organization_sheet_bounds"],
+            [
+                [0.0, 0.0, 300.0, 200.0],
+                [350.0, 0.0, 650.0, 200.0],
+                [700.0, 0.0, 1000.0, 200.0],
+            ],
+        )
+        self.assertEqual(self.widget.sheet_panel.list.count(), 3)
+        self.assertEqual(self.widget.sheet_panel.current_index(), 2)
+        self.assertEqual(
+            self.widget._active_sheet_origin,
+            QtCore.QPointF(700.0, 0.0),
+        )
+        self.widget.undo()
+        self.app.processEvents()
+        self.assertEqual(self.widget.sheet_panel.list.count(), 2)
+        self.assertEqual(self.document.entities_by_id, before_entities)
+
+    def test_sheet_panel_delete_and_edit_are_atomic(self):
+        self.widget.controller.execute(self.SetDocumentMetadataCommand(
+            "organization_sheet_bounds", [[0.,0.,300.,200.], [350.,0.,650.,200.]]))
+        panel = self.widget.sheet_panel
+        panel.list.setCurrentRow(1)
+        before = dict(self.document.entities_by_id)
+        revision = self.document.revision
+        def accept_size():
+            dialog = self.app.activeModalWidget()
+            self.assertEqual(self.document.revision, revision)
+            dialog.findChild(QtWidgets.QDoubleSpinBox, "sheetWidth").setValue(450.)
+            dialog.findChild(QtWidgets.QDoubleSpinBox, "sheetHeight").setValue(250.)
+            dialog.accept()
+        QtCore.QTimer.singleShot(0, accept_size)
+        panel.edit_button.click()
+        self.app.processEvents()
+        self.assertEqual(self.document.metadata["organization_sheet_bounds"],
+                         [[0.,0.,300.,200.], [350.,0.,800.,250.]])
+        self.assertEqual(self.document.entities_by_id, before)
+        self.widget.undo()
+        self.assertEqual(panel.document_bounds()[1], (350.,0.,650.,200.))
+        panel.list.setCurrentRow(1)
+        panel.delete_button.click()
+        self.app.processEvents()
+        self.assertEqual(panel.list.count(), 1)
+        self.assertEqual(self.document.entities_by_id, before)
+        self.widget.undo()
+        self.assertEqual(panel.list.count(), 2)
+        revision = self.document.revision
+        QtCore.QTimer.singleShot(0, lambda: self.app.activeModalWidget().reject())
+        panel.edit_button.click()
+        self.assertEqual(self.document.revision, revision)
+
     def test_remnant_cut_preview_becomes_a_selectable_document_vector(self):
         before = dict(self.document.entities_by_id)
         cut = {
@@ -965,8 +1066,17 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         self.widget.adapter.show_preview_remnant_cuts([cut])
         self.assertEqual(len(self.widget.adapter.preview_remnant_cut_items), 1)
         self.assertEqual(len(self.widget.adapter.preview_remnant_label_items), 1)
+        self.assertFalse(self.widget.adapter.preview_remnant_label_items[0].isVisible())
+        self.assertIn("Retalho 300 × 30 mm", self.widget.adapter.preview_remnant_cut_items[0].toolTip())
+        self.assertTrue(self.widget.adapter.preview_remnant_cut_items[0].acceptHoverEvents())
         self.widget.adapter.clear_preview_remnant_cuts()
         self.assertFalse(self.widget.adapter.preview_remnant_cut_items)
+        from woodcam_editor.presentation.i18n import set_language
+        set_language("en")
+        self.widget.adapter.show_preview_remnant_cuts([cut])
+        self.assertIn("Remnant 300 × 30 mm", self.widget.adapter.preview_remnant_cut_items[0].toolTip())
+        self.widget.adapter.clear_preview_remnant_cuts()
+        set_language("pt")
 
         remnant = self.PathEntity.from_points(
             self.document.active_layer_id,
@@ -1005,13 +1115,34 @@ class EditorWidgetInteractionTests(unittest.TestCase):
             "Retalho 300 × 30 mm",
             self.widget.adapter.remnant_label_items[0].text(),
         )
+        self.assertFalse(self.widget.adapter.remnant_label_items[0].isVisible())
+        self.assertIn("Retalho 300 × 30 mm", self.widget.adapter.items_by_id[remnant.id].toolTip())
+        set_language("en")
+        self.assertIn("Remnant 300 × 30 mm", self.widget.adapter.items_by_id[remnant.id].toolTip())
+        self.assertIn("Remnant 300 × 30 mm", self.widget.adapter.remnant_label_items[0].text())
+        set_language("pt")
         self.widget.controller.selection.select_only(remnant.id)
         self.widget.adapter.update_selection()
         self.assertEqual(self.widget.selected_entity_ids, (remnant.id,))
+        self.assertTrue(self.widget.adapter.remnant_label_items[0].isVisible())
         self.widget.controller.undo()
         self.app.processEvents()
         self.assertNotIn(remnant.id, self.document.entities_by_id)
         self.assertFalse(self.widget.adapter.remnant_cut_items)
+        self.assertFalse(self.widget.adapter.remnant_label_items)
+
+        self.widget.controller.redo()
+        self.app.processEvents()
+        self.widget.controller.selection.select_only(remnant.id)
+        self.widget.controller.delete_selected()
+        self.app.processEvents()
+        self.assertNotIn(remnant.id, self.document.entities_by_id)
+        self.assertFalse(self.document.metadata["organization_remnant_cuts"])
+        self.assertFalse(self.widget.adapter.remnant_label_items)
+        self.widget.controller.undo()
+        self.app.processEvents()
+        self.assertIn(remnant.id, self.document.entities_by_id)
+        self.assertEqual(len(self.widget.adapter.remnant_label_items), 1)
 
     def test_sheet_panel_uses_a_local_origin_for_status_snap_and_exact_position(self):
         self.widget.controller.execute(
@@ -1648,6 +1779,12 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         self.widget.view.setFocus()
 
         QtTest.QTest.keyClick(self.widget.view, QtCore.Qt.Key_C, QtCore.Qt.ControlModifier)
+        target = self.Vec2(80.0, 155.0)
+        pointer = self.viewport_point(target.x, target.y)
+        mapped_target = self.widget.view.mapToScene(pointer)
+        QtTest.QTest.mouseMove(
+            self.widget.view.viewport(), pointer
+        )
         QtTest.QTest.keyClick(self.widget.view, QtCore.Qt.Key_V, QtCore.Qt.ControlModifier)
         self.app.processEvents()
 
@@ -1656,6 +1793,13 @@ class EditorWidgetInteractionTests(unittest.TestCase):
         self.assertIsInstance(copied_group, self.GroupEntity)
         self.assertEqual(len(copied_group.child_ids), 2)
         self.assertEqual(len(self.document.entities_by_id), 6)
+        copied_hole = next(
+            self.document.get_entity(child_id)
+            for child_id in copied_group.child_ids
+            if isinstance(self.document.get_entity(child_id), CircleEntity)
+        )
+        self.assertAlmostEqual(copied_hole.center.x, mapped_target.x(), places=4)
+        self.assertAlmostEqual(copied_hole.center.y, mapped_target.y(), places=4)
         self.assertIn("peça inteira", self.widget.mode_label.text().lower())
 
         self.widget.undo()

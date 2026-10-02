@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
+import sys
+import types
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -47,6 +50,26 @@ class PanelNestLanguageTests(unittest.TestCase):
 
         set_language("pt")
         self.window.close()
+
+    def test_fresh_install_uses_english_and_keeps_saved_language(self):
+        from panelnest.i18n import _stored_language
+
+        preferences = {}
+
+        class Parameters:
+            def __init__(self, path):
+                self.path = path
+
+            def GetString(self, key, default=""):
+                return preferences.get((self.path, key), default)
+
+        fake_freecad = types.SimpleNamespace(ParamGet=Parameters)
+        with patch.dict(sys.modules, {"FreeCAD": fake_freecad}):
+            self.assertEqual(_stored_language(), "en")
+            preferences[("User parameter:BaseApp/Preferences/WoodCAM2D", "language")] = "pt"
+            self.assertEqual(_stored_language(), "pt")
+            preferences[("User parameter:BaseApp/Preferences/PanelNest", "language")] = "en"
+            self.assertEqual(_stored_language(), "en")
 
     def test_global_menu_translates_commands_and_restores_without_mutation(self):
         from panelnest.i18n import set_language

@@ -17,11 +17,26 @@ IGNORED_PARTS = {
     ".agents",
     "backups",
     "dist",
+    "experiments",
     "local_ai",
     "output",
     "outputs",
     "test-results",
     "tests",
+}
+IGNORED_SUFFIXES = {
+    ".zip",
+    ".fcstd",
+    ".fcstd1",
+    ".fcbak",
+    ".nc",
+    ".gcode",
+    ".log",
+    ".onnx",
+    ".pth",
+    ".safetensors",
+    ".gguf",
+    ".part",
 }
 
 
@@ -32,7 +47,7 @@ def _iter_package_files(root):
             continue
         if any(part in IGNORED_PARTS for part in relative.parts):
             continue
-        if path.is_file() and path.suffix not in {".pyc", ".pyo"}:
+        if path.is_file() and path.suffix.lower() not in IGNORED_SUFFIXES | {".pyc", ".pyo"}:
             yield path, relative
 
 

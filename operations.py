@@ -144,18 +144,31 @@ def _point_in_polygon(point, polygon):
     return inside
 
 
-def split_nested_contours(contours):
-    """Separa contornos externos e internos pela paridade de contenção."""
+def split_nested_contours(contours, reference_contours=None):
+    """Separa externos/internos pela paridade no desenho completo.
+
+    ``reference_contours`` permite cortar somente um recorte interno sem
+    perder a peça externa que define seu lado de compensação.
+    """
     clean_contours = [_clean_closed_points(contour) for contour in contours if contour]
+    references = (
+        [_clean_closed_points(contour) for contour in reference_contours if contour]
+        if reference_contours is not None else clean_contours
+    )
     outer = []
     inner = []
 
     for index, contour in enumerate(clean_contours):
         probe = contour[0]
+        candidates = (
+            (other for other_index, other in enumerate(references)
+             if other_index != index)
+            if reference_contours is None else
+            (other for other in references if other != contour)
+        )
         nesting_depth = sum(
             _point_in_polygon(probe, other)
-            for other_index, other in enumerate(clean_contours)
-            if other_index != index
+            for other in candidates
         )
         (inner if nesting_depth % 2 else outer).append(contour)
 
@@ -491,11 +504,14 @@ def external_compensation_detail_loss(points, tool_diameter):
     The result is presentation-neutral evidence for the caller's confirmation
     workflow.  A narrow open slot is reduced to its medial centre-line,
     including tapered and stepped walls.  Only collapsed details that cannot
-    be interpreted safely as one slot retain their local source polyline.  The
+    be interpreted safely as one slot retain their local source polyline.  A
+    short circular Dogbone/corner relief made for a smaller cutter is returned
+    as a profile excursion.  The caller must splice that excursion into the
+    engaged external cut; it must never become an auxiliary plunge.  The
     complete outer contour is never changed to an on-vector cut.
 
-    ``None`` means that the normal compensated contour represents the complete
-    source boundary within the cutter-radius envelope.
+    ``None`` means that there is no actionable collapsed slot outside the
+    normal cutter-radius treatment of the compensated contour.
     """
 
     source = _clean_closed_points(points)
@@ -566,7 +582,66 @@ def external_compensation_detail_loss(points, tool_diameter):
                 )
 
     neighbour_radius = int(math.ceil(allowed_distance / cell_size)) + 1
-    first_issue = None
+
+    def circular_arc_radius(values):
+        """Return a fitted radius only for one consistently turning arc."""
+
+        # Imported arcs are tessellated into several chords. Four-point
+        # rectangular notches are also co-circular, so they are deliberately
+        # excluded from this relief recognition.
+        if len(values) < 5:
+            return None
+        first = values[0]
+        middle = values[len(values) // 2]
+        last = values[-1]
+        determinant = 2.0 * (
+            first[0] * (middle[1] - last[1])
+            + middle[0] * (last[1] - first[1])
+            + last[0] * (first[1] - middle[1])
+        )
+        if abs(determinant) <= 1.0e-10:
+            return None
+        first_norm = first[0] * first[0] + first[1] * first[1]
+        middle_norm = middle[0] * middle[0] + middle[1] * middle[1]
+        last_norm = last[0] * last[0] + last[1] * last[1]
+        center = (
+            (
+                first_norm * (middle[1] - last[1])
+                + middle_norm * (last[1] - first[1])
+                + last_norm * (first[1] - middle[1])
+            )
+            / determinant,
+            (
+                first_norm * (last[0] - middle[0])
+                + middle_norm * (first[0] - last[0])
+                + last_norm * (middle[0] - first[0])
+            )
+            / determinant,
+        )
+        fitted_radius = distance(center, first)
+        if fitted_radius <= 1.0e-9:
+            return None
+        radial_tolerance = max(0.02, fitted_radius * 0.02)
+        if any(
+            abs(distance(center, point) - fitted_radius) > radial_tolerance
+            for point in values
+        ):
+            return None
+        turn_sign = 0
+        for left, vertex, right in zip(values, values[1:], values[2:]):
+            cross = (
+                (vertex[0] - left[0]) * (right[1] - vertex[1])
+                - (vertex[1] - left[1]) * (right[0] - vertex[0])
+            )
+            if abs(cross) <= 1.0e-10:
+                continue
+            current_sign = 1 if cross > 0.0 else -1
+            if turn_sign and current_sign != turn_sign:
+                return None
+            turn_sign = current_sign
+        return fitted_radius if turn_sign else None
+
+    issue_by_segment = {}
     affected_segments = set()
     for index, start in enumerate(source):
         end = source[(index + 1) % len(source)]
@@ -601,15 +676,15 @@ def external_compensation_detail_loss(points, tool_diameter):
                 for segment_start, segment_end in compensated_segments
             )
             affected_segments.add(index)
-            if first_issue is None:
-                first_issue = {
+            if index not in issue_by_segment:
+                issue_by_segment[index] = {
                     "point": sample,
                     "distance_to_compensated_path": nearest,
                     "tool_radius": radius,
                     "source_segment_index": index,
                 }
             break
-    if first_issue is None:
+    if not issue_by_segment:
         return None
 
     segment_count = len(source)
@@ -632,9 +707,12 @@ def external_compensation_detail_loss(points, tool_diameter):
 
     cleanup_paths = []
     cleanup_modes = []
+    profile_relief_paths = []
+    retained_segment_indices = set()
     for run in runs:
         local_points = [source[run[0]]]
         local_points.extend(source[(index + 1) % segment_count] for index in run)
+        relief_radius = circular_arc_radius(local_points)
         cleanup_path = tuple(local_points)
         cleanup_mode = "local_source_trace"
 
@@ -651,12 +729,38 @@ def external_compensation_detail_loss(points, tool_diameter):
                 else "slot_medial_axis"
             )
 
+        # A centre-line shorter than one cutter radius is not a traversable
+        # slot. It is the characteristic residual produced when an imported
+        # Dogbone/corner-relief made for a smaller cutter is externally
+        # compensated with a larger one. Adding an auxiliary path here turns
+        # every relief into a separate plunge before the real profile. The
+        # resulting medial excursion must instead be spliced into the engaged
+        # compensated outer contour at the same Z.
+        if (
+            cleanup_mode in {"slot_centerline", "slot_medial_axis"}
+            and relief_radius is not None
+            and relief_radius <= radius + 0.02
+            and _path_length(cleanup_path) <= radius + 1.0e-7
+        ):
+            profile_relief_paths.append(cleanup_path)
+            retained_segment_indices.update(run)
+            continue
+
         cleanup_paths.append(cleanup_path)
         cleanup_modes.append(cleanup_mode)
+        retained_segment_indices.update(run)
 
+    if not cleanup_paths and not profile_relief_paths:
+        return None
+
+    first_segment_index = min(retained_segment_indices)
+    first_issue = dict(issue_by_segment[first_segment_index])
     first_issue["cleanup_paths"] = tuple(cleanup_paths)
     first_issue["cleanup_modes"] = tuple(cleanup_modes)
-    first_issue["affected_segment_indices"] = tuple(sorted(affected_segments))
+    first_issue["profile_relief_paths"] = tuple(profile_relief_paths)
+    first_issue["affected_segment_indices"] = tuple(
+        sorted(retained_segment_indices)
+    )
     return first_issue
 
 
@@ -1675,10 +1779,16 @@ def build_drill_moves(
         if not depth_steps:
             raise ValueError("A profundidade do furo deve ser maior que zero.")
 
+        # Imported nominal circles commonly differ from the cutter by a few
+        # ten-thousandths of a millimetre after cubic flattening (for example
+        # Ø3.1755 versus a Ø3.175 tool). Treat that as import tolerance, not as
+        # room for a microscopic helix with thousands of useless segments.
+        minimum_helix_diameter_clearance = max(0.01, cutter_diameter * 0.001)
         can_helix = (
             use_helical
             and cutter_diameter > 0.0
-            and hole_diameter > cutter_diameter + 1e-6
+            and hole_diameter
+            > cutter_diameter + minimum_helix_diameter_clearance
         )
 
         if can_helix:
@@ -2962,6 +3072,7 @@ def build_global_cut_plan_moves(
         )
     continuous_network = plan.strategy.value in {
         "piece_bidirectional",
+        "piece_unidirectional",
         "hybrid_stability",
         "hybrid_piece_bidirectional",
     }
@@ -3052,13 +3163,6 @@ def build_global_cut_plan_moves(
         ):
             connector = None
             connector_depth = depth_key
-            # The experimental piece-by-piece route deliberately retracts
-            # between distinct physical trails.  Reusing an already machined
-            # edge as a low-Z connector would look (and sound) like another
-            # cut of that edge, defeating the physical DONE contract.  The
-            # outbound/return pair still remains engaged because both passes
-            # meet at exactly the same endpoint.  Stability routing keeps the
-            # established cleared-kerf connector behaviour.
             connector_candidates = []
             if operation.routing_mode == "final_sheet_pass":
                 # A última passada nunca usa um segmento já executado nessa
@@ -3081,7 +3185,7 @@ def build_global_cut_plan_moves(
                         ),
                     )
                 )
-            elif operation.routing_mode != "piece_bidirectional":
+            elif operation.routing_mode not in {"piece_bidirectional", "piece_unidirectional"}:
                 connector_candidates = [(depth_key, cleared_at_depth)]
                 connector_candidates.extend(
                     (candidate_depth, cleared_by_depth[candidate_depth])
@@ -3354,7 +3458,9 @@ def build_global_cut_plan_moves(
             current_z = float(cut_core[-1]["z"])
         cleared_at_depth.update(operation.segment_ids)
         active_depth = depth_key
-        if not continuous_network:
+        if not continuous_network or (
+            operation.routing_mode == "piece_unidirectional" and not trail.closed
+        ):
             operation_moves.append(
                 {"type": "rapid", "x": None, "y": None, "z": float(safe_height)}
             )

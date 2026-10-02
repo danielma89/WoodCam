@@ -193,6 +193,250 @@ class PieceOrganizerTest(unittest.TestCase):
         self.assertEqual({item.sheet_index for item in result.placements}, {0, 1, 2})
         self.assertLess(result.sheet_bounds[0][2], result.sheet_bounds[1][0])
 
+    def test_prearranged_blocks_are_preserved_when_overflow_needs_same_sheets(self):
+        """Do not turn two deliberate three-part blocks into a 5+1 layout."""
+
+        paths = []
+        for index, x_value in enumerate((0, 22, 44, 100, 122, 144)):
+            paths.append(
+                _Path(
+                    "piece-%d" % index,
+                    [
+                        (x_value, 0),
+                        (x_value + 20, 0),
+                        (x_value + 20, 80),
+                        (x_value, 80),
+                    ],
+                )
+            )
+        paths.append(
+            _Path(
+                "piece-0-hole",
+                [(5, 10), (15, 10), (15, 20), (5, 20)],
+            )
+        )
+        classified = classify_document_pieces(_Document(paths))
+        rotations = {
+            piece.piece_id: (0.0,)
+            for piece in classified.pieces
+        }
+
+        result = organize_pieces(
+            classified.pieces,
+            (0, 0, 120, 100),
+            spacing=2,
+            rotations=rotations,
+            search_mode="fast",
+        )
+
+        self.assertEqual(result.strategy, "arranjo atual preservado")
+        self.assertEqual(len(result.sheet_bounds), 2)
+        by_sheet = {
+            sheet_index: sorted(
+                placement.piece_id
+                for placement in result.placements
+                if placement.sheet_index == sheet_index
+            )
+            for sheet_index in range(2)
+        }
+        self.assertEqual(
+            [len(by_sheet[0]), len(by_sheet[1])],
+            [3, 3],
+        )
+        first_placement = next(
+            placement
+            for placement in result.placements
+            if placement.piece_id.endswith("piece-0")
+        )
+        self.assertIn("piece-0-hole", first_placement.entity_ids)
+        source_by_id = {piece.piece_id: piece for piece in classified.pieces}
+        for sheet_index in range(2):
+            placements = sorted(
+                (
+                    placement
+                    for placement in result.placements
+                    if placement.sheet_index == sheet_index
+                ),
+                key=lambda placement: placement.placed_bounds[0],
+            )
+            source_gaps = [
+                source_by_id[right.piece_id].bounds[0]
+                - source_by_id[left.piece_id].bounds[0]
+                for left, right in zip(placements, placements[1:])
+            ]
+            placed_gaps = [
+                right.placed_bounds[0] - left.placed_bounds[0]
+                for left, right in zip(placements, placements[1:])
+            ]
+            self.assertEqual(source_gaps, placed_gaps)
+
+    def test_valid_manual_layout_wins_when_nesting_would_waste_a_sheet(self):
+        paths = [
+            _Path("piece-a", [(0, 0), (20, 0), (20, 80), (0, 80)]),
+            _Path("piece-b", [(22, 0), (42, 0), (42, 80), (22, 80)]),
+        ]
+        classified = classify_document_pieces(_Document(paths))
+        pieces = classified.pieces
+
+        def one_piece_page(piece):
+            return piece_organizer.OrganizationResult(
+                placements=[
+                    piece_organizer.PiecePlacement(
+                        piece_id=piece.piece_id,
+                        instance=1,
+                        dx=2.0 - piece.bounds[0],
+                        dy=2.0 - piece.bounds[1],
+                        rotation_degrees=0.0,
+                        placed_bounds=(2.0, 2.0, 22.0, 82.0),
+                        entity_ids=(piece.outer_id,),
+                    )
+                ],
+                strategy="nesting incompleto",
+                evaluated_layouts=1,
+            )
+
+        with mock.patch.object(
+            piece_organizer,
+            "_organize_single_sheet",
+            side_effect=[
+                one_piece_page(pieces[0]),
+                one_piece_page(pieces[1]),
+            ],
+        ):
+            result = organize_pieces(
+                pieces,
+                (0, 0, 100, 100),
+                spacing=2,
+                rotations={piece.piece_id: (0.0,) for piece in pieces},
+            )
+
+        self.assertEqual(result.strategy, "arranjo atual preservado")
+        self.assertEqual(len(result.sheet_bounds), 1)
+        self.assertEqual(len(result.placements), 2)
+
+    def test_multi_sheet_search_does_not_strand_large_parts_after_small_parts(self):
+        specifications = (
+            ("large-a", 0, 60, 100),
+            ("large-b", 70, 60, 100),
+            ("small-0", 140, 40, 50),
+            ("small-1", 190, 40, 50),
+            ("small-2", 240, 40, 50),
+            ("small-3", 290, 40, 50),
+        )
+        paths = [
+            _Path(
+                name,
+                [(x_value, 0), (x_value + width, 0),
+                 (x_value + width, height), (x_value, height)],
+            )
+            for name, x_value, width, height in specifications
+        ]
+        pieces = classify_document_pieces(_Document(paths)).pieces
+
+        result = organize_pieces(
+            pieces,
+            (0, 0, 100, 100),
+            spacing=0,
+            rotations={piece.piece_id: (0.0,) for piece in pieces},
+            search_mode="fast",
+        )
+
+        self.assertEqual(len(result.placements), 6)
+        self.assertEqual(len(result.sheet_bounds), 2)
+        for sheet_index in range(2):
+            sheet_piece_ids = {
+                placement.piece_id
+                for placement in result.placements
+                if placement.sheet_index == sheet_index
+            }
+            self.assertEqual(len(sheet_piece_ids), 3)
+            self.assertEqual(
+                sum("large" in piece_id for piece_id in sheet_piece_ids),
+                1,
+            )
+
+    def test_table_lr4_free_rotation_compares_orthogonal_two_sheet_layout(self):
+        """Regression for the 1834 x 2745 mm LR4 table SVG."""
+
+        dimensions = (
+            [(100, 2665)] * 7
+            + [(100, 2094)] * 10
+            + [(100, 2413)] * 2
+            + [(52.7, 2413), (81.35, 2413)]
+            + [(100, 645)] * 2
+            + [(81.35, 645), (52.7, 645)]
+            + [(100, 46.5)] * 2
+            + [(25, 25)]
+        )
+        paths = []
+        source_x = 0.0
+        for index, (width, height) in enumerate(dimensions):
+            paths.append(
+                _Path(
+                    "lr4-part-%02d" % index,
+                    [
+                        (source_x, 0),
+                        (source_x + width, 0),
+                        (source_x + width, height),
+                        (source_x, height),
+                    ],
+                )
+            )
+            source_x += width + 20.0
+        pieces = classify_document_pieces(_Document(paths)).pieces
+        free_rotations = {
+            piece.piece_id: tuple(range(0, 360, 15))
+            for piece in pieces
+        }
+
+        # Isolate the automatic nesting decision from the separate candidate
+        # that preserves deliberate source-space blocks.
+        with mock.patch.object(
+            piece_organizer,
+            "_preserve_existing_layout_candidate",
+            return_value=None,
+        ):
+            result = organize_pieces(
+                pieces,
+                (0, 0, 1834, 2745),
+                spacing=3.175,
+                rotations=free_rotations,
+                search_mode="fast",
+                search_budget=(4, 0, 1, 1),
+            )
+
+        self.assertEqual(len(result.placements), 28)
+        self.assertEqual(len(result.sheet_bounds), 2)
+        self.assertTrue(result.strategy.startswith("ângulos ortogonais"))
+        self.assertTrue(
+            all(
+                abs(float(placement.rotation_degrees) % 90.0) <= 1.0e-7
+                for placement in result.placements
+            )
+        )
+
+    def test_overlapping_source_layout_still_uses_regular_nesting(self):
+        paths = [
+            _Path(
+                "piece-%d" % index,
+                [(0, 0), (20, 0), (20, 80), (0, 80)],
+            )
+            for index in range(3)
+        ]
+        classified = classify_document_pieces(_Document(paths))
+
+        result = organize_pieces(
+            classified.pieces,
+            (0, 0, 120, 100),
+            spacing=2,
+            rotations={piece.piece_id: (0.0,) for piece in classified.pieces},
+            search_mode="fast",
+        )
+
+        self.assertNotEqual(result.strategy, "arranjo atual preservado")
+        self.assertEqual(len(result.placements), 3)
+        self.assertEqual(len(result.sheet_bounds), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

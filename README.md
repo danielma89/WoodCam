@@ -36,11 +36,12 @@ Implementado:
 - quando carregado pela bancada PanelNest, o idioma é escolhido no menu global
   `Idioma` da barra principal do FreeCAD (`Português`/`English`) e traduz a
   bancada inteira, incluindo o Editor 2D e o CAM; em uso independente do
-  Editor 2D, o seletor local continua disponível como fallback. A barra de
-  operações fica na lateral esquerda, com ícone e nome horizontal em todas as
-  abas; trocar o idioma não muda sua estrutura, quantidade de abas nem área de
-  clique. A coluna termina depois de `Simulação e Salvar`, sem prolongar um
-  fundo vazio até o rodapé. O botão acima de `Trabalho` alterna a mesma
+  Editor 2D, o seletor local continua disponível como fallback. Uma instalação
+  nova inicia em inglês; preferências de idioma já salvas continuam valendo.
+  A barra de operações fica na lateral esquerda, com ícone e nome horizontal
+  em todas as abas; trocar o idioma não muda sua estrutura, quantidade de abas
+  nem área de clique. A coluna termina depois de `Simulação e Salvar`, sem
+  prolongar um fundo vazio até o rodapé. O botão acima de `Trabalho` alterna a mesma
   instância do WoodCAM entre painel preso ao FreeCAD e janela independente,
   preservando aba, campos e Editor 2D. Sugestões e
   alertas gerados pelo Assistente CAM também são formatados diretamente no
@@ -70,8 +71,17 @@ Implementado:
 - camadas com nome, cor, finalidade, visibilidade, bloqueio e movimentação da
   seleção entre camadas;
 - painel `Chapas` derivado das folhas reais do layout, com seleção,
-  enquadramento e X0/Y0 local por chapa; a origem local é apenas uma vista de
-  edição e os vetores continuam nas coordenadas globais estáveis do documento;
+  enquadramento e X0/Y0 local por chapa; `+ Nova chapa vazia` acrescenta uma
+  folha das mesmas dimensões da chapa ativa, seleciona e enquadra a nova folha,
+  sem mover ou duplicar vetores e com um único Ctrl+Z. A origem local é apenas
+  uma vista de edição e os vetores continuam nas coordenadas globais estáveis
+  do documento;
+- `Editar chapa` ajusta largura e altura somente da folha ativa. Alterar essas
+  dimensões em `Trabalho` tem o mesmo efeito; selecionar outra chapa mostra
+  suas medidas nos campos. As peças não são escaladas. Se uma ampliação
+  alcançar a folha seguinte, ela e seu conteúdo são deslocados juntos para
+  manter a separação. `Apagar chapa` remove uma folha vazia com Undo, sem
+  apagar peças; folhas com vetores e a última folha são protegidas;
 - `Arquivo → Enviar para impressão (TechDraw)…` cria uma página vetorial por
   chapa, preservando seu limite e todo o conteúdo visível. O assistente permite
   chapa ativa ou todas, sugere A4–A0 conforme o tamanho, oferece chapa inteira
@@ -106,7 +116,10 @@ Implementado:
 - dogbone e T-bone manuais e automáticos como arcos integrados ao contorno —
   não círculos soltos —, limitados deliberadamente a cantos internos lineares
   de 90 graus;
-- importação por cópia de Sketch/Shape, DXF e SVG, sem modificar a origem;
+- importação por cópia de Sketch/Shape, DXF e SVG, sem modificar a origem.
+  Subpaths abertos inequivocamente contidos em um contorno fechado do mesmo
+  elemento SVG entram como marcações da peça, não como falsos contornos
+  quebrados no diagnóstico;
 - vetorização de PNG/JPEG/BMP/TIFF/WebP com limiar, inversão, filtro de ruído,
   ajuste de cantos, suavização, tamanho final e prévia antes de aplicar;
 - criação local de relevo 3D por PNG/JPEG/BMP/TIFF/WebP: o perfil padrão
@@ -122,7 +135,8 @@ Implementado:
   o mesmo grupo pode ser reeditado depois para trocar conteúdo, fonte, tamanho
   e estilo sem perder a posição ou a operação de Undo;
 - exportação DXF/SVG e preservação de camadas, nomes e cores nos formatos que
-  suportam esses dados;
+  suportam esses dados; o formato selecionado ao salvar determina o conteúdo
+  e corrige a extensão do nome do arquivo, mesmo após trocar entre SVG e DXF;
 - classificação de contorno externo, furos e recortes internos; metadados de
   peça, material, espessura, veio, quantidade e rotações permitidas;
 - organização por contorno real raster/bitmask, comparada com MaxRects e com
@@ -131,6 +145,13 @@ Implementado:
   MaxRects isolada não enxerga. Concavidades, triângulos e curvas podem intercalar sem
   separar furos e recortes; a busca roda fora da interface, mostra a primeira
   solução e continua refinando a prévia com tempo-alvo, progresso e interrupção;
+  a busca por contorno começa logo após a primeira prévia, antes das tentativas
+  retangulares profundas. A resolução se adapta ao tamanho da chapa e às
+  máscaras de rotação, mantendo a validação vetorial da folga em todos os lados;
+  no perfil Equilibrado ou Profundo, uma tentativa alinhada compara somente
+  rotações já permitidas para procurar encaixes e retalhos retangulares maiores;
+  entre soluções que colocam as mesmas peças no mesmo número de chapas, a prévia
+  prioriza a maior sobra aproveitável antes da altura ocupada;
   nos perfis equilibrado/profundo, o feixe também escolhe dinamicamente qual
   das próximas peças melhor ocupa a fronteira livre, e a seleção final conserva
   a melhor alternativa que passe pela validação vetorial exata em vez de cair
@@ -140,9 +161,30 @@ Implementado:
   retângulo envolvente antigo. Modos 0°, 0°/90°, bloqueado e direção do veio
   continuam sendo respeitados. A prévia e o comando aplicado reutilizam a mesma
   transformação rígida validada pelo nesting, portanto peças rotacionadas não
-  mudam de posição entre o cálculo e a guia 2D;
+  mudam de posição entre o cálculo e a guia 2D. Quando o operador já deixou
+  blocos válidos organizados e o conjunto apenas transborda a área de Trabalho,
+  esse arranjo também concorre como solução. A comparação prioriza colocar todas
+  as peças e, em seguida, usar menos chapas; assim, uma composição manual válida
+  em uma chapa nunca perde para um nesting automático em duas. Com quantidade
+  equivalente de chapas, os blocos mantêm posição relativa e orientação e
+  somente o excesso é transladado para folhas virtuais adicionais. Colisões e
+  folga insuficiente continuam encaminhando o caso ao nesting normal;
+- no preenchimento progressivo de múltiplas chapas, a escolha de cada folha
+  prioriza a área real de material acomodada antes da quantidade bruta de
+  objetos. Isso evita encher a primeira folha com muitas peças pequenas e
+  abandonar peças grandes/difíceis em folhas extras, embora uma distribuição
+  global com menos chapas seja possível. Quando a rotação livre está habilitada,
+  uma segunda busca somente com os ângulos ortogonais permitidos concorre com
+  ela; vence a que coloca todas as peças em menos chapas, impedindo que poses
+  diagonais localmente atraentes criem uma folha desnecessária;
+- a folga do nesting aceita três casas decimais e incremento de 0,125 mm. No
+  organizador, ela depende somente da escolha do operador. A fresa e a
+  estratégia de Corte são escolhidas depois e validadas pelo CAM separadamente;
 - fonte de geometria explícita para Corte/Furo/Preenchimento e marcação de
-  operação CAM desatualizada quando o desenho usado por ela muda;
+  operação CAM desatualizada quando o desenho usado por ela muda. Ativar
+  `Usar Editor 2D como fonte` valida o documento/folha, sem deixar uma seleção
+  residual do diagnóstico impedir a ativação; a seleção volta a ser respeitada
+  ao configurar a operação CAM específica;
 - círculos pequenos selecionados continuam sendo furos em `Furo`/`Corte`, mas
   em `Preenchimento` o próprio círculo é preservado como área fechada a
   usinar, sem exigir conversão manual do vetor;
@@ -190,7 +232,14 @@ Implementado:
   o percurso persistido; selecionar uma operação na árvore, sozinho, nunca a
   sobrescreve, descompacta seus movimentos nem redesenha a trajetória; a
   geometria exata é carregada somente por `Ver percurso`, `Simular`, editar ou
-  exportar;
+  exportar. Os campos internos grandes do percurso e do documento vetorial ficam
+  ocultos no painel de propriedades do FreeCAD, sem perder seus dados. O cache
+  vetorial interno não recebe cliques na área gráfica durante a prévia CAM;
+  selecione e edite peças no próprio Editor 2D;
+- percursos novos guardam listas longas de segmentos e identificadores de perfil
+  uma vez por operação, preservando os movimentos exatos e evitando FCStd
+  enormes. Arquivos antigos podem ser convertidos em uma cópia com
+  `freecadcmd tools/compact_woodcam_fcstd.py ORIGINAL.FCStd COPIA.FCStd`;
 - nome, profundidades e ferramenta próprios em cada aba;
 - rampa própria nas abas `Corte` e `Preenchimento`;
 - desaceleração configurável nos cantos: ângulo mínimo, percentual do avanço e distância antes/depois do vértice;
@@ -203,13 +252,11 @@ Implementado:
   cruzamentos, sobreposição de área e propriedade ambígua bloqueiam a prévia;
   no segundo modo, somente fronteiras realmente comprovadas são aceitas e o
   operador confirma a perda aproximada de meio diâmetro em cada peça;
-- ao organizar com linha comum e corte externo ativos, a folga acompanha a
-  fresa: no modo de preservar medidas ela nunca fica abaixo do diâmetro efetivo;
-  no modo sobre o vetor, 0 mm coincide as bordas e uma folga intermediária
-  menor que a fresa é corrigida antes da busca. A validação final do nesting
-  usa a mesma política do CAM — esquadria apenas nos nós ortogonais de linha
-  comum e raio físico nos demais —, impedindo que uma aproximação diagonal
-  aceita na prévia cruze somente ao gerar o percurso;
+- ao organizar com linha comum e corte externo ativos, a folga é definida pelo
+  operador e não consulta nem é aumentada pelo diâmetro da fresa que aparece
+  por padrão na aba Corte. A organização valida a geometria e a folga real
+  entre peças; ao configurar Corte, a compensação e as linhas comuns são
+  validadas com a fresa então escolhida;
 - a compensação externa contorna vértices convexos pelo raio físico da fresa;
   bicos agudos não usam miter ilimitado, que criaria uma ponta artificial e
   falsos cruzamentos entre ripas/trapézios próximos;
@@ -219,11 +266,26 @@ Implementado:
   externo permanece compensado e somente a região colapsada recebe um percurso
   auxiliar. Fendas abertas usam seu eixo médio local, inclusive quando são
   afuniladas ou escalonadas, e retiram o mínimo fisicamente possível de cada
-  lateral, inclusive no plano de Linha comum;
+  lateral, inclusive no plano de Linha comum. Um arco curto de Dogbone/alívio
+  de canto feito para uma fresa menor não é uma fenda: em cada profundidade ele
+  recebe uma excursão contínua do próprio perfil externo, com ida e volta pelo
+  mesmo kerf, sem G0, retração ou novo mergulho. Mesmo quando a Linha comum
+  fragmenta o perfil em vários trails, cada alívio é associado somente ao
+  trail local mais próximo e executado uma vez por profundidade; se não houver
+  âncora dentro do raio/tolerância da fresa, o CAM bloqueia em vez de criar uma
+  reta através da peça;
 - a rede de linha comum corta cada fronteira compartilhada uma única vez,
   mantém furos/recortes internos primeiro e usa entrada vertical para não
   repassar uma aresta aberta já usinada; peças isoladas no mesmo trabalho
-  conservam seu perímetro exclusivo fechado, inclusive com tabs;
+  conservam seu perímetro exclusivo fechado, inclusive com tabs. Em perfis
+  fechados, o ponto de entrada da Linha comum é escolhido somente no meio de
+  uma reta longa, com folga real para os dois lados; vértices, curvas curtas e
+  os arcos poligonizados de dogbones não são candidatos de mergulho. Se uma
+  fronteira candidata for interrompida repetidamente por rasgos/dogbones, o
+  WoodCAM conserva os trechos coincidentes como `SHARED` e corta cada trecho
+  físico uma única vez. Remanescentes realmente desconectados terminam com
+  retração e reposicionamento XY em Z seguro; não são ligados por uma travessia
+  longa em baixa sobre a rede já cortada;
 - com **Linha comum ativa**, o padrão é
   `Otimizado — ida/volta + última volta separada`;
   `Por peça`, `Chapa inteira por profundidade` e `Híbrido — estabilidade`
@@ -269,6 +331,13 @@ Implementado:
   ida/volta recebe todas as profundidades. Uma trilha aberta faz Z1 para fora,
   Z2 voltando e Z3 novamente para fora, sem a antiga reentrada por trail e sem
   criar a fase `final_sheet_pass`; somente depois a máquina troca de peça;
+- a opção adicional `Todas as passadas direto por peça (ex.: 3 direto) — sentido único`
+  mantém o contorno completo da primeira peça e corta somente os trechos ainda
+  pendentes das seguintes. Cada passada de um trecho aberto termina com
+  retração ao Z seguro, retorno ao início e nova entrada para repetir o mesmo
+  sentido, sem recortar a fronteira compartilhada já concluída. Perfis fechados
+  continuam dando a volta no mesmo sentido. A opção original de ida/volta,
+  suas preferências e os percursos já aplicados permanecem preservados;
 - o tipo de entrada escolhido chega sem substituição ao plano global: `Suave`
   não reutiliza o gerador de zigue-zague; uma espiral é
   usada em perfil fechado somente quando o círculo tangente fica integralmente
@@ -365,6 +434,10 @@ Implementado:
   usa uma linha do tempo compacta com cada destino real do G-code. A posição
   é interpolada somente dentro do segmento real atual, preservando subidas e
   descidas de Z sem criar um objeto FreeCAD por movimento;
+- a prévia e a simulação de Furo também usam a lista integral. Mesmo numa
+  furação helicoidal densa, a retração vertical e o rápido XY na altura segura
+  permanecem dois movimentos distintos; a projeção nunca os substitui por uma
+  diagonal do fundo de um furo até o seguinte;
 - a ferramenta animada representa topo reto, topo esférico, V-bit, broca,
   compressão ou faceadora com a ponta de contato em seu XYZ real. Hélices
   leves e rotação Coin3D tornam o giro perceptível sem recomputar o documento;
@@ -468,7 +541,11 @@ comando mostra uma orientação de dependência enquanto `potrace` não estiver 
    inclusive regiões de rebaixo cego como hachuras selecionáveis com a
    profundidade detectada. Em chapas em pé, fundo e contorno compartilham o
    mesmo plano 2D; rebaixo aberto na borda não deforma a silhueta de corte
-   externo. A importação ignora arestas degeneradas sem perder
+   externo. Pares alinhados de painéis opostos são copiados pela face externa
+   de cada lado, preservando o espelhamento necessário para rebaixos de cabeça
+   de parafuso feitos depois no CAM. Planos 2D salvos antes dessa correção
+   precisam ser reimportados para receber a nova orientação. A importação
+   ignora arestas degeneradas sem perder
    o restante da chapa e só aceita furos PanelNest contidos na área útil do
    perfil,
    `Importar arquivo` para DXF/SVG ou `Vetorizar imagem…` para transformar uma
@@ -493,6 +570,14 @@ comando mostra uma orientação de dependência enquanto `potrace` não estiver 
    perfis `rápido`, `equilibrado` e `profundo` reduzem ou ampliam a busca sem
    usar aleatoriedade. O perfil equilibrado também conserva alternativas de
    posição/rotação em paralelo e nunca aceita resultado pior que o rápido.
+   Quando já existem várias chapas, a organização começa pela chapa ativa
+   no painel `Chapas`: sem seleção, organiza suas peças; com seleção, organiza
+   as peças selecionadas dessa folha com todos os internos, incluindo peças
+   que ultrapassam sua borda. O excesso segue para as próximas chapas vazias;
+   se faltar espaço, são criadas novas folhas após as existentes. Chapas
+   ocupadas e seus retalhos permanecem intactos. Peças grandes demais para
+   qualquer folha disponível permanecem no lugar e são informadas. Aplicar,
+   Undo e Redo incluem toda a distribuição e as novas folhas.
 7. Ative `Usar Editor 2D como fonte` para alimentar Corte/Furo/Preenchimento, ou
    use `Enviar PanelNest` para criar o intercâmbio no documento. Para um
    rebaixo importado, clique dentro da hachura e abra `CAM → Preenchimento`;
@@ -510,6 +595,13 @@ comando mostra uma orientação de dependência enquanto `potrace` não estiver 
 Atalhos principais: `S` selecionar; `N` nós; `L` linha; `P` polilinha; `R`
 retângulo; `C` círculo; `E` elipse; `A` arco; `G` polígono; `Delete` excluir;
 `Ctrl+Z` desfazer; `Ctrl+Shift+Z`/`Ctrl+Y` refazer; `F` enquadrar.
+
+Para limpar os vetores visíveis e desbloqueados e sua projeção na vista 3D,
+use `Ctrl+A` e `Delete` no Editor 2D; a exclusão é desfeita com `Ctrl+Z`.
+`Documento vetorial (interno)` é a persistência do Editor, não um segundo
+desenho para editar pela árvore. Uma prévia CAM ou página TechDraw é um objeto
+separado: `Ocultar percurso` só retira a sobreposição visual; uma operação
+aplicada é excluída em `Simulação e Salvar → Excluir`.
 
 ## Relevo 3D por imagem
 
@@ -595,12 +687,10 @@ O relevo também pode alimentar diretamente as abas de desbaste e acabamento 3D.
 
 ## Uso do CAM
 
-A barra principal mantém texto somente em `Trabalho` e `Material`. As demais
-abas usam botões estreitos somente com ícone e mostram o nome completo ao
-repousar o ponteiro; ícones nativos temporários marcam operações cuja arte
-definitiva ainda não foi fornecida. A antiga aba de diagnóstico de Sketch não
-faz mais parte da interface de produção; seu código permanece preservado sem
-permissão para modificar a fonte.
+A barra de operações fica na lateral esquerda, com ícone e nome horizontal em
+todas as abas. A antiga aba de diagnóstico de Sketch não faz mais parte da
+interface de produção; seu código permanece preservado sem permissão para
+modificar a fonte.
 
 1. Abra ou crie um documento no FreeCAD.
 2. Desenhe Sketches fechados, selecione uma face plana ou selecione objetos 3D/compounds com varias chapas.
@@ -608,7 +698,7 @@ permissão para modificar a fonte.
 4. Clique em `WoodCAM 2D` na barra `PanelNest CAM`.
 5. Confira primeiro as abas `Trabalho` e `Material`: defina tipo de trabalho, tamanho X/Y/Z da área, Z-zero, origem XY, posição inicial, espessura e cotas de segurança.
 6. Na aba `Fresas`, cadastre ou ajuste as ferramentas; nas abas de usinagem use `Selecionar...` para escolher uma delas.
-7. Na aba `Corte`, escolha o lado dos contornos externos; furos/contornos internos são enviados automaticamente como corte interno.
+7. Na aba `Corte`, escolha o lado dos contornos externos; furos/contornos internos são enviados automaticamente como corte interno, inclusive ao selecionar só os recortes sem selecionar a peça externa. O diâmetro usado no CAM e na folga segura de linha comum vem da fresa exibida no seletor.
    Toda geometria 2D — Editor, PanelNest, Sketch, face ou Shape selecionado no
    FreeCAD — permanece no XY do documento. O datum da área define somente a
    saída e o retorno da ferramenta; nunca reposiciona a peça no zero global.
@@ -680,17 +770,20 @@ operações é realmente consultada ou modificada.
 Seleção de grupo e limites da seleção usam índices associados à revisão do
 `VectorDocument`. `Copiar` cria no clipboard somente o objeto selecionado, seus
 filhos e relações `Piece2D`; vetores não relacionados do móvel não são mais
-clonados. `Colar` continua sendo um único comando com Undo/Redo.
+clonados. Ao usar `Ctrl+V` ou `Editar → Colar`, o centro do conjunto copiado
+aparece sob o mouse na área 2D. Cada colagem continua sendo um único comando
+com Undo/Redo, preservando grupos, peças e furos.
 
 Na organização progressiva, a opção de retalho separa sucessivamente os
 maiores retângulos vazios da chapa que não atravessam peças, inclusive regiões
 internas abaixo ou ao lado do conjunto ocupado. Assim, uma sobra em L pode
 produzir uma faixa superior, outra lateral e um bloco central guardável. Uma
 região interna recebe todas as linhas de separação necessárias, sem repetir
-uma borda já proposta. As linhas e dimensões aparecem primeiro na prévia; ao
-aplicar, cada linha vira um
+uma borda já proposta. As linhas aparecem primeiro na prévia; passe o mouse
+sobre elas para ver as dimensões. Ao aplicar, cada linha vira um
 `PathEntity` aberto, tracejado, selecionável e persistido no mesmo
-`CompositeCommand`/Undo da organização. Essas linhas não são peças, não
+`CompositeCommand`/Undo da organização. A dimensão aparece quando a linha é
+selecionada; excluir a linha também exclui a etiqueta. Essas linhas não são peças, não
 bloqueiam o diagnóstico comum e não entram silenciosamente no G-code. Uma
 seleção total que contenha peças e essas linhas continua produzindo o Corte
 normal das peças; as linhas laranjas são ignoradas nesse escopo misto. Para
@@ -711,7 +804,19 @@ visual e usa exatamente os movimentos do G-code. O botão inferior
 `Percursos 2D` oferece as mesmas escolhas quando o usuário está em outra aba.
 O encaminhamento usa o identificador interno da operação, portanto diferenças
 de apresentação como `Furos` no menu e `Furo` na aba não impedem abrir a
-configuração nem aplicar a operação.
+configuração nem aplicar a operação. Dentro do Editor 2D ou de uma aba de
+configuração CAM, `Ver percurso` sempre calcula a geometria e os parâmetros
+atuais; uma operação antiga que permaneceu selecionada na lista invisível não
+pode substituir essa prévia. Somente a página `Simulação e Salvar` usa a
+operação persistida explicitamente selecionada.
+
+Marcar `Usar Editor 2D como fonte` somente escolhe a origem dos dados e não é
+uma operação de usinagem; por isso a ação não se desmarca devido a uma linha
+aberta solta. A validação ocorre ao criar Corte, Furo ou Rebaixo. Sem seleção
+explícita e com relações `Piece2D`, somente os contornos pertencentes às peças
+reconhecidas da chapa ativa entram nesse escopo; vetores abertos independentes
+continuam intactos e visíveis no diagnóstico. Uma seleção explícita continua
+estrita e qualquer caminho aberto selecionado é bloqueado normalmente.
 
 Ao enviar peças ao PanelNest, círculos pequenos importados como polilinhas
 fechadas são reconhecidos de forma conservadora como furos (até 12 mm, com
@@ -726,6 +831,28 @@ atuais e envia o layout completo. Uma seleção residual no Editor não limita o
 intercâmbio silenciosamente; todas as peças válidas, suas quantidades, furos e
 recortes internos seguem juntas, preservando XY e rotação. O rodapé informa as
 contagens de peças, ocorrências, furos e recortes realmente materializados.
+
+Na operação de Furo, círculos SVG importados como caminhos fechados continuam
+sendo reconhecidos como furos. Selecionar o contorno externo de uma `Piece2D`
+inclui seus furos internos vinculados, enquanto selecionar um furo isolado
+mantém a operação restrita somente a ele; marcações abertas não entram no
+percurso de furação. A relação `Piece2D` é autoritativa: em seleção de peça ou
+seleção múltipla, somente `inner_path_ids` podem alimentar a furação. Um
+contorno externo pequeno e circular — inclusive geometria semelhante a
+dogbone — nunca é promovido a furo apenas por sua forma.
+Sem seleção explícita, Furo usa todos os `inner_path_ids` das peças na chapa
+ativa. O contrato dessa operação sempre sai com `contours: []`; nem contornos
+externos nem recortes internos não circulares são enviados ao gerador de Furo.
+Ao aplicar um percurso, ele passa a ser a única operação selecionada para
+simulação. A seleção múltipla continua disponível para exportação ordenada,
+mas Simular exige uma única operação, impedindo que o percurso de Corte com
+dogbones apareça misturado e rotulado como se pertencesse à furação. Operações
+de Furo do Editor criadas antes desse contrato ficam desatualizadas e precisam
+ser reaplicadas.
+Diferenças subcentesimais entre o diâmetro nominal importado e a fresa são
+tratadas como tolerância, não como espaço para uma hélice microscópica. No caso
+Ø3,1755/Ø3,175 mm, cada furo usa um mergulho central em vez de milhares de
+segmentos sem deslocamento útil.
 
 ## Arquivos principais
 

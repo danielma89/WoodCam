@@ -153,6 +153,7 @@ class ArrayCopyCommand(Command):
         step_x: float,
         step_y: float,
         source_document: Optional[VectorDocument] = None,
+        origin_offset: Optional[Vec2] = None,
     ) -> None:
         super().__init__()
         self.entity_ids = tuple(dict.fromkeys(str(value) for value in entity_ids))
@@ -160,6 +161,7 @@ class ArrayCopyCommand(Command):
         self.rows = int(rows)
         self.step_x = float(step_x)
         self.step_y = float(step_y)
+        self.origin_offset = origin_offset if origin_offset is not None else Vec2(0.0, 0.0)
         # A clipboard paste must keep working even if the source is moved or
         # deleted after Ctrl+C.  The optional snapshot is transient command
         # input; VectorDocument remains the sole persistent source of truth.
@@ -236,7 +238,8 @@ class ArrayCopyCommand(Command):
                 if row == 0 and column == 0:
                     continue
                 transform = Affine2D.translation(
-                    Vec2(column * self.step_x, row * self.step_y)
+                    Vec2(column * self.step_x + self.origin_offset.x,
+                         row * self.step_y + self.origin_offset.y)
                 )
                 copies_by_source = {}
 
@@ -403,7 +406,18 @@ class DeleteEntitiesCommand(Command):
         before_ids = set(document.entities_by_id)
         document.remove_entities(self.entity_ids, bump_revision=False)
         removed = before_ids - set(document.entities_by_id)
-        return DocumentChangeSet(removed=frozenset(removed))
+        cuts = document.metadata.get("organization_remnant_cuts", ()) or ()
+        retained_cuts = [
+            cut for cut in cuts
+            if not isinstance(cut, dict) or str(cut.get("entity_id", "")) not in removed
+        ]
+        remnant_metadata_changed = len(retained_cuts) != len(cuts)
+        if remnant_metadata_changed:
+            document.metadata["organization_remnant_cuts"] = retained_cuts
+        return DocumentChangeSet(
+            removed=frozenset(removed),
+            work_area_changed=remnant_metadata_changed,
+        )
 
 
 class TransformEntitiesCommand(Command):

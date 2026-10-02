@@ -343,6 +343,7 @@ class SheetPanel(CollapsibleGroupBox):
 
     sheetSelected = Signal(int, object)
     fitRequested = Signal(object)
+    message = Signal(str)
 
     def __init__(self, controller, parent=None):
         super(SheetPanel, self).__init__("Chapas", parent)
@@ -369,6 +370,21 @@ class SheetPanel(CollapsibleGroupBox):
         self.fit_button = QtWidgets.QPushButton("Enquadrar chapa", self)
         self.fit_button.clicked.connect(self._fit_current)
         root.addWidget(self.fit_button)
+        self.add_button = QtWidgets.QPushButton("+ Nova chapa vazia", self)
+        self.add_button.setToolTip(
+            "Cria uma chapa vazia com as dimensões da chapa ativa, sem mover "
+            "nem duplicar vetores. Ctrl+Z desfaz."
+        )
+        self.add_button.clicked.connect(self._add_empty_sheet)
+        root.addWidget(self.add_button)
+        self.edit_button = QtWidgets.QPushButton("Editar chapa", self)
+        self.edit_button.setToolTip("Altera somente a largura e a altura da chapa ativa, sem escalar peças. Ctrl+Z desfaz.")
+        self.edit_button.clicked.connect(self._edit_sheet)
+        root.addWidget(self.edit_button)
+        self.delete_button = QtWidgets.QPushButton("Apagar chapa", self)
+        self.delete_button.setToolTip("Apaga a chapa vazia selecionada. Peças não são apagadas; Ctrl+Z desfaz.")
+        self.delete_button.clicked.connect(self._delete_empty_sheet)
+        root.addWidget(self.delete_button)
         controller.subscribe_document(lambda _change=None: self.refresh())
         self.refresh()
 
@@ -444,7 +460,97 @@ class SheetPanel(CollapsibleGroupBox):
         finally:
             self._refreshing = False
         self.fit_button.setEnabled(bool(self._bounds))
+        self.add_button.setEnabled(bool(self._bounds))
+        self.delete_button.setEnabled(len(self._bounds) > 1)
+        self.edit_button.setEnabled(bool(self._bounds))
         self._emit_current()
+
+    def _add_empty_sheet(self):
+        bounds = self.current_bounds()
+        if bounds is None:
+            self.message.emit(
+                translate_text("Configure a área de Trabalho antes de criar uma chapa.")
+            )
+            return
+        current_bounds = list(self.document_bounds())
+        width = float(bounds[2]) - float(bounds[0])
+        height = float(bounds[3]) - float(bounds[1])
+        gap = 50.0
+        new_min_x = max(value[2] for value in current_bounds) + gap
+        new_min_y = float(bounds[1])
+        new_bounds = (
+            new_min_x,
+            new_min_y,
+            new_min_x + width,
+            new_min_y + height,
+        )
+        from woodcam_editor.domain import SetDocumentMetadataCommand
+
+        self.controller.execute(
+            SetDocumentMetadataCommand(
+                "organization_sheet_bounds",
+                [list(value) for value in current_bounds] + [list(new_bounds)],
+            )
+        )
+        self.list.setCurrentRow(len(current_bounds))
+        self.fitRequested.emit(new_bounds)
+        self.message.emit(
+            translate_text("Nova chapa vazia criada; Ctrl+Z desfaz.")
+        )
+
+    def _edit_sheet(self):
+        bounds = self.current_bounds()
+        if bounds is None:
+            return
+        index = self.current_index()
+        revision = self.controller.document.revision
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(translate_text("Editar chapa"))
+        layout = QtWidgets.QVBoxLayout(dialog)
+        form = QtWidgets.QFormLayout()
+        fields = []
+        for label, name, value in (
+            ("Largura X (mm)", "sheetWidth", bounds[2] - bounds[0]),
+            ("Altura Y (mm)", "sheetHeight", bounds[3] - bounds[1]),
+        ):
+            field = QtWidgets.QDoubleSpinBox(dialog)
+            field.setObjectName(name)
+            field.setDecimals(3)
+            field.setRange(0.001, 1000000.)
+            field.setValue(value)
+            form.addRow(translate_text(label), field)
+            fields.append(field)
+        layout.addLayout(form)
+        info = QtWidgets.QLabel(translate_text(
+            "Somente esta chapa muda de tamanho. Peças mantêm suas medidas; chapas vizinhas são afastadas se necessário. Ao reduzir, peças podem ficar fora da borda."), dialog)
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel, parent=dialog)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        execute = getattr(dialog, "exec", None) or dialog.exec_
+        if execute() != QtWidgets.QDialog.Accepted:
+            return
+        if self.controller.document.revision != revision:
+            self.message.emit(translate_text("O documento mudou; abra Editar chapa novamente."))
+            return
+        from woodcam_editor.domain import WorkArea
+        from woodcam_editor.application.sheet_management import resize_work_area_command
+        area = self.controller.document.work_area
+        x, y = (area.min_x, area.min_y) if area is not None else bounds[:2]
+        work_area = WorkArea(x, y, x + fields[0].value(), y + fields[1].value())
+        self.controller.execute(resize_work_area_command(self.controller.document, work_area, index))
+        self.message.emit(translate_text("Tamanho da chapa atualizado; Ctrl+Z desfaz."))
+
+    def _delete_empty_sheet(self):
+        from woodcam_editor.domain.sheets import DeleteEmptySheetCommand
+        try:
+            self.controller.execute(DeleteEmptySheetCommand(self.current_index()))
+            self.message.emit(translate_text("Chapa vazia apagada; Ctrl+Z desfaz."))
+        except ValueError as error:
+            self.message.emit(translate_text(str(error)))
 
     def select_sheet_for_point(self, x, y):
         x, y = float(x), float(y)

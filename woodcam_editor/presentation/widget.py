@@ -516,11 +516,13 @@ class Editor2DWidget(QtWidgets.QWidget):
         self.nesting_spacing.setAccessibleName("Espaçamento entre peças para nesting")
         self.nesting_spacing.setToolTip(
             "Folga mínima entre peças no nesting, em milímetros. "
-            "Use a folga que precisa sobrar entre os cortes/fresa."
+            "Use a folga que precisa sobrar entre os cortes/fresa. Quando "
+            "linha comum preservando medidas está ativa, o diâmetro efetivo "
+            "da fresa define o menor valor fisicamente usinável."
         )
         self.nesting_spacing.setRange(0.0, 1000.0)
-        self.nesting_spacing.setDecimals(2)
-        self.nesting_spacing.setSingleStep(1.0)
+        self.nesting_spacing.setDecimals(3)
+        self.nesting_spacing.setSingleStep(0.125)
         self.nesting_spacing.setSuffix(" mm entre peças")
         self.nesting_spacing.setValue(10.0)
         self.nesting_spacing.setFixedWidth(132)
@@ -721,6 +723,7 @@ class Editor2DWidget(QtWidgets.QWidget):
         self.modifier_panel = ModifierParametersPanel(self.side_panel)
         self.sheet_panel.sheetSelected.connect(self._on_sheet_selected)
         self.sheet_panel.fitRequested.connect(self._fit_sheet_bounds)
+        self.sheet_panel.message.connect(self._show_panel_message)
         self.layer_panel.message.connect(self._show_panel_message)
         self.pieces_panel.message.connect(self._show_panel_message)
         self.pieces_panel.pieceSelected.connect(self._on_piece_selected)
@@ -1075,7 +1078,7 @@ class Editor2DWidget(QtWidgets.QWidget):
         count = self.controller.copy_selection()
         if count:
             message = translate_text(
-                "%d objeto(s) copiado(s). Ctrl+V cola a cópia com deslocamento visível."
+                "%d objeto(s) copiado(s). Ctrl+V cola a cópia sob o mouse."
             ) % count
             self._set_mode_status(message)
         else:
@@ -1083,7 +1086,13 @@ class Editor2DWidget(QtWidgets.QWidget):
         return bool(count)
 
     def paste_copied(self):
-        count = self.controller.paste_copied()
+        viewport = self.view.viewport()
+        pointer = self.view.last_pointer_viewport_position()
+        if pointer is None:
+            global_pointer = viewport.mapFromGlobal(QtGui.QCursor.pos())
+            pointer = (global_pointer if viewport.rect().contains(global_pointer)
+                       else viewport.rect().center())
+        count = self.controller.paste_copied(self.view.mapToScene(pointer))
         if count:
             message = translate_text(
                 "%d objeto(s) colado(s). A peça inteira foi preservada; Ctrl+Z desfaz."

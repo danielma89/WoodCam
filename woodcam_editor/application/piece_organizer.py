@@ -607,6 +607,21 @@ class OrganizationResult:
     scrap_fragmentation_score: float = 0.0
 
 
+def organization_with_stationary_pieces(pieces, result):
+    """Include unmoved sheet occupants for clearance and remnant validation."""
+    placed_ids = {value.piece_id for value in result.placements}
+    stationary = [
+        PiecePlacement(
+            piece_id=piece.piece_id, instance=0, dx=0.0, dy=0.0,
+            rotation_degrees=0.0, placed_bounds=piece.bounds,
+            entity_ids=(piece.outer_id,) + tuple(piece.descendant_ids)
+            + tuple(piece.feature_ids) + tuple(piece.marking_ids),
+        )
+        for piece in pieces if piece.piece_id not in placed_ids
+    ]
+    return replace(result, placements=list(result.placements) + stationary)
+
+
 @dataclass(frozen=True)
 class RectangularRemnantCut:
     """One safe guillotine line that isolates a rectangular reusable remnant."""
@@ -1328,7 +1343,7 @@ def _candidate_orders(
             identities.add(identity)
             result.append(ordered)
         salt += 1
-    return tuple(result)
+    return tuple(result[:max_orders])
 
 
 def _organize_pieces_rectangular(
@@ -1339,6 +1354,7 @@ def _organize_pieces_rectangular(
     rotations: Optional[Mapping[str, Sequence[float]]] = None,
     max_orders: int = 4,
     stop_requested: Optional[Callable[[], bool]] = None,
+    prefer_remnants: bool = False,
 ) -> OrganizationResult:
     """Return a deterministic compact bottom-left placement preview.
 
@@ -1347,7 +1363,9 @@ def _organize_pieces_rectangular(
     bottom/left work-area boundary and the top/right edges of already placed
     boxes.  Every permitted rotation is compared at every candidate.  Several
     deterministic size orders are evaluated and the result that places the
-    most material with the lowest used height/area is returned.
+    most material with the lowest used height/area is returned. Material area
+    precedes raw piece count: otherwise a first sheet full of many small parts
+    can strand large parts on one extra sheet each during progressive packing.
 
     This function is pure.  It does not mutate geometry or the document; the
     caller remains responsible for turning an accepted preview into one Undo.
@@ -1430,8 +1448,8 @@ def _organize_pieces_rectangular(
             used,
         )
         score = (
-            len(unplaced),
             -round(placed_source_area, 12),
+            len(unplaced),
             round(used_height, 12),
             round(used_width * used_height, 12),
             round(used_width, 12),
@@ -1463,8 +1481,8 @@ def _organize_pieces_rectangular(
             used,
         )
         score = (
-            len(unplaced),
             -round(placed_source_area, 12),
+            len(unplaced),
             round(used_height, 12),
             round(used_width * used_height, 12),
             round(used_width, 12),
@@ -1473,10 +1491,20 @@ def _organize_pieces_rectangular(
         )
         layouts.append((score, packed, unplaced, used, "Pontos de fronteira"))
 
-    _score, packed, unplaced, used, strategy = min(
-        layouts,
-        key=lambda value: value[0],
-    )
+    def layout_score(value):
+        if not prefer_remnants:
+            return value[0]
+        _score, boxes, unplaced_items, _used, _strategy = value
+        preview = OrganizationResult(
+            placements=[PiecePlacement(box.item.piece.piece_id, box.item.instance,
+                                       0.0, 0.0, box.option.angle, box.bounds, ())
+                        for box in boxes],
+            unplaced_piece_ids=[item.piece.piece_id for item in unplaced_items],
+            sheet_bounds=(tuple(map(float, work_bounds)),),
+        )
+        return organization_remnant_score(preview, clearance=max(1.0, spacing * 0.5)) + (_score,)
+
+    _score, packed, unplaced, used, strategy = min(layouts, key=layout_score)
     result = OrganizationResult(
         unplaced_piece_ids=[item.piece.piece_id for item in unplaced],
         used_bounds=used,
@@ -1572,7 +1600,25 @@ def _raster_resolution(
         )
         precision_resolution = max(1.0, cell_limited_resolution)
         resolution = min(resolution, precision_resolution)
-    return resolution
+    # Small clearance must not silently disable contour packing on a full
+    # production sheet. Respect the raster cell budget by coarsening the
+    # candidate grid; exact vector clearance remains the acceptance gate.
+    return max(resolution, math.sqrt(max(0.0, width * height) / 1350000.0))
+
+
+def _bounded_raster_resolution(pieces, work_bounds, spacing, rotations):
+    """Fit both the sheet and all allowed masks before allocating bitmaps."""
+    resolution = _raster_resolution(pieces, work_bounds, spacing)
+    options = tuple(
+        option for piece in pieces
+        for option in _rotation_options(piece, rotations.get(piece.piece_id, (0.0, 90.0)))
+    )
+    while True:
+        cells = sum(math.ceil(option.width / resolution) * math.ceil(option.height / resolution)
+                    for option in options)
+        if cells <= 12000000:
+            return resolution
+        resolution *= math.sqrt(cells / 10000000.0)
 
 
 def _rotate_outer_points(
@@ -1811,6 +1857,19 @@ def _bit_runs(bits: int) -> Tuple[Tuple[int, int], ...]:
     return tuple(runs)
 
 
+@lru_cache(maxsize=32768)
+def _raster_forbidden_cols(source_bits, occupied_bits, min_col, max_col):
+    """Translations blocked by a pair of rows, reusable across frontier levels."""
+    forbidden = 0
+    for source_start, source_end in _bit_runs(source_bits):
+        for occupied_start, occupied_end in _bit_runs(occupied_bits):
+            first = max(min_col, occupied_start - source_end + 1)
+            last = min(max_col, occupied_end - source_start - 1)
+            if first <= last:
+                forbidden |= ((1 << (last - first + 1)) - 1) << (first - min_col)
+    return forbidden
+
+
 def _raster_candidate_cols(
     sheet_bits: Sequence[int],
     mask: _RasterOrientation,
@@ -1818,33 +1877,31 @@ def _raster_candidate_cols(
     min_col: int,
     max_col: int,
 ) -> Tuple[int, ...]:
-    """Generate exact horizontal frontier contacts for one candidate row.
+    """Return collision-free horizontal frontier contacts for this row.
 
-    Compact polygon packing only needs positions on the sheet border or where
-    a mask run touches an occupied run.  The previous implementation tested
-    every raster column (nearly one thousand in the production sheet) for
-    every angle and state.  Deriving contacts from integer row bitmasks keeps
-    the same geometric candidates while making the first preview responsive.
+    Two half-open runs collide at a contiguous interval of translations.
+    Union those forbidden intervals as integer bits instead of generating
+    thousands of blocked contacts and replaying the whole mask at each one.
+    Endpoints of the remaining free runs are the feasible frontier contacts.
     """
 
-    candidates = {int(min_col), int(max_col)}
+    if max_col < min_col:
+        return ()
+    available = (1 << (max_col - min_col + 1)) - 1
     for mask_row, source_bits in enumerate(mask.row_bits):
         if not source_bits:
             continue
         occupied_bits = sheet_bits[row + mask_row]
         if not occupied_bits:
             continue
-        source_runs = _bit_runs(source_bits)
-        occupied_runs = _bit_runs(occupied_bits)
-        for source_start, source_end in source_runs:
-            for occupied_start, occupied_end in occupied_runs:
-                # Touch the right/left edge of the already stamped spacing
-                # halo. Half-open bit runs make the contact positions exact.
-                candidates.add(occupied_end - source_start)
-                candidates.add(occupied_start - source_end)
-    return tuple(
-        sorted(value for value in candidates if min_col <= value <= max_col)
-    )
+        available &= ~_raster_forbidden_cols(source_bits, occupied_bits, min_col, max_col)
+        if not available:
+            return ()
+    candidates = set()
+    for start, end in _bit_runs(available):
+        candidates.add(min_col + start)
+        candidates.add(min_col + end - 1)
+    return tuple(sorted(candidates))
 
 
 def _find_raster_positions(
@@ -1979,10 +2036,14 @@ def _stamp_raster_mask(
     for mask_row, source_bits in enumerate(mask.row_bits):
         if not source_bits:
             continue
-        expanded = source_bits
+        # Translate before dilation: shifting a local row right discards the
+        # negative bits of its left clearance halo. In sheet coordinates those
+        # bits are real space and must block neighbours approaching from left.
+        shifted = source_bits << col
+        expanded = shifted
         for distance in range(1, spacing_pixels + 1):
-            expanded |= (source_bits << distance) | (source_bits >> distance)
-        expanded = (expanded << col) & clip
+            expanded |= (shifted << distance) | (shifted >> distance)
+        expanded &= clip
         sheet_row = row + mask_row
         for destination in range(
             max(0, sheet_row - spacing_pixels),
@@ -2183,12 +2244,13 @@ def _organize_pieces_raster(
     candidate_limit: int = 1,
     stop_requested: Optional[Callable[[], bool]] = None,
     toolpath_offset: float = 0.0,
+    prefer_remnants: bool = False,
 ) -> Optional[OrganizationResult]:
     if not pieces or any(len(piece.outer_points) < 3 for piece in pieces):
         return None
     if sum(len(piece.outer_points) for piece in pieces) > 50000:
         return None
-    resolution = _raster_resolution(pieces, work_bounds, spacing)
+    resolution = _bounded_raster_resolution(pieces, work_bounds, spacing, rotations)
     sheet_cols = int(math.floor((work_bounds[2] - work_bounds[0]) / resolution))
     sheet_rows = int(math.floor((work_bounds[3] - work_bounds[1]) / resolution))
     if sheet_cols <= 0 or sheet_rows <= 0 or sheet_cols * sheet_rows > 1500000:
@@ -2273,8 +2335,8 @@ def _organize_pieces_raster(
                 used,
             )
             score = (
-                len(unplaced),
                 -round(placed_area, 12),
+                len(unplaced),
                 round(used_height, 12),
                 round(used_width * used_height, 12),
                 round(used_width, 12),
@@ -2319,7 +2381,20 @@ def _organize_pieces_raster(
             )
         return result
 
-    ordered_layouts = sorted(layouts, key=lambda value: value[0])
+    def layout_score(value):
+        if not prefer_remnants:
+            return value[0]
+        old_score, boxes, unplaced_items, _used = value
+        preview = OrganizationResult(
+            placements=[PiecePlacement(box.item.piece.piece_id, box.item.instance,
+                                       0.0, 0.0, box.orientation.angle, box.bounds, ())
+                        for box in boxes],
+            unplaced_piece_ids=[item.piece.piece_id for item in unplaced_items],
+            sheet_bounds=(tuple(map(float, work_bounds)),),
+        )
+        return organization_remnant_score(preview, clearance=max(1.0, spacing * 0.5)) + (old_score,)
+
+    ordered_layouts = sorted(layouts, key=layout_score)
     best_invalid = None
     for _score, packed, unplaced, used in ordered_layouts:
         _check_search_cancelled(stop_requested)
@@ -2386,6 +2461,39 @@ def organization_result_score(result: OrganizationResult) -> Tuple:
     return _organization_result_score(result)
 
 
+def organization_remnant_score(result, *, minimum_short_side=100.0, clearance=1.0):
+    """Rank complete previews by coverage, sheets and reusable, cuttable waste.
+
+    Use the same conservative rectangles as the offcut preview. Bounding boxes
+    intentionally exclude pockets between diagonal contours that cannot yet
+    be separated by the existing rectangular-remnant tool.
+    """
+    base = _organization_result_score(result)
+    remnants = {}
+    for cut in suggest_rectangular_remnant_cuts(
+        result, minimum_short_side=minimum_short_side, clearance=clearance,
+    ):
+        key = (cut.sheet_index, cut.remnant_bounds)
+        area, count = remnants.get(key, (cut.area, 0))
+        remnants[key] = area, count + 1
+    practical_areas = [area / (1.0 + 0.30 * max(0, count - 1))
+                       for area, count in remnants.values()]
+    return base[:3] + (
+        -round(max(practical_areas, default=0.0), 6),
+        -round(sum(area for area, _count in remnants.values()), 6),
+    ) + base[3:]
+
+
+def orthogonal_nesting_rotations(rotations):
+    """Explore aligned poses without adding any rotation forbidden by the user."""
+    return {
+        key: tuple(angle for angle in angles
+                   if abs(float(angle) / 90.0 - round(float(angle) / 90.0)) < 1e-9)
+        or tuple(angles)
+        for key, angles in rotations.items()
+    }
+
+
 def _point_segment_clearance(point, start, end):
     vector_x = end.x - start.x
     vector_y = end.y - start.y
@@ -2408,10 +2516,23 @@ def _contour_clearance(first, second):
     """Return exact boundary distance and the nearest point pair."""
 
     best = (float("inf"), first.points[0], second.points[0])
+    second_segments = tuple(
+        (start, end, min(start.x, end.x), min(start.y, end.y),
+         max(start.x, end.x), max(start.y, end.y))
+        for start, end in zip(second.points, second.points[1:] + second.points[:1])
+    )
     for first_index, first_start in enumerate(first.points):
         first_end = first.points[(first_index + 1) % len(first.points)]
-        for second_index, second_start in enumerate(second.points):
-            second_end = second.points[(second_index + 1) % len(second.points)]
+        min_x, max_x = sorted((first_start.x, first_end.x))
+        min_y, max_y = sorted((first_start.y, first_end.y))
+        for second_start, second_end, sx0, sy0, sx1, sy1 in second_segments:
+            # Bounding-box distance is a lower bound on segment distance.
+            # Skip only pairs that cannot improve the exact minimum already
+            # measured; this changes cost, never the clearance tolerance.
+            dx = max(0.0, min_x - sx1, sx0 - max_x)
+            dy = max(0.0, min_y - sy1, sy0 - max_y)
+            if dx * dx + dy * dy >= best[0] * best[0]:
+                continue
             candidates = []
             distance, projected = _point_segment_clearance(
                 first_start, second_start, second_end
@@ -2724,6 +2845,7 @@ def _organize_single_sheet(
     search_budget: Optional[Sequence[int]] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
     toolpath_offset: float = 0.0,
+    prefer_remnants: bool = False,
 ) -> OrganizationResult:
     """Return the best pure preview for one sheet.
 
@@ -2767,6 +2889,7 @@ def _organize_single_sheet(
         rotations,
         rectangular_orders,
         stop_requested,
+        prefer_remnants,
     )
     raster = None
     if raster_orders > 0:
@@ -2781,6 +2904,7 @@ def _organize_single_sheet(
             raster_candidate_limit,
             stop_requested,
             toolpath_offset,
+            prefer_remnants,
         )
     if raster is None:
         issues = validate_organization_result_geometry(
@@ -2817,10 +2941,16 @@ def _organize_single_sheet(
             )
         return rectangular
     evaluated = rectangular.evaluated_layouts + raster.evaluated_layouts
+    def candidate_score(candidate):
+        if not prefer_remnants:
+            return _organization_result_score(candidate)
+        return organization_remnant_score(
+            replace(candidate, sheet_bounds=(tuple(map(float, work_bounds)),)),
+            clearance=max(1.0, spacing * 0.5),
+        )
     selected, fallback = (
         (raster, rectangular)
-        if _organization_result_score(raster)
-        <= _organization_result_score(rectangular)
+        if candidate_score(raster) <= candidate_score(rectangular)
         else (rectangular, raster)
     )
     selected_issues = validate_organization_result_geometry(
@@ -2873,7 +3003,7 @@ def _organize_single_sheet(
                     "O nesting foi bloqueado pela validação vetorial final: %s"
                     % selected_issues[0].message
                 )
-            selected = min(repaired, key=_organization_result_score)
+            selected = min(repaired, key=candidate_score)
         else:
             selected = fallback
     selected.evaluated_layouts = evaluated
@@ -2891,6 +3021,311 @@ def _union_bounds(first: Optional[Bounds], second: Bounds) -> Bounds:
     )
 
 
+def _preserve_existing_layout_candidate(
+    pieces: Sequence[ClassifiedPiece],
+    work_bounds: Bounds,
+    spacing: float,
+    rotations: Mapping[str, Sequence[float]],
+    toolpath_offset: float,
+    stop_requested: Optional[Callable[[], bool]] = None,
+) -> Optional[OrganizationResult]:
+    """Keep an already valid arrangement and split it at natural gaps.
+
+    Operators commonly prepare repeated rails and panels in meaningful blocks
+    before asking the organizer to create sheets.  The packing generators used
+    to discard that work even when the same number of sheets was unavoidable.
+    This candidate preserves every relative XY position and the current
+    orientation inside each block.  It only translates whole
+    guillotine-separated blocks to side-by-side virtual sheets.
+
+    A block is accepted only after the same exact contour/clearance gate used by
+    generated nests.  Overlapping, too-tight or genuinely scattered layouts
+    therefore remain the responsibility of the regular organizer.
+    """
+
+    pieces = tuple(pieces)
+    if len(pieces) < 2:
+        return None
+    # Guillotine partitioning is a quality candidate, not the safety/packing
+    # fallback.  Keep the first progressive preview responsive on very large
+    # production batches; their normal deterministic packer remains unchanged.
+    if len(pieces) > 64:
+        return None
+    min_x, min_y, max_x, max_y = map(float, work_bounds)
+    usable_width = max_x - min_x - 2.0 * spacing
+    usable_height = max_y - min_y - 2.0 * spacing
+    if usable_width <= 1.0e-9 or usable_height <= 1.0e-9:
+        return None
+    piece_by_id = {piece.piece_id: piece for piece in pieces}
+    all_ids = tuple(sorted(piece_by_id))
+    tolerance = 1.0e-7
+
+    def zero_rotation_allowed(piece_id):
+        allowed = rotations.get(piece_id, (0.0, 90.0))
+        return any(
+            abs(float(angle) % 360.0) <= 1.0e-9
+            for angle in allowed
+        )
+
+    if not all(zero_rotation_allowed(piece_id) for piece_id in all_ids):
+        return None
+
+    @lru_cache(maxsize=None)
+    def group_bounds(group_ids):
+        return _bounds_union(
+            [piece_by_id[piece_id].bounds for piece_id in group_ids]
+        )
+
+    @lru_cache(maxsize=None)
+    def group_can_stay(group_ids):
+        _check_search_cancelled(stop_requested)
+        bounds = group_bounds(group_ids)
+        if bounds is None:
+            return False
+        width = bounds[2] - bounds[0]
+        height = bounds[3] - bounds[1]
+        if (
+            width > usable_width + tolerance
+            or height > usable_height + tolerance
+        ):
+            return False
+        shift_x = min_x + spacing - bounds[0]
+        shift_y = min_y + spacing - bounds[1]
+        placements = []
+        for piece_id in group_ids:
+            piece = piece_by_id[piece_id]
+            placed_bounds = (
+                piece.bounds[0] + shift_x,
+                piece.bounds[1] + shift_y,
+                piece.bounds[2] + shift_x,
+                piece.bounds[3] + shift_y,
+            )
+            placements.append(
+                PiecePlacement(
+                    piece_id=piece_id,
+                    instance=1,
+                    dx=shift_x,
+                    dy=shift_y,
+                    rotation_degrees=0.0,
+                    placed_bounds=placed_bounds,
+                    entity_ids=(
+                        (piece.outer_id,)
+                        + piece.descendant_ids
+                        + piece.feature_ids
+                        + piece.marking_ids
+                    ),
+                )
+            )
+        probe = OrganizationResult(placements=placements)
+        issues = validate_organization_result_geometry(
+            (piece_by_id[piece_id] for piece_id in group_ids),
+            probe,
+            minimum_clearance=spacing,
+            toolpath_offset=toolpath_offset,
+        )
+        if issues:
+            return False
+        # The exact gate has no contours to compare for legacy/custom pieces
+        # without ``outer_points``.  Preserve them only when their conservative
+        # bounding boxes also prove the requested spacing.
+        grouped_pieces = [piece_by_id[piece_id] for piece_id in group_ids]
+        return all(
+            _bounds_have_spacing(first.bounds, second.bounds, spacing)
+            for index, first in enumerate(grouped_pieces)
+            for second in grouped_pieces[index + 1 :]
+            if len(first.outer_points) < 3 or len(second.outer_points) < 3
+        )
+
+    def partition_score(groups):
+        areas = []
+        for group in groups:
+            bounds = group_bounds(group)
+            areas.append(
+                max(0.0, bounds[2] - bounds[0])
+                * max(0.0, bounds[3] - bounds[1])
+            )
+        return (
+            len(groups),
+            round(sum(areas), 9),
+            round(max(areas) if areas else 0.0, 9),
+            groups,
+        )
+
+    @lru_cache(maxsize=None)
+    def partition(group_ids):
+        _check_search_cancelled(stop_requested)
+        group_ids = tuple(sorted(group_ids))
+        if group_can_stay(group_ids):
+            return (group_ids,)
+        candidates = []
+        for axis in (0, 1):
+            ordered = sorted(
+                group_ids,
+                key=lambda piece_id: (
+                    (
+                        piece_by_id[piece_id].bounds[axis]
+                        + piece_by_id[piece_id].bounds[axis + 2]
+                    )
+                    * 0.5,
+                    piece_id,
+                ),
+            )
+            for index in range(1, len(ordered)):
+                left = tuple(sorted(ordered[:index]))
+                right = tuple(sorted(ordered[index:]))
+                left_edge = max(
+                    piece_by_id[value].bounds[axis + 2]
+                    for value in left
+                )
+                right_edge = min(
+                    piece_by_id[value].bounds[axis]
+                    for value in right
+                )
+                if left_edge > right_edge + tolerance:
+                    continue
+                left_groups = partition(left)
+                right_groups = partition(right)
+                if left_groups is None or right_groups is None:
+                    continue
+                candidates.append(left_groups + right_groups)
+        if not candidates:
+            return None
+        return min(candidates, key=partition_score)
+
+    groups = partition(all_ids)
+    if not groups:
+        return None
+    groups = tuple(
+        sorted(
+            groups,
+            key=lambda group: (
+                group_bounds(group)[0],
+                group_bounds(group)[1],
+                group,
+            ),
+        )
+    )
+    sheet_width = max_x - min_x
+    sheet_gap = max(50.0, spacing * 4.0)
+    result = OrganizationResult(
+        strategy="arranjo atual preservado",
+        evaluated_layouts=1,
+    )
+    fragmentation = 0.0
+    for sheet_index, group_ids in enumerate(groups):
+        _check_search_cancelled(stop_requested)
+        source_bounds = group_bounds(group_ids)
+        offset_x = sheet_index * (sheet_width + sheet_gap)
+        shift_x = min_x + spacing + offset_x - source_bounds[0]
+        shift_y = min_y + spacing - source_bounds[1]
+        sheet_bounds = (
+            min_x + offset_x,
+            min_y,
+            max_x + offset_x,
+            max_y,
+        )
+        result.sheet_bounds += (sheet_bounds,)
+        page_bounds = None
+        page_layout = []
+        for piece_id in group_ids:
+            piece = piece_by_id[piece_id]
+            placed_bounds = (
+                piece.bounds[0] + shift_x,
+                piece.bounds[1] + shift_y,
+                piece.bounds[2] + shift_x,
+                piece.bounds[3] + shift_y,
+            )
+            placement = PiecePlacement(
+                piece_id=piece_id,
+                instance=1,
+                dx=shift_x,
+                dy=shift_y,
+                rotation_degrees=0.0,
+                placed_bounds=placed_bounds,
+                entity_ids=(
+                    (piece.outer_id,)
+                    + piece.descendant_ids
+                    + piece.feature_ids
+                    + piece.marking_ids
+                ),
+                sheet_index=sheet_index,
+            )
+            result.placements.append(placement)
+            result.used_bounds = _union_bounds(result.used_bounds, placed_bounds)
+            page_bounds = _union_bounds(page_bounds, placed_bounds)
+            page_layout.append((piece, 0.0, placed_bounds))
+        fragmentation += _layout_scrap_fragmentation_score(
+            page_layout,
+            page_bounds,
+        )
+    result.scrap_fragmentation_score = fragmentation
+    issues = validate_organization_result_geometry(
+        pieces,
+        result,
+        minimum_clearance=spacing,
+        toolpath_offset=toolpath_offset,
+    )
+    return None if issues else result
+
+
+def organization_sheet_index(bounds, sheet_bounds):
+    """Assign overflowing geometry to its largest sheet overlap, then nearest.
+
+    This is an organization scope, not CAM containment: a part crossing a
+    sheet edge must still be movable as a whole. Ties keep the earlier sheet.
+    """
+    x0, y0, x1, y1 = bounds
+    def score(item):
+        index, (sx0, sy0, sx1, sy1) = item
+        overlap = max(0., min(x1, sx1) - max(x0, sx0)) * max(0., min(y1, sy1) - max(y0, sy0))
+        distance = max(sx0 - x1, x0 - sx1, 0.) ** 2 + max(sy0 - y1, y0 - sy1, 0.) ** 2
+        return (-overlap, distance, index)
+    return min(enumerate(sheet_bounds), key=score)[0]
+
+
+def organize_pieces_in_sheet_pool(pieces, sheet_bounds, *, new_sheet_bounds, **options):
+    """Pack the active sheet, then supplied empty sheets, then new sheets.
+
+    Destination bounds are snapshots. No occupied sheet is a candidate; the
+    caller supplies the first new sheet beyond the existing document layout.
+    Result sheet indexes are local to the returned destination bounds.
+    """
+    remaining = tuple(pieces)
+    available = list(tuple(map(float, bounds)) for bounds in sheet_bounds)
+    if not available:
+        raise ValueError("Defina a chapa ativa para organizar.")
+    next_new = tuple(map(float, new_sheet_bounds))
+    result = OrganizationResult()
+    gap = max(50., float(options.get("spacing", 10.)) * 4.)
+    while remaining:
+        _check_search_cancelled(options.get("stop_requested"))
+        creating = not available
+        bounds = available.pop(0) if available else next_new
+        page = organize_pieces(remaining, bounds, single_sheet=True, **options)
+        result.evaluated_layouts += page.evaluated_layouts
+        if page.placements or not result.sheet_bounds:
+            index = len(result.sheet_bounds)
+            result.sheet_bounds += (bounds,)
+            result.placements.extend(replace(p, sheet_index=index) for p in page.placements)
+            if page.used_bounds is not None:
+                result.used_bounds = _union_bounds(result.used_bounds, page.used_bounds)
+            result.placed_area += page.placed_area
+            result.sheet_area += (bounds[2] - bounds[0]) * (bounds[3] - bounds[1])
+            result.scrap_fragmentation_score += page.scrap_fragmentation_score
+        if page.strategy and page.strategy not in result.strategy.split(" + "):
+            result.strategy = " + ".join(filter(None, (result.strategy, page.strategy)))
+        placed = {p.piece_id for p in page.placements}
+        remaining = tuple(p for p in remaining if p.piece_id not in placed)
+        if creating:
+            if not placed:
+                break  # No piece fits a fresh sheet; never allocate endlessly.
+            step = bounds[2] - bounds[0] + gap
+            next_new = (bounds[0] + step, bounds[1], bounds[2] + step, bounds[3])
+    result.unplaced_piece_ids = [p.piece_id for p in remaining]
+    result.utilization_percent = 100. * result.placed_area / result.sheet_area if result.sheet_area else 0.
+    return result
+
+
 def organize_pieces(
     pieces: Iterable[ClassifiedPiece],
     work_bounds: Bounds,
@@ -2901,6 +3336,8 @@ def organize_pieces(
     search_budget: Optional[Sequence[int]] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
     toolpath_offset: float = 0.0,
+    single_sheet: bool = False,
+    prefer_remnants: bool = False,
 ) -> OrganizationResult:
     """Organize every fitting piece across deterministic side-by-side sheets.
 
@@ -2909,6 +3346,8 @@ def organize_pieces(
     A piece that cannot fit an empty sheet remains unplaced.  Quantity packing
     keeps the historical single-sheet contract because repeated instances do
     not have independent document entities in the Editor.
+    ``single_sheet`` keeps all destinations inside the supplied active sheet;
+    excess pieces are reported without allocating another sheet.
     """
 
     pieces = tuple(pieces)
@@ -2937,7 +3376,9 @@ def organize_pieces(
         )
         return result
 
-    if any(max(1, int(quantities.get(piece.piece_id, 1))) > 1 for piece in pieces):
+    if (single_sheet and len(pieces) != 1) or any(
+        max(1, int(quantities.get(piece.piece_id, 1))) > 1 for piece in pieces
+    ):
         result = _organize_single_sheet(
             pieces,
             work_bounds,
@@ -2948,6 +3389,7 @@ def organize_pieces(
             search_budget,
             stop_requested,
             toolpath_offset,
+            prefer_remnants,
         )
         result.sheet_bounds = (work_bounds,) if result.placements else ()
         return finalize(result)
@@ -2967,6 +3409,7 @@ def organize_pieces(
             search_budget,
             stop_requested,
             toolpath_offset,
+            prefer_remnants,
         )
         if result.placements:
             placement = result.placements[0]
@@ -2990,73 +3433,151 @@ def organize_pieces(
         result.sheet_bounds = (work_bounds,) if result.placements else ()
         return finalize(result)
 
-    remaining = pieces
-    combined = OrganizationResult()
+    preserved_layout = _preserve_existing_layout_candidate(
+        pieces,
+        work_bounds,
+        spacing,
+        rotations,
+        toolpath_offset,
+        stop_requested,
+    )
+
     sheet_width = work_bounds[2] - work_bounds[0]
     sheet_gap = max(50.0, spacing * 4.0)
-    sheet_index = 0
-    while remaining:
-        _check_search_cancelled(stop_requested)
-        page = _organize_single_sheet(
-            remaining,
-            work_bounds,
-            spacing,
-            {},
-            rotations,
-            search_mode,
-            search_budget,
-            stop_requested,
-            toolpath_offset,
-        )
-        combined.evaluated_layouts += page.evaluated_layouts
-        combined.scrap_fragmentation_score += page.scrap_fragmentation_score
-        if page.strategy:
-            if not combined.strategy:
-                combined.strategy = page.strategy
-            elif page.strategy not in combined.strategy.split(" + "):
-                combined.strategy += " + " + page.strategy
-        if not page.placements:
-            combined.unplaced_piece_ids.extend(
-                piece.piece_id for piece in remaining
+
+    def pack_across_sheets(current_rotations, strategy_prefix=""):
+        remaining = pieces
+        result = OrganizationResult()
+        sheet_index = 0
+        while remaining:
+            _check_search_cancelled(stop_requested)
+            page = _organize_single_sheet(
+                remaining,
+                work_bounds,
+                spacing,
+                {},
+                current_rotations,
+                search_mode,
+                search_budget,
+                stop_requested,
+                toolpath_offset,
+                prefer_remnants,
             )
-            break
-        offset_x = sheet_index * (sheet_width + sheet_gap)
-        translated_sheet = (
-            work_bounds[0] + offset_x,
-            work_bounds[1],
-            work_bounds[2] + offset_x,
-            work_bounds[3],
-        )
-        combined.sheet_bounds += (translated_sheet,)
-        placed_ids = set()
-        for placement in page.placements:
-            placed_ids.add(placement.piece_id)
-            placed_bounds = (
-                placement.placed_bounds[0] + offset_x,
-                placement.placed_bounds[1],
-                placement.placed_bounds[2] + offset_x,
-                placement.placed_bounds[3],
-            )
-            combined.placements.append(
-                PiecePlacement(
-                    piece_id=placement.piece_id,
-                    instance=placement.instance,
-                    dx=placement.dx + offset_x,
-                    dy=placement.dy,
-                    rotation_degrees=placement.rotation_degrees,
-                    placed_bounds=placed_bounds,
-                    entity_ids=placement.entity_ids,
-                    sheet_index=sheet_index,
+            result.evaluated_layouts += page.evaluated_layouts
+            result.scrap_fragmentation_score += page.scrap_fragmentation_score
+            if page.strategy:
+                if not result.strategy:
+                    result.strategy = page.strategy
+                elif page.strategy not in result.strategy.split(" + "):
+                    result.strategy += " + " + page.strategy
+            if not page.placements:
+                result.unplaced_piece_ids.extend(
+                    piece.piece_id for piece in remaining
                 )
+                break
+            offset_x = sheet_index * (sheet_width + sheet_gap)
+            translated_sheet = (
+                work_bounds[0] + offset_x,
+                work_bounds[1],
+                work_bounds[2] + offset_x,
+                work_bounds[3],
             )
-            combined.used_bounds = _union_bounds(
-                combined.used_bounds, placed_bounds
+            result.sheet_bounds += (translated_sheet,)
+            placed_ids = set()
+            for placement in page.placements:
+                placed_ids.add(placement.piece_id)
+                placed_bounds = (
+                    placement.placed_bounds[0] + offset_x,
+                    placement.placed_bounds[1],
+                    placement.placed_bounds[2] + offset_x,
+                    placement.placed_bounds[3],
+                )
+                result.placements.append(
+                    PiecePlacement(
+                        piece_id=placement.piece_id,
+                        instance=placement.instance,
+                        dx=placement.dx + offset_x,
+                        dy=placement.dy,
+                        rotation_degrees=placement.rotation_degrees,
+                        placed_bounds=placed_bounds,
+                        entity_ids=placement.entity_ids,
+                        sheet_index=sheet_index,
+                    )
+                )
+                result.used_bounds = _union_bounds(
+                    result.used_bounds, placed_bounds
+                )
+            remaining = tuple(
+                piece for piece in remaining if piece.piece_id not in placed_ids
             )
-        remaining = tuple(
-            piece for piece in remaining if piece.piece_id not in placed_ids
+            sheet_index += 1
+        if strategy_prefix:
+            result.strategy = (
+                strategy_prefix
+                if not result.strategy
+                else strategy_prefix + " — " + result.strategy
+            )
+        return finalize(result)
+
+    combined = pack_across_sheets(rotations)
+    orthogonal_rotations = {}
+    has_non_orthogonal_angle = False
+    for piece in pieces:
+        allowed = tuple(rotations.get(piece.piece_id, (0.0, 90.0)))
+        orthogonal = []
+        for raw_angle in allowed:
+            angle = float(raw_angle) % 360.0
+            distance = min(
+                abs(angle - cardinal)
+                for cardinal in (0.0, 90.0, 180.0, 270.0, 360.0)
+            )
+            if distance <= 1.0e-7:
+                if not any(abs(angle - value) <= 1.0e-7 for value in orthogonal):
+                    orthogonal.append(angle)
+            else:
+                has_non_orthogonal_angle = True
+        if not orthogonal:
+            orthogonal_rotations = None
+            break
+        orthogonal_rotations[piece.piece_id] = tuple(orthogonal)
+    if has_non_orthogonal_angle and orthogonal_rotations is not None:
+        orthogonal_layout = pack_across_sheets(
+            orthogonal_rotations,
+            "ângulos ortogonais",
         )
-        sheet_index += 1
-    return finalize(combined)
+        evaluated_layouts = (
+            combined.evaluated_layouts + orthogonal_layout.evaluated_layouts
+        )
+        combined = min(
+            (combined, orthogonal_layout),
+            key=_organization_result_score,
+        )
+        combined.evaluated_layouts = evaluated_layouts
+    if preserved_layout is not None:
+        preserved_layout = finalize(preserved_layout)
+        preserved_layout.evaluated_layouts += combined.evaluated_layouts
+        preserved_unplaced = len(preserved_layout.unplaced_piece_ids)
+        combined_unplaced = len(combined.unplaced_piece_ids)
+        preserved_sheets = len(preserved_layout.sheet_bounds)
+        combined_sheets = len(combined.sheet_bounds)
+        improves_coverage = preserved_unplaced < combined_unplaced
+        same_coverage = preserved_unplaced == combined_unplaced
+        reduces_sheet_count = same_coverage and preserved_sheets < combined_sheets
+        preserves_equivalent_overflow = (
+            same_coverage
+            and preserved_sheets > 1
+            and preserved_sheets == combined_sheets
+        )
+        if (
+            len(preserved_layout.placements) >= len(combined.placements)
+            and (
+                improves_coverage
+                or reduces_sheet_count
+                or preserves_equivalent_overflow
+            )
+        ):
+            return preserved_layout
+    return combined
 
 
 __all__ = [
